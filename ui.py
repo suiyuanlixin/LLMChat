@@ -8,7 +8,7 @@ from rich.console import Console
 
 console = Console()
 
-VERSION = "0.2.1"
+VERSION = "1.0.0"
 
 SUCCESS_COLOR = ["#67b6a6", "#92ded2"]
 INFO_COLOR = ["#6d8da8", "#97cbe3"]
