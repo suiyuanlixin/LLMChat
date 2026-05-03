@@ -130,12 +130,21 @@ def load_config():
     return api_type, base_url, model, api_key, max_tokens, temperature, DEFAULT_STREAM_MODE, DEFAULT_THINKING_MODE
 
 
+def _persist_config(config):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as file:
+            json.dump(config, file, indent=4, ensure_ascii=False)
+        print_success(f"Configuration saved to {CONFIG_FILE}")
+    except Exception as error:
+        print_error(f"Failed to save configuration file: {error}")
+
+
 def _save_config(api_type, base_url, model, api_key, max_tokens, temperature, stream_mode=False, thinking_mode=False):
     api_type = normalize_api_type(api_type)
     if api_type not in SUPPORTED_API_TYPES:
         api_type = DEFAULT_API_TYPE
 
-    config = {
+    _persist_config({
         "api_type": api_type,
         "base_url": _normalize_base_url(api_type, base_url),
         "model": model,
@@ -144,13 +153,15 @@ def _save_config(api_type, base_url, model, api_key, max_tokens, temperature, st
         "temperature": temperature,
         "stream_mode": stream_mode,
         "thinking_mode": thinking_mode,
-    }
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as file:
-            json.dump(config, file, indent=4, ensure_ascii=False)
-        print_success(f"Configuration saved to {CONFIG_FILE}")
-    except Exception as error:
-        print_error(f"Failed to save configuration file: {error}")
+    })
+
+
+def save_config_field(key, value):
+    config = _load_existing_config()
+    if key not in config:
+        raise ValueError(f"Unknown config key: {key}")
+    config[key] = value
+    _persist_config(config)
 
 
 def _load_existing_config():
@@ -162,69 +173,9 @@ def _load_existing_config():
                 if "base_url" not in existing and "url" in existing:
                     existing["base_url"] = existing.get("url", "")
                 config.update(existing)
-        except Exception:
-            pass
+        except Exception as error:
+            print_warn(f"Failed to parse {CONFIG_FILE}: {error}. Using defaults.")
     return _sanitize_config(config)
-
-
-def save_max_tokens(max_tokens):
-    config = _load_existing_config()
-    config["max_tokens"] = max_tokens
-    _save_config(
-        config["api_type"],
-        config["base_url"],
-        config["model"],
-        config["api_key"],
-        config["max_tokens"],
-        config["temperature"],
-        config["stream_mode"],
-        config["thinking_mode"],
-    )
-
-
-def save_temperature(temperature):
-    config = _load_existing_config()
-    config["temperature"] = temperature
-    _save_config(
-        config["api_type"],
-        config["base_url"],
-        config["model"],
-        config["api_key"],
-        config["max_tokens"],
-        config["temperature"],
-        config["stream_mode"],
-        config["thinking_mode"],
-    )
-
-
-def save_stream_mode(stream_mode):
-    config = _load_existing_config()
-    config["stream_mode"] = stream_mode
-    _save_config(
-        config["api_type"],
-        config["base_url"],
-        config["model"],
-        config["api_key"],
-        config["max_tokens"],
-        config["temperature"],
-        config["stream_mode"],
-        config["thinking_mode"],
-    )
-
-
-def save_thinking_mode(thinking_mode):
-    config = _load_existing_config()
-    config["thinking_mode"] = thinking_mode
-    _save_config(
-        config["api_type"],
-        config["base_url"],
-        config["model"],
-        config["api_key"],
-        config["max_tokens"],
-        config["temperature"],
-        config["stream_mode"],
-        config["thinking_mode"],
-    )
 
 
 def update_config():
