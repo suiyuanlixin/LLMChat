@@ -104,10 +104,6 @@ def print_stream_thinking_continue(content):
     console.print(Text(content, style=f"bold {STREAM_THINK_COLOR}"), end="")
 
 
-def _print_newline():
-    console.print()
-
-
 def print_stream_response_start(model_name):
     console.print(
         Text.assemble(
@@ -119,7 +115,7 @@ def print_stream_response_start(model_name):
     )
 
 
-def _clean_and_print_stream_response(content):
+def clean_and_print_stream_response(content):
     # Collapse multiple \n into single \n
     while "\n\n" in content:
         content = content.replace("\n\n", "\n")
@@ -127,35 +123,6 @@ def _clean_and_print_stream_response(content):
     if content.startswith("\n"):
         content = content[1:]
     console.print(Text(content, style=f"bold {STREAM_RESPONSE_COLOR}"), end="")
-
-
-def center_text(text, terminal_width=None):
-    import os
-
-    if terminal_width is None:
-        terminal_width = os.get_terminal_size().columns
-
-    lines = text.strip().split("\n")
-    max_len = max(len(line) for line in lines)
-
-    if max_len > terminal_width:
-        return text
-
-    padding = (terminal_width - max_len) // 2
-    return "\n".join(" " * padding + line for line in lines)
-
-
-def _build_gradient_line(width, start_color, end_color):
-    start_triplet = Color.parse(start_color).triplet
-    end_triplet = Color.parse(end_color).triplet
-    t = Text()
-    for i in range(width):
-        progress = i / max(width - 1, 1)
-        r = round(start_triplet[0] + (end_triplet[0] - start_triplet[0]) * progress)
-        g = round(start_triplet[1] + (end_triplet[1] - start_triplet[1]) * progress)
-        b = round(start_triplet[2] + (end_triplet[2] - start_triplet[2]) * progress)
-        t.append("─", style=f"rgb({r},{g},{b})")
-    return t
 
 
 def _dashboard_text_from_segments(*segments):
@@ -247,38 +214,6 @@ def _get_last_record_text(line_number):
         (f" <{model}>", THINK_COLOR),
         (f" <{msg_count}>", THINK_COLOR),
     )
-
-
-def _build_history_section():
-    record_dir = "record"
-    if not os.path.exists(record_dir):
-        return Text("")
-
-    files = sorted(
-        [f for f in os.listdir(record_dir) if f.endswith(".json")], reverse=True
-    )
-    if not files:
-        return Text("")
-
-    lines = []
-    for f in files:
-        # Format: 2026-04-25-14-30.json -> 2026.04.25 14:30
-        name = f[:-5]
-        parts = name.split("-")
-        if len(parts) >= 5:
-            formatted = f"{parts[0]}.{parts[1]}.{parts[2]} {parts[3]}:{parts[4]}"
-            entry = f" {formatted}"
-            padded = entry + " " * (39 - len(entry))
-            lines.append(
-                Text.assemble(
-                    Text("│", style="bold #6d8da8"),
-                    gradient_text(padded, *INFO_COLOR),
-                    Text("│", style="bold #6d8da8"),
-                    "\n",
-                )
-            )
-
-    return Text.assemble(*lines)
 
 
 def show_dashboard(model_name):

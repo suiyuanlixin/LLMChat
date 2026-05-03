@@ -140,12 +140,14 @@ record/2026-04-25-22-33.json
 
 ```text
 LLMChat/
-├─ record/       # 会话记录目录，已被 git 忽略
-├─ config.json   # 本地配置文件，已被 git 忽略
-├─ config.py     # 配置读取、校验、交互式更新和持久化
-├─ main.py       # 程序入口、聊天客户端、命令处理、会话保存/加载
-├─ README.md     # 项目说明
-└─ ui.py         # Rich 终端 UI、渐变文本、启动面板、流式输出渲染
+├─ record/         # 会话记录目录
+├─ chat.py         # 核心聊天客户端，LLM API 调用、流式处理
+├─ commands.py     # 命令解析与处理
+├─ config.json     # 本地配置文件
+├─ config.py       # 配置读取、校验、交互式更新和持久化
+├─ main.py         # 程序入口，事件循环与 UI 组装
+├─ session.py      # 会话保存与加载
+└─ ui.py           # Rich 终端 UI、渐变文本、启动面板、流式输出渲染
 ```
 
 ## 常见问题
