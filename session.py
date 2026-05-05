@@ -11,6 +11,7 @@ from ui import (
     print_error,
     print_info,
     get_user_input,
+    clean_display_text,
     TEXT_COLOR,
     THINK_COLOR,
 )
@@ -27,6 +28,9 @@ def save_conversation(conversation_history, model_name):
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     filename = f"{record_dir}/{timestamp}.json"
+    if os.path.exists(filename):
+        print_error("A conversation was already saved this minute. Please try again after one minute.")
+        return False
 
     save_data = {
         "version": "1.0",
@@ -45,6 +49,19 @@ def save_conversation(conversation_history, model_name):
         return False
 
 
+def _print_loaded_conversation(conversation, model_name):
+    assistant_name = (model_name or "assistant").upper()
+    for message in conversation:
+        role = message.get("role", "")
+        content = clean_display_text(message.get("content", ""))
+        if role == "assistant":
+            print_success(f"{assistant_name}: {content}")
+        elif role == "user":
+            print_info(f"YOU: {content}")
+        else:
+            print_info(f"{role.upper() or 'MESSAGE'}: {content}")
+
+
 def load_conversation():
     record_dir = "record"
     if not os.path.exists(record_dir):
@@ -56,7 +73,7 @@ def load_conversation():
         print_error("No saved conversations found.")
         return None
 
-    files.sort(reverse=True)
+    files.sort()
 
     file_info = []
     for f in files:
@@ -111,12 +128,14 @@ def load_conversation():
         with open(filename, "r", encoding="utf-8") as file:
             data = json.load(file)
         conversation = data.get("conversation", [])
+        model = data.get("model", "")
         name = files[idx][:-5]
         parts = name.split("-")
         if len(parts) >= 5:
             date_str = f"{parts[0]}.{parts[1]}.{parts[2]} {parts[3]}:{parts[4]}"
         else:
             date_str = name
+        _print_loaded_conversation(conversation, model)
         print_success(
             f"Loaded {len(conversation)} messages from [{idx + 1}] {date_str}."
         )

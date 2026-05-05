@@ -50,6 +50,10 @@ def _blend_channels(start, end, progress):
     )
 
 
+def clean_display_text(text):
+    return "\n".join(line for line in text.strip().split("\n") if line.strip())
+
+
 def print_message(symbol, content, color):
     console.print(
         Text.assemble(
@@ -166,7 +170,7 @@ def _get_last_record_text(line_number):
         files = []
     else:
         files = sorted(
-            [f for f in os.listdir(record_dir) if f.endswith(".json")], reverse=True
+            [f for f in os.listdir(record_dir) if f.endswith(".json")]
         )
 
     if not files:
@@ -174,17 +178,26 @@ def _get_last_record_text(line_number):
             return _dashboard_text_from_segments((" No history record", TEXT_COLOR))
         return Text("")
 
-    if line_number > len(files):
-        return Text("")
-
-    if len(files) > 5 and line_number == 5:
+    if len(files) > 5 and line_number == 1:
         return _dashboard_text_from_segments(
             ("[-]", INFO_COLOR),
             (" ...", TEXT_COLOR),
         )
 
+    if len(files) > 5:
+        visible_files = files[-4:]
+        file_index = line_number - 2
+    else:
+        visible_files = files
+        file_index = line_number - 1
+
+    if file_index < 0 or file_index >= len(visible_files):
+        return Text("")
+
+    filename = visible_files[file_index]
+
     # Format: 2026-04-25-14-30.json -> " 2026.04.25 14:30 <json> <version> <MODEL>"
-    name = files[line_number - 1][:-5]
+    name = filename[:-5]
     parts = name.split("-")
     if len(parts) >= 5:
         formatted = f"{parts[0]}.{parts[1]}.{parts[2]} {parts[3]}:{parts[4]}"
@@ -197,7 +210,7 @@ def _get_last_record_text(line_number):
     msg_count = ""
     try:
         with open(
-            os.path.join(record_dir, files[line_number - 1]), "r", encoding="utf-8"
+            os.path.join(record_dir, filename), "r", encoding="utf-8"
         ) as f:
             data = json.load(f)
         version = data.get("version", "")

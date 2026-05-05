@@ -1,5 +1,5 @@
 from ui import print_error, print_success, print_warn, print_info
-from config import save_config_field, update_config
+from config import parse_max_tokens, parse_temperature, save_config_field, update_config
 from session import save_conversation, load_conversation
 
 COMMANDS = {
@@ -30,7 +30,8 @@ def process_command(user_input, chat):
     handler = COMMAND_HANDLERS.get(base)
     if handler:
         return handler(chat, args)
-    return None
+    print_error(f"Unknown command: {base}. Use /help to see available commands.")
+    return True
 
 
 def handle_help(chat, args):
@@ -52,25 +53,16 @@ def handle_clear(chat, args):
 def handle_conf(chat, args):
     result = update_config()
     if result:
-        (
-            new_api_type,
-            new_base_url,
-            new_model,
-            new_api_key,
-            new_max_tokens,
-            new_temperature,
-            stream_mode,
-            _,
-        ) = result
         try:
             chat.configure(
-                new_api_type,
-                new_base_url,
-                new_model,
-                new_api_key,
-                new_max_tokens,
-                new_temperature,
-                stream_mode,
+                result.api_type,
+                result.base_url,
+                result.model,
+                result.api_key,
+                result.max_tokens,
+                result.temperature,
+                result.stream_mode,
+                result.thinking_mode,
             )
         except Exception as error:
             print_error(f"Failed to apply configuration: {error}")
@@ -84,15 +76,12 @@ def handle_token(chat, args):
         print_info(f"Current max tokens: {chat.max_tokens}")
         return True
     try:
-        new_max_tokens = int(args.strip())
-        if new_max_tokens <= 0:
-            print_error("Token number must be greater than 0.")
-            return True
+        new_max_tokens = parse_max_tokens(args)
         chat.set_max_tokens(new_max_tokens)
         save_config_field("max_tokens", new_max_tokens)
         print_success(f"Max tokens set to {new_max_tokens}.")
-    except ValueError:
-        print_error(f"Invalid token number: {args}")
+    except ValueError as error:
+        print_error(str(error))
     return True
 
 
@@ -101,15 +90,12 @@ def handle_temp(chat, args):
         print_info(f"Current temperature: {chat.temperature}")
         return True
     try:
-        new_temp = float(args.strip())
-        if new_temp < 0 or new_temp > 1:
-            print_error("Temperature must be between 0 and 1.")
-            return True
+        new_temp = parse_temperature(args)
         chat.set_temperature(new_temp)
         save_config_field("temperature", new_temp)
         print_success(f"Temperature set to {new_temp}.")
-    except ValueError:
-        print_error(f"Invalid temperature value: {args}")
+    except ValueError as error:
+        print_error(str(error))
     return True
 
 

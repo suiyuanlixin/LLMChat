@@ -7,6 +7,7 @@ from ui import (
     show_dashboard,
     print_stream_thinking_continue,
     clean_and_print_stream_response,
+    clean_display_text,
 )
 from config import load_config
 from chat import LLMChat
@@ -14,7 +15,7 @@ from commands import process_command
 
 
 def _clean_text(text):
-    return "\n".join(line for line in text.strip().split("\n") if line.strip())
+    return clean_display_text(text)
 
 
 def stream_print_thinking(content):
@@ -52,18 +53,17 @@ def handle_response(response, model_name, stream_mode=False, thinking_mode=False
 
 def main():
     config = load_config()
-    api_type, base_url, model, api_key, max_tokens, temperature, stream_mode, thinking_mode = config
-    show_dashboard(model)
+    show_dashboard(config.model)
     try:
         chat = LLMChat(
-            model=model,
-            api_key=api_key,
-            api_type=api_type,
-            base_url=base_url,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stream_mode=stream_mode,
-            thinking_mode=thinking_mode,
+            model=config.model,
+            api_key=config.api_key,
+            api_type=config.api_type,
+            base_url=config.base_url,
+            max_tokens=config.max_tokens,
+            temperature=config.temperature,
+            stream_mode=config.stream_mode,
+            thinking_mode=config.thinking_mode,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")

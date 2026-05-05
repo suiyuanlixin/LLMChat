@@ -1,5 +1,6 @@
 import os
 import json
+from dataclasses import dataclass
 
 from ui import print_error, print_success, print_warn, print_info, get_user_input
 
@@ -26,15 +27,39 @@ API_TYPE_ALIASES = {
 }
 
 
+@dataclass
+class AppConfig:
+    api_type: str = DEFAULT_API_TYPE
+    base_url: str = DEFAULT_BASE_URL
+    model: str = DEFAULT_MODEL
+    api_key: str = ""
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+    stream_mode: bool = DEFAULT_STREAM_MODE
+    thinking_mode: bool = DEFAULT_THINKING_MODE
+
+    def to_dict(self):
+        return {
+            "api_type": self.api_type,
+            "base_url": self.base_url,
+            "model": self.model,
+            "api_key": self.api_key,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream_mode": self.stream_mode,
+            "thinking_mode": self.thinking_mode,
+        }
+
+
 def normalize_api_type(api_type):
-    value = (api_type or DEFAULT_API_TYPE).strip().lower()
+    value = str(api_type or DEFAULT_API_TYPE).strip().lower()
     return API_TYPE_ALIASES.get(value, value)
 
 
 def _normalize_base_url(api_type, base_url):
     if normalize_api_type(api_type) == API_TYPE_GLM:
         return ""
-    return (base_url or "").strip()
+    return str(base_url or "").strip()
 
 
 def _default_config():
@@ -50,17 +75,41 @@ def _default_config():
     }
 
 
-def _config_to_tuple(config):
-    return (
-        config["api_type"],
-        config["base_url"],
-        config["model"],
-        config["api_key"],
-        config["max_tokens"],
-        config["temperature"],
-        config["stream_mode"],
-        config["thinking_mode"],
-    )
+def parse_max_tokens(value):
+    try:
+        max_tokens = int(str(value).strip())
+    except (TypeError, ValueError) as error:
+        raise ValueError("Max tokens must be an integer.") from error
+
+    if max_tokens <= 0:
+        raise ValueError("Max tokens must be greater than 0.")
+    return max_tokens
+
+
+def parse_temperature(value):
+    try:
+        temperature = float(str(value).strip())
+    except (TypeError, ValueError) as error:
+        raise ValueError("Temperature must be a number.") from error
+
+    if temperature < 0 or temperature > 1:
+        raise ValueError("Temperature must be between 0 and 1.")
+    return temperature
+
+
+def _parse_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return default
+    if value is None:
+        return default
+    return bool(value)
 
 
 def _sanitize_config(config):
@@ -70,13 +119,24 @@ def _sanitize_config(config):
         config["api_type"] = DEFAULT_API_TYPE
 
     config["base_url"] = _normalize_base_url(config["api_type"], config.get("base_url"))
-    config["model"] = (config.get("model") or DEFAULT_MODEL).strip()
-    config["api_key"] = (config.get("api_key") or "").strip()
-    config["max_tokens"] = config.get("max_tokens", DEFAULT_MAX_TOKENS)
-    config["temperature"] = config.get("temperature", DEFAULT_TEMPERATURE)
-    config["stream_mode"] = config.get("stream_mode", DEFAULT_STREAM_MODE)
-    config["thinking_mode"] = config.get("thinking_mode", DEFAULT_THINKING_MODE)
-    return config
+    config["model"] = str(config.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    config["api_key"] = str(config.get("api_key") or "").strip()
+
+    try:
+        config["max_tokens"] = parse_max_tokens(config.get("max_tokens", DEFAULT_MAX_TOKENS))
+    except ValueError as error:
+        print_warn(f"Invalid max_tokens in {CONFIG_FILE}: {error} Fallback to {DEFAULT_MAX_TOKENS}.")
+        config["max_tokens"] = DEFAULT_MAX_TOKENS
+
+    try:
+        config["temperature"] = parse_temperature(config.get("temperature", DEFAULT_TEMPERATURE))
+    except ValueError as error:
+        print_warn(f"Invalid temperature in {CONFIG_FILE}: {error} Fallback to {DEFAULT_TEMPERATURE}.")
+        config["temperature"] = DEFAULT_TEMPERATURE
+
+    config["stream_mode"] = _parse_bool(config.get("stream_mode"), DEFAULT_STREAM_MODE)
+    config["thinking_mode"] = _parse_bool(config.get("thinking_mode"), DEFAULT_THINKING_MODE)
+    return AppConfig(**{key: config[key] for key in _default_config()})
 
 
 def _prompt_api_type(current_api_type):
@@ -100,68 +160,89 @@ def _prompt_base_url(api_type, current_base_url):
     return get_user_input(f"Base URL (Current: {current}): ").strip() or current_base_url
 
 
+def _prompt_max_tokens(prompt, default_value):
+    while True:
+        value = get_user_input(prompt).strip()
+        if not value:
+            return default_value
+
+        try:
+            return parse_max_tokens(value)
+        except ValueError as error:
+            print_error(str(error))
+
+
+def _prompt_temperature(prompt, default_value):
+    while True:
+        value = get_user_input(prompt).strip()
+        if not value:
+            return default_value
+
+        try:
+            return parse_temperature(value)
+        except ValueError as error:
+            print_error(str(error))
+
+
 def load_config():
     config = _load_existing_config()
-    if config["api_key"]:
-        return _config_to_tuple(config)
+    if config.api_key:
+        return config
 
     print_warn("Configuration file does not exist or API Key is empty!")
 
-    api_type = _prompt_api_type(config["api_type"])
-    base_url = _prompt_base_url(api_type, config["base_url"])
+    api_type = _prompt_api_type(config.api_type)
+    base_url = _prompt_base_url(api_type, config.base_url)
     model = (
         get_user_input(
-            f"Please enter the model name (Default: {config['model']}): "
+            f"Please enter the model name (Default: {config.model}): "
         ).strip()
-        or config["model"]
+        or config.model
     )
-    api_key = get_user_input("Please enter your API Key: ")
-    max_tokens_str = get_user_input(
-        f"Please enter the maximum tokens (Default: {DEFAULT_MAX_TOKENS}): "
+    api_key = get_user_input("Please enter your API Key: ").strip()
+    max_tokens = _prompt_max_tokens(
+        f"Please enter the maximum tokens (Default: {DEFAULT_MAX_TOKENS}): ",
+        DEFAULT_MAX_TOKENS,
     )
-    max_tokens = int(max_tokens_str) if max_tokens_str else DEFAULT_MAX_TOKENS
-    temp_str = get_user_input(
-        f"Please enter the temperature (Default: {DEFAULT_TEMPERATURE}): "
+    temperature = _prompt_temperature(
+        f"Please enter the temperature (Default: {DEFAULT_TEMPERATURE}): ",
+        DEFAULT_TEMPERATURE,
     )
-    temperature = float(temp_str) if temp_str else DEFAULT_TEMPERATURE
 
-    _save_config(api_type, base_url, model, api_key, max_tokens, temperature, False, DEFAULT_THINKING_MODE)
+    config = AppConfig(
+        api_type=api_type,
+        base_url=_normalize_base_url(api_type, base_url),
+        model=model,
+        api_key=api_key,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stream_mode=DEFAULT_STREAM_MODE,
+        thinking_mode=DEFAULT_THINKING_MODE,
+    )
+    _save_config(config)
 
-    return api_type, base_url, model, api_key, max_tokens, temperature, DEFAULT_STREAM_MODE, DEFAULT_THINKING_MODE
+    return config
 
 
 def _persist_config(config):
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as file:
-            json.dump(config, file, indent=4, ensure_ascii=False)
+            json.dump(config.to_dict(), file, indent=4, ensure_ascii=False)
         print_success(f"Configuration saved to {CONFIG_FILE}")
     except Exception as error:
         print_error(f"Failed to save configuration file: {error}")
 
 
-def _save_config(api_type, base_url, model, api_key, max_tokens, temperature, stream_mode=False, thinking_mode=False):
-    api_type = normalize_api_type(api_type)
-    if api_type not in SUPPORTED_API_TYPES:
-        api_type = DEFAULT_API_TYPE
-
-    _persist_config({
-        "api_type": api_type,
-        "base_url": _normalize_base_url(api_type, base_url),
-        "model": model,
-        "api_key": api_key,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream_mode": stream_mode,
-        "thinking_mode": thinking_mode,
-    })
+def _save_config(config):
+    _persist_config(_sanitize_config(config.to_dict()))
 
 
 def save_config_field(key, value):
-    config = _load_existing_config()
+    config = _load_existing_config().to_dict()
     if key not in config:
         raise ValueError(f"Unknown config key: {key}")
     config[key] = value
-    _persist_config(config)
+    _persist_config(_sanitize_config(config))
 
 
 def _load_existing_config():
@@ -183,41 +264,34 @@ def update_config():
 
     print_info("Enter new configuration (Enter to keep current)")
 
-    new_api_type = _prompt_api_type(config["api_type"])
-    new_base_url = _prompt_base_url(new_api_type, config["base_url"])
+    new_api_type = _prompt_api_type(config.api_type)
+    new_base_url = _prompt_base_url(new_api_type, config.base_url)
     new_model = (
-        get_user_input(f"Model name (Current: {config['model']}): ").strip()
-        or config["model"]
+        get_user_input(f"Model name (Current: {config.model}): ").strip()
+        or config.model
     )
-    masked_key = config["api_key"][:10] + "..." if config["api_key"] else "None"
+    masked_key = config.api_key[:10] + "..." if config.api_key else "None"
     new_api_key = (
-        get_user_input(f"API Key (Current: {masked_key}): ") or config["api_key"]
+        get_user_input(f"API Key (Current: {masked_key}): ").strip() or config.api_key
     )
-    new_max_tokens_str = get_user_input(f"Max tokens (Current: {config['max_tokens']}): ")
-    new_max_tokens = (
-        int(new_max_tokens_str) if new_max_tokens_str else config["max_tokens"]
+    new_max_tokens = _prompt_max_tokens(
+        f"Max tokens (Current: {config.max_tokens}): ",
+        config.max_tokens,
     )
-    new_temp_str = get_user_input(f"Temperature (Current: {config['temperature']}): ")
-    new_temperature = float(new_temp_str) if new_temp_str else config["temperature"]
-
-    _save_config(
-        new_api_type,
-        new_base_url,
-        new_model,
-        new_api_key,
-        new_max_tokens,
-        new_temperature,
-        config["stream_mode"],
-        config["thinking_mode"],
+    new_temperature = _prompt_temperature(
+        f"Temperature (Current: {config.temperature}): ",
+        config.temperature,
     )
 
-    return (
-        new_api_type,
-        _normalize_base_url(new_api_type, new_base_url),
-        new_model,
-        new_api_key,
-        new_max_tokens,
-        new_temperature,
-        config["stream_mode"],
-        config["thinking_mode"],
+    new_config = AppConfig(
+        api_type=new_api_type,
+        base_url=_normalize_base_url(new_api_type, new_base_url),
+        model=new_model,
+        api_key=new_api_key,
+        max_tokens=new_max_tokens,
+        temperature=new_temperature,
+        stream_mode=config.stream_mode,
+        thinking_mode=config.thinking_mode,
     )
+    _save_config(new_config)
+    return new_config

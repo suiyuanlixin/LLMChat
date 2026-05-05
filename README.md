@@ -55,7 +55,8 @@ pip install rich zai-sdk anthropic
   "api_key": "YOUR_API_KEY",
   "max_tokens": 4096,
   "temperature": 0.7,
-  "stream_mode": false
+  "stream_mode": false,
+  "thinking_mode": false
 }
 ```
 
@@ -70,6 +71,7 @@ pip install rich zai-sdk anthropic
 | `max_tokens` | 单次回复的最大 token 数。 |
 | `temperature` | 采样温度，范围为 `0` 到 `1`。 |
 | `stream_mode` | 是否默认启用流式输出。 |
+| `thinking_mode` | 是否默认展示模型返回的推理 / 思考内容。 |
 
 `config.json` 已被 `.gitignore` 忽略，适合存放本地密钥和个人配置。
 
@@ -98,6 +100,9 @@ python main.py
 | `/mode` | 查看当前输出模式。 |
 | `/mode normal` | 切换到普通输出模式。 |
 | `/mode stream` | 切换到流式输出模式。 |
+| `/think` | 查看当前推理 / 思考内容展示模式。 |
+| `/think on` | 开启推理 / 思考内容展示。 |
+| `/think off` | 关闭推理 / 思考内容展示。 |
 | `Ctrl+C` | 强制中断并退出程序。 |
 
 ## 输出模式

@@ -28,6 +28,7 @@ class LLMChat:
         max_tokens=None,
         temperature=None,
         stream_mode=None,
+        thinking_mode=None,
     ):
         api_type = normalize_api_type(api_type)
         if api_type not in {API_TYPE_GLM, API_TYPE_ANTHROPIC}:
@@ -47,6 +48,8 @@ class LLMChat:
             self.temperature = temperature
         if stream_mode is not None:
             self.stream_mode = stream_mode
+        if thinking_mode is not None:
+            self.thinking_mode = thinking_mode
 
     def _create_client(self, api_type, api_key, base_url):
         if api_type == API_TYPE_ANTHROPIC:
@@ -63,7 +66,7 @@ class LLMChat:
         try:
             from zai import ZhipuAiClient
         except ImportError as error:
-            raise RuntimeError("ZhipuAI SDK is not installed. Run: pip install zai") from error
+            raise RuntimeError("ZhipuAI SDK is not installed. Run: pip install zai-sdk") from error
 
         return ZhipuAiClient(api_key=api_key)
 
@@ -80,11 +83,12 @@ class LLMChat:
         self.thinking_mode = enabled
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
+        original_history_length = len(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": user_message})
 
         try:
             if self.stream_mode:
-                return self._stream_response(stream_callback_thinking, stream_callback_response, self.model)
+                response = self._stream_response(stream_callback_thinking, stream_callback_response, self.model)
             elif self.api_type == API_TYPE_ANTHROPIC:
                 response = self.client.messages.create(
                     model=self.model,
@@ -92,7 +96,7 @@ class LLMChat:
                     temperature=self.temperature,
                     messages=self._anthropic_messages(),
                 )
-                return self._parse_anthropic_response(response)
+                response = self._parse_anthropic_response(response)
             else:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -101,11 +105,19 @@ class LLMChat:
                     max_tokens=self.max_tokens,
                     thinking={"type": "enabled"} if self.thinking_mode else {},
                 )
-                return self._parse_response(response)
+                response = self._parse_response(response)
+
+            if response is None:
+                self._rollback_history(original_history_length)
+            return response
 
         except Exception as error:
+            self._rollback_history(original_history_length)
             print_error(f"Request error: {error}")
             return None
+
+    def _rollback_history(self, history_length):
+        self.conversation_history = self.conversation_history[:history_length]
 
     def _stream_response(self, callback_thinking, callback_response, model_name):
         if self.api_type == API_TYPE_ANTHROPIC:
