@@ -14,6 +14,7 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_STREAM_MODE = False
 DEFAULT_THINKING_MODE = False
+DEFAULT_AGENT_MODE = False
 SUPPORTED_API_TYPES = {API_TYPE_GLM, API_TYPE_ANTHROPIC}
 API_TYPE_ALIASES = {
     "zhipu": API_TYPE_GLM,
@@ -37,6 +38,7 @@ class AppConfig:
     temperature: float = DEFAULT_TEMPERATURE
     stream_mode: bool = DEFAULT_STREAM_MODE
     thinking_mode: bool = DEFAULT_THINKING_MODE
+    agent_mode: bool = DEFAULT_AGENT_MODE
 
     def to_dict(self):
         return {
@@ -48,6 +50,7 @@ class AppConfig:
             "temperature": self.temperature,
             "stream_mode": self.stream_mode,
             "thinking_mode": self.thinking_mode,
+            "agent_mode": self.agent_mode,
         }
 
 
@@ -72,6 +75,7 @@ def _default_config():
         "temperature": DEFAULT_TEMPERATURE,
         "stream_mode": DEFAULT_STREAM_MODE,
         "thinking_mode": DEFAULT_THINKING_MODE,
+        "agent_mode": DEFAULT_AGENT_MODE,
     }
 
 
@@ -136,6 +140,7 @@ def _sanitize_config(config):
 
     config["stream_mode"] = _parse_bool(config.get("stream_mode"), DEFAULT_STREAM_MODE)
     config["thinking_mode"] = _parse_bool(config.get("thinking_mode"), DEFAULT_THINKING_MODE)
+    config["agent_mode"] = _parse_bool(config.get("agent_mode"), DEFAULT_AGENT_MODE)
     return AppConfig(**{key: config[key] for key in _default_config()})
 
 
@@ -218,6 +223,7 @@ def load_config():
         temperature=temperature,
         stream_mode=DEFAULT_STREAM_MODE,
         thinking_mode=DEFAULT_THINKING_MODE,
+        agent_mode=DEFAULT_AGENT_MODE,
     )
     _save_config(config)
 
@@ -292,6 +298,7 @@ def update_config():
         temperature=new_temperature,
         stream_mode=config.stream_mode,
         thinking_mode=config.thinking_mode,
+        agent_mode=config.agent_mode,
     )
     _save_config(new_config)
     return new_config

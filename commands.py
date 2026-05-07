@@ -13,6 +13,7 @@ COMMANDS = {
     "/temp": "Set the temperature for responses (Example: /temp 0.7).",
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
+    "/agent": "Toggle local file-editing agent mode (Example: /agent on).",
 }
 
 
@@ -151,6 +152,34 @@ def handle_think(chat, args):
     return True
 
 
+def handle_agent(chat, args):
+    status = chat.get_agent_status()
+    workspace = status["workspace_dir"] or "No workspace directory"
+
+    if args is None:
+        current = "on" if status["enabled"] else "off"
+        print_info(f"Current agent mode: {current}. Workspace: {workspace}. Usage: /agent on | /agent off")
+        return True
+
+    mode = args.lower().strip()
+    if mode == "on":
+        if not status["workspace_dir"]:
+            chat.set_agent_mode(False)
+            save_config_field("agent_mode", False)
+            print_error("Agent mode requires a startup workspace directory. Example: python main.py <workspace>")
+            return True
+        chat.set_agent_mode(True)
+        save_config_field("agent_mode", True)
+        print_success(f"Agent mode turned on. Workspace: {workspace}")
+    elif mode == "off":
+        chat.set_agent_mode(False)
+        save_config_field("agent_mode", False)
+        print_success("Agent mode turned off.")
+    else:
+        print_error(f"Invalid option: {mode}. Use /agent on or /agent off.")
+    return True
+
+
 COMMAND_HANDLERS = {
     "/help": handle_help,
     "/quit": handle_quit,
@@ -160,6 +189,7 @@ COMMAND_HANDLERS = {
     "/load": handle_load,
     "/mode": handle_mode,
     "/think": handle_think,
+    "/agent": handle_agent,
     "/token": handle_token,
     "/temp": handle_temp,
 }

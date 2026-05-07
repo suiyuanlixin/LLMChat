@@ -5,6 +5,7 @@ from rich.text import Text
 from rich.color import Color
 from rich.panel import Panel
 from rich.console import Console
+from rich.table import Table
 
 console = Console()
 
@@ -43,6 +44,14 @@ def gradient_text(content, start_color, end_color, mid_color=None):
     return gradient
 
 
+def background_block(content, background_color):
+    style = f"bold {TEXT_COLOR[1]} on {background_color}"
+    table = Table.grid(expand=True, padding=(0, 0))
+    table.add_column(ratio=1, style=style)
+    table.add_row(Text(str(content), style=style))
+    return table
+
+
 def _blend_channels(start, end, progress):
     return ",".join(
         str(round(start_value + (end_value - start_value) * progress))
@@ -51,7 +60,29 @@ def _blend_channels(start, end, progress):
 
 
 def clean_display_text(text):
+    if isinstance(text, list):
+        text = "\n".join(_display_content_block(block) for block in text)
+    elif isinstance(text, dict):
+        text = json.dumps(text, ensure_ascii=False)
+    else:
+        text = str(text or "")
     return "\n".join(line for line in text.strip().split("\n") if line.strip())
+
+
+def _display_content_block(block):
+    if not isinstance(block, dict):
+        return str(block)
+
+    block_type = block.get("type")
+    if block_type == "text":
+        return block.get("text", "")
+    if block_type == "thinking":
+        return block.get("thinking", "")
+    if block_type == "tool_use":
+        return f"[tool_use] {block.get('name', '')} {json.dumps(block.get('input', {}), ensure_ascii=False)}"
+    if block_type == "tool_result":
+        return f"[tool_result] {block.get('content', '')}"
+    return json.dumps(block, ensure_ascii=False)
 
 
 def print_message(symbol, content, color):
@@ -229,7 +260,7 @@ def _get_last_record_text(line_number):
     )
 
 
-def show_dashboard(model_name):
+def show_dashboard(model_name, workspace_dir=None):
     console.clear()
     console.print()
     title = Text.assemble(
@@ -237,7 +268,7 @@ def show_dashboard(model_name):
         gradient_text(f" v{VERSION}", *TEXT_COLOR),
     )
     billing_text = f"{model_name.upper() + ' · API Usage Billing':^37}"
-    cwd = os.getcwd()
+    cwd = workspace_dir or "No workspace directory"
     cwd_text = f"...{cwd[-34:]}" if len(cwd) > 37 else f"{cwd:^37}"
 
     if console.width < 68:
@@ -330,3 +361,23 @@ def get_user_input(prompt_text):
             gradient_text(f" {prompt_text}", *TEXT_COLOR),
         )
     ).strip()
+
+
+def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content):
+    console.print(
+        Text.assemble(
+            "\n",
+            gradient_text("[-]", *INFO_COLOR),
+            gradient_text(f" Allow agent to edit file? ({file_path})\n", *TEXT_COLOR),
+            gradient_text(f"Occurrences to replace: {occurrences}\n", *TEXT_COLOR),
+        ),
+        end="",
+    )
+    console.print(background_block(f"Old:\n{old_content}", ERROR_COLOR[0]))
+    console.print(background_block(f"New:\n{new_content}", SUCCESS_COLOR[0]))
+    answer = console.input(
+        Text.assemble(
+            gradient_text("Continue? (y/N, default: N): ", *TEXT_COLOR),
+        )
+    )
+    return answer.strip().lower() in {"y", "yes"}

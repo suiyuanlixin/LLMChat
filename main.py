@@ -1,7 +1,10 @@
+import sys
+
 from ui import (
     console,
     print_success,
     print_error,
+    print_warn,
     print_thinking,
     get_user_input,
     show_dashboard,
@@ -9,9 +12,10 @@ from ui import (
     clean_and_print_stream_response,
     clean_display_text,
 )
-from config import load_config
+from config import load_config, save_config_field
 from chat import LLMChat
 from commands import process_command
+from tools import normalize_workspace_dir
 
 
 def _clean_text(text):
@@ -51,9 +55,30 @@ def handle_response(response, model_name, stream_mode=False, thinking_mode=False
     print_success(f"{model_name.upper()}: {reply}")
 
 
+def get_startup_workspace(argv):
+    if len(argv) < 2:
+        return None, None
+
+    workspace = normalize_workspace_dir(argv[1])
+    if workspace is None:
+        return None, f"Invalid workspace directory: {argv[1]}"
+    return str(workspace), None
+
+
 def main():
     config = load_config()
-    show_dashboard(config.model)
+    workspace_dir, workspace_error = get_startup_workspace(sys.argv)
+    agent_auto_disabled = False
+    if config.agent_mode and not workspace_dir:
+        config.agent_mode = False
+        save_config_field("agent_mode", False)
+        agent_auto_disabled = True
+
+    show_dashboard(config.model, workspace_dir)
+    if workspace_error:
+        print_error(workspace_error)
+    if agent_auto_disabled:
+        print_warn("Agent mode requires a startup workspace directory and has been turned off.")
     try:
         chat = LLMChat(
             model=config.model,
@@ -64,6 +89,8 @@ def main():
             temperature=config.temperature,
             stream_mode=config.stream_mode,
             thinking_mode=config.thinking_mode,
+            agent_mode=config.agent_mode,
+            workspace_dir=workspace_dir,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")
@@ -85,7 +112,7 @@ def main():
                     continue
 
             response = chat.send_message(user_input, stream_print_thinking, stream_print_response)
-            handle_response(response, chat.model, chat.stream_mode, chat.thinking_mode)
+            handle_response(response, chat.model, chat.stream_mode and not chat.agent_mode, chat.thinking_mode)
 
         except KeyboardInterrupt:
             console.print()
