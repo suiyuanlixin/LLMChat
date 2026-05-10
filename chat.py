@@ -1,8 +1,27 @@
 import json
 
-from ui import console, print_error, print_stream_thinking, print_stream_response_start
-from config import API_TYPE_ANTHROPIC, API_TYPE_GLM, normalize_api_type
+from ui import console, print_error, print_info, print_stream_thinking, print_stream_response_start, print_warn
+from config import (
+    API_TYPE_ANTHROPIC,
+    API_TYPE_GLM,
+    DEFAULT_MAX_AGENT_ROUNDS,
+    DEFAULT_MAX_AGENT_TOOL_CALLS,
+    normalize_api_type,
+)
 from tools import AgentTools, anthropic_tool_schemas, glm_tool_schemas
+
+
+AGENT_SYSTEM_PROMPT = """You are in local workspace agent mode.
+
+Rules:
+- Work only inside the configured workspace and use tools for local file facts.
+- Explore before editing: list directories, search, and read relevant line ranges first.
+- Prefer small, targeted changes. Do not rewrite unrelated code.
+- Use read_file with line ranges and line numbers when a file is long.
+- Prefer apply_patch for line-based edits and edit_file for exact small replacements.
+- After editing, run a lightweight verification command when it is safe and relevant.
+- If a tool fails, explain the failure and try a different precise approach instead of repeating the same call.
+- Stop when the task is complete and summarize what changed."""
 
 
 class LLMChat:
@@ -18,12 +37,19 @@ class LLMChat:
         thinking_mode=False,
         agent_mode=False,
         workspace_dir=None,
+        max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
+        max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
     ):
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
         self.agent_tools = AgentTools(workspace_dir)
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
+        self.max_agent_rounds = max(1, int(max_agent_rounds))
+        self.max_agent_tool_calls = max(1, int(max_agent_tool_calls))
+        self.agent_running = False
+        self.agent_stop_requested = False
+        self.agent_tool_calls = 0
         self.configure(api_type, base_url, model, api_key, max_tokens, temperature, stream_mode)
 
     def configure(
@@ -89,6 +115,12 @@ class LLMChat:
     def set_thinking_mode(self, enabled):
         self.thinking_mode = enabled
 
+    def set_agent_limits(self, max_rounds=None, max_tool_calls=None):
+        if max_rounds is not None:
+            self.max_agent_rounds = max(1, int(max_rounds))
+        if max_tool_calls is not None:
+            self.max_agent_tool_calls = max(1, int(max_tool_calls))
+
     def set_workspace_dir(self, workspace_dir):
         self.agent_tools.set_workspace_dir(workspace_dir)
         if not self.agent_tools.enabled:
@@ -96,12 +128,22 @@ class LLMChat:
 
     def set_agent_mode(self, enabled):
         self.agent_mode = bool(enabled and self.agent_tools.enabled)
+        if not self.agent_mode:
+            self.request_agent_stop()
         return self.agent_mode
+
+    def request_agent_stop(self):
+        was_running = self.agent_running
+        self.agent_stop_requested = True
+        return was_running
 
     def get_agent_status(self):
         return {
             "enabled": self.agent_mode,
             "workspace_dir": str(self.agent_tools.workspace_dir) if self.agent_tools.enabled else None,
+            "running": self.agent_running,
+            "max_rounds": self.max_agent_rounds,
+            "max_tool_calls": self.max_agent_tool_calls,
         }
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
@@ -136,28 +178,51 @@ class LLMChat:
 
             if response is None:
                 self._rollback_history(original_history_length)
+            elif response.get("agent_stopped"):
+                self._rollback_history(original_history_length)
             return response
 
+        except KeyboardInterrupt:
+            if self.agent_running:
+                self.request_agent_stop()
+                self._rollback_history(original_history_length)
+                print_warn("Agent stopped by user.")
+                return {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
+            raise
         except Exception as error:
             self._rollback_history(original_history_length)
             print_error(f"Request error: {error}")
             return None
 
     def _agent_response(self):
-        if self.api_type == API_TYPE_ANTHROPIC:
-            return self._anthropic_agent_response()
-        return self._glm_agent_response()
+        self.agent_running = True
+        self.agent_stop_requested = False
+        self.agent_tool_calls = 0
+        try:
+            if self.api_type == API_TYPE_ANTHROPIC:
+                return self._anthropic_agent_response()
+            return self._glm_agent_response()
+        except KeyboardInterrupt:
+            self.agent_stop_requested = True
+            print_warn("Agent stopped by user.")
+            return {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
+        finally:
+            self.agent_running = False
 
     def _anthropic_agent_response(self):
         full_thinking = ""
         final_response = ""
 
-        for _ in range(10):
+        for round_index in range(1, self.max_agent_rounds + 1):
+            if self._agent_should_stop():
+                return self._agent_stopped_response(full_thinking, final_response)
+            self._print_agent_round(round_index)
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 messages=self._anthropic_messages(),
+                system=AGENT_SYSTEM_PROMPT,
                 tools=anthropic_tool_schemas(),
             )
 
@@ -171,9 +236,30 @@ class LLMChat:
             if not tool_uses:
                 return {"thinking": full_thinking, "response": final_response}
 
+            if self._agent_tool_budget_exceeded(len(tool_uses)):
+                message = self._agent_tool_budget_message()
+                self.conversation_history.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use.get("id", ""),
+                                "content": _error_text(message),
+                                "is_error": True,
+                            }
+                            for tool_use in tool_uses
+                        ],
+                    }
+                )
+                print_error(message)
+                return {"thinking": full_thinking, "response": final_response or message}
+
             tool_results = []
             for tool_use in tool_uses:
-                tool_result = self.agent_tools.execute(
+                if self._agent_should_stop():
+                    return self._agent_stopped_response(full_thinking, final_response)
+                tool_result = self._execute_agent_tool(
                     tool_use.get("name", ""),
                     tool_use.get("input", {}),
                 )
@@ -187,17 +273,21 @@ class LLMChat:
                 )
             self.conversation_history.append({"role": "user", "content": tool_results})
 
-        print_error("Agent loop stopped after 10 tool rounds.")
-        return {"thinking": full_thinking, "response": final_response or "Agent loop stopped after 10 tool rounds."}
+        message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        print_error(message)
+        return {"thinking": full_thinking, "response": final_response or message}
 
     def _glm_agent_response(self):
         full_thinking = ""
         final_response = ""
 
-        for _ in range(10):
+        for round_index in range(1, self.max_agent_rounds + 1):
+            if self._agent_should_stop():
+                return self._agent_stopped_response(full_thinking, final_response)
+            self._print_agent_round(round_index)
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.conversation_history,
+                messages=self._glm_agent_messages(),
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 thinking={"type": "enabled"} if self.thinking_mode else {},
@@ -213,8 +303,24 @@ class LLMChat:
             if not tool_calls:
                 return {"thinking": full_thinking, "response": final_response}
 
+            if self._agent_tool_budget_exceeded(len(tool_calls)):
+                message = self._agent_tool_budget_message()
+                for tool_call in tool_calls:
+                    self.conversation_history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": tool_call["name"],
+                            "content": _error_text(message),
+                        }
+                    )
+                print_error(message)
+                return {"thinking": full_thinking, "response": final_response or message}
+
             for tool_call in tool_calls:
-                tool_result = self.agent_tools.execute(tool_call["name"], tool_call["arguments"])
+                if self._agent_should_stop():
+                    return self._agent_stopped_response(full_thinking, final_response)
+                tool_result = self._execute_agent_tool(tool_call["name"], tool_call["arguments"])
                 self.conversation_history.append(
                     {
                         "role": "tool",
@@ -224,8 +330,41 @@ class LLMChat:
                     }
                 )
 
-        print_error("Agent loop stopped after 10 tool rounds.")
-        return {"thinking": full_thinking, "response": final_response or "Agent loop stopped after 10 tool rounds."}
+        message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        print_error(message)
+        return {"thinking": full_thinking, "response": final_response or message}
+
+    def _agent_should_stop(self):
+        return self.agent_stop_requested
+
+    def _agent_stopped_response(self, thinking, response):
+        message = "Agent stopped by user."
+        print_warn(message)
+        return {
+            "thinking": thinking,
+            "response": response or message,
+            "agent_stopped": True,
+        }
+
+    def _agent_tool_budget_exceeded(self, requested_tool_calls):
+        return self.agent_tool_calls + requested_tool_calls > self.max_agent_tool_calls
+
+    def _agent_tool_budget_message(self):
+        return f"Agent stopped after {self.max_agent_tool_calls} tool calls."
+
+    def _print_agent_round(self, round_index):
+        print_info(f"Agent round {round_index}/{self.max_agent_rounds}")
+
+    def _execute_agent_tool(self, name, tool_input):
+        self.agent_tool_calls += 1
+        print_info(f"Tool {self.agent_tool_calls}/{self.max_agent_tool_calls}: {name} {_summarize_tool_input(tool_input)}")
+        tool_result = self.agent_tools.execute(name, tool_input)
+        summary = _summarize_tool_result(tool_result)
+        if tool_result.startswith("ERROR:"):
+            print_warn(f"Tool result: {summary}")
+        else:
+            print_info(f"Tool result: {summary}")
+        return tool_result
 
     def _rollback_history(self, history_length):
         self.conversation_history = self.conversation_history[:history_length]
@@ -471,6 +610,9 @@ class LLMChat:
             messages.append({"role": role, "content": message.get("content", "")})
         return messages
 
+    def _glm_agent_messages(self):
+        return [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + self.conversation_history
+
     @staticmethod
     def _get_field(item, field, default=None):
         if isinstance(item, dict):
@@ -482,3 +624,31 @@ class LLMChat:
 
     def get_history(self):
         return self.conversation_history
+
+
+def _summarize_tool_input(tool_input):
+    if isinstance(tool_input, str):
+        text = tool_input
+    else:
+        try:
+            text = json.dumps(tool_input, ensure_ascii=False)
+        except TypeError:
+            text = str(tool_input)
+    return _single_line(text, 280)
+
+
+def _summarize_tool_result(tool_result):
+    if not tool_result:
+        return "(empty)"
+    return _single_line(str(tool_result).splitlines()[0], 220)
+
+
+def _single_line(text, max_chars):
+    text = " ".join(str(text or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+
+
+def _error_text(message):
+    return f"ERROR: {message}"

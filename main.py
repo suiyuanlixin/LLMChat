@@ -91,6 +91,8 @@ def main():
             thinking_mode=config.thinking_mode,
             agent_mode=config.agent_mode,
             workspace_dir=workspace_dir,
+            max_agent_rounds=config.max_agent_rounds,
+            max_agent_tool_calls=config.max_agent_tool_calls,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")

@@ -377,7 +377,29 @@ def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content
     console.print(background_block(f"New:\n{new_content}", SUCCESS_COLOR[0]))
     answer = console.input(
         Text.assemble(
-            gradient_text("Continue? (y/N, default: N): ", *TEXT_COLOR),
+            gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
+        )
+    )
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def get_agent_patch_confirmation(file_path, start_line, end_line, old_content, new_content):
+    console.print(
+        Text.assemble(
+            "\n",
+            gradient_text("[-]", *INFO_COLOR),
+            gradient_text(
+                f" Allow agent to patch file? ({file_path}:{start_line}-{end_line})\n",
+                *TEXT_COLOR,
+            ),
+        ),
+        end="",
+    )
+    console.print(background_block(f"Old lines:\n{old_content}", ERROR_COLOR[0]))
+    console.print(background_block(f"New lines:\n{new_content}", SUCCESS_COLOR[0]))
+    answer = console.input(
+        Text.assemble(
+            gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
         )
     )
     return answer.strip().lower() in {"y", "yes"}

@@ -1,5 +1,13 @@
 from ui import print_error, print_success, print_warn, print_info
-from config import parse_max_tokens, parse_temperature, save_config_field, update_config
+from config import (
+    parse_agent_rounds,
+    parse_agent_tool_calls,
+    parse_max_tokens,
+    parse_temperature,
+    save_config_field,
+    save_config_fields,
+    update_config,
+)
 from session import save_conversation, load_conversation
 
 COMMANDS = {
@@ -13,7 +21,7 @@ COMMANDS = {
     "/temp": "Set the temperature for responses (Example: /temp 0.7).",
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
-    "/agent": "Toggle local file-editing agent mode (Example: /agent on).",
+    "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent budget 12 40).",
 }
 
 
@@ -65,6 +73,7 @@ def handle_conf(chat, args):
                 result.stream_mode,
                 result.thinking_mode,
             )
+            chat.set_agent_limits(result.max_agent_rounds, result.max_agent_tool_calls)
         except Exception as error:
             print_error(f"Failed to apply configuration: {error}")
             return True
@@ -158,11 +167,18 @@ def handle_agent(chat, args):
 
     if args is None:
         current = "on" if status["enabled"] else "off"
-        print_info(f"Current agent mode: {current}. Workspace: {workspace}. Usage: /agent on | /agent off")
+        running = "running" if status.get("running") else "idle"
+        budget = f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
+        print_info(
+            f"Current agent mode: {current} ({running}). Budget: {budget}. "
+            f"Usage: /agent on | /agent off | /agent stop | "
+            f"/agent budget <rounds> <tool-calls>"
+        )
         return True
 
-    mode = args.lower().strip()
-    if mode == "on":
+    parts = args.split()
+    mode = parts[0].lower().strip() if parts else ""
+    if mode == "on" and len(parts) == 1:
         if not status["workspace_dir"]:
             chat.set_agent_mode(False)
             save_config_field("agent_mode", False)
@@ -170,13 +186,47 @@ def handle_agent(chat, args):
             return True
         chat.set_agent_mode(True)
         save_config_field("agent_mode", True)
-        print_success(f"Agent mode turned on. Workspace: {workspace}")
-    elif mode == "off":
+        print_success(f"Agent mode turned on.")
+    elif mode == "off" and len(parts) == 1:
         chat.set_agent_mode(False)
         save_config_field("agent_mode", False)
         print_success("Agent mode turned off.")
+    elif mode == "stop" and len(parts) == 1:
+        if chat.request_agent_stop():
+            print_warn("Agent stop requested.")
+        else:
+            print_info("No agent task is currently running.")
+    elif mode in {"budget", "limits"}:
+        if len(parts) == 1:
+            print_info(
+                f"Current agent budget: {status.get('max_rounds')} rounds / "
+                f"{status.get('max_tool_calls')} tool calls. "
+                f"Usage: /agent budget <rounds> <tool-calls>"
+            )
+            return True
+        if len(parts) != 3:
+            print_error("Usage: /agent budget <rounds> <tool-calls>")
+            return True
+        try:
+            max_rounds = parse_agent_rounds(parts[1])
+            max_tool_calls = parse_agent_tool_calls(parts[2])
+        except ValueError as error:
+            print_error(str(error))
+            return True
+
+        chat.set_agent_limits(max_rounds, max_tool_calls)
+        save_config_fields(
+            {
+                "max_agent_rounds": max_rounds,
+                "max_agent_tool_calls": max_tool_calls,
+            }
+        )
+        print_success(f"Agent budget set to {max_rounds} rounds / {max_tool_calls} tool calls.")
     else:
-        print_error(f"Invalid option: {mode}. Use /agent on or /agent off.")
+        print_error(
+            f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
+            f"/agent budget <rounds> <tool-calls>."
+        )
     return True
 
 
