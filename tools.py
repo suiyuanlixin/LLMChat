@@ -1,11 +1,12 @@
 import fnmatch
+import difflib
 import json
 import os
 import re
 import subprocess
 from pathlib import Path
 
-from ui import get_agent_edit_confirmation, get_agent_patch_confirmation, get_user_input
+from ui import get_agent_diff_confirmation, get_user_input
 
 
 MAX_READ_CHARS = 60000
@@ -14,6 +15,9 @@ MAX_GREP_MATCHES = 200
 MAX_GLOB_MATCHES = 500
 MAX_LIST_ENTRIES = 300
 COMMAND_TIMEOUT_SECONDS = 60
+GIT_TIMEOUT_SECONDS = 30
+AGENT_APPROVAL_CONFIRM = "confirm"
+AGENT_APPROVAL_AUTO = "auto"
 
 SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
 
@@ -68,7 +72,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "write_file",
-        "description": "Create or overwrite a UTF-8 text file in the configured workspace. Requires user confirmation.",
+        "description": "Create or overwrite a UTF-8 text file in the configured workspace. Shows a unified diff before writing unless auto approval is enabled.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -86,7 +90,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "edit_file",
-        "description": "Edit a text file by replacing an exact string. Requires user confirmation.",
+        "description": "Edit a text file by replacing an exact string. Shows a unified diff before writing unless auto approval is enabled.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -112,7 +116,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "apply_patch",
-        "description": "Replace a 1-based inclusive line range in a text file. Requires user confirmation and shows old/new content.",
+        "description": "Replace a 1-based inclusive line range in a text file. Shows a unified diff before writing unless auto approval is enabled.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -137,6 +141,24 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "apply_unified_patch",
+        "description": "Apply a unified diff patch to one UTF-8 text file. Validates context lines and shows the resulting diff unless auto approval is enabled.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Absolute path or workspace-relative path to edit.",
+                },
+                "patch": {
+                    "type": "string",
+                    "description": "Unified diff for this file, including @@ hunk headers and +/-/space lines.",
+                },
+            },
+            "required": ["file_path", "patch"],
+        },
+    },
+    {
         "name": "bash",
         "description": "Run a shell command inside the configured workspace. Commands with obvious file writes or deletes require user confirmation.",
         "input_schema": {
@@ -148,6 +170,39 @@ TOOL_DEFINITIONS = [
                 }
             },
             "required": ["command"],
+        },
+    },
+    {
+        "name": "git_status",
+        "description": "Show the workspace git status in short format. Read-only and does not require confirmation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "git_diff",
+        "description": "Show git diff output, diff stat, or diff whitespace checks for the workspace. Read-only and does not require confirmation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative or absolute file path to limit the diff.",
+                },
+                "cached": {
+                    "type": "boolean",
+                    "description": "Show staged changes instead of unstaged changes. Defaults to false.",
+                },
+                "stat": {
+                    "type": "boolean",
+                    "description": "Return diff statistics instead of the full patch. Defaults to false.",
+                },
+                "check": {
+                    "type": "boolean",
+                    "description": "Run git diff --check to find whitespace/conflict-marker issues. Defaults to false.",
+                },
+            },
         },
     },
     {
@@ -216,8 +271,10 @@ class AgentToolError(Exception):
 
 
 class AgentTools:
-    def __init__(self, workspace_dir=None):
+    def __init__(self, workspace_dir=None, approval_mode=AGENT_APPROVAL_CONFIRM):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
+        self.set_approval_mode(approval_mode)
+        self.begin_agent_session()
 
     @property
     def enabled(self):
@@ -225,6 +282,77 @@ class AgentTools:
 
     def set_workspace_dir(self, workspace_dir):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
+
+    def set_approval_mode(self, approval_mode):
+        mode = str(approval_mode or AGENT_APPROVAL_CONFIRM).strip().lower()
+        if mode not in {AGENT_APPROVAL_CONFIRM, AGENT_APPROVAL_AUTO}:
+            mode = AGENT_APPROVAL_CONFIRM
+        self.approval_mode = mode
+
+    def begin_agent_session(self):
+        self.session_changed_files = []
+        self._session_changed_file_set = set()
+        self.session_mutating_commands = []
+        self.output_needs_separator = False
+
+    def consume_output_separator(self):
+        needs_separator = self.output_needs_separator
+        self.output_needs_separator = False
+        return needs_separator
+
+    def session_has_changes(self):
+        return bool(self.session_changed_files or self.session_mutating_commands)
+
+    def session_change_count(self):
+        return len(self.session_changed_files) + len(self.session_mutating_commands)
+
+    def session_summary(self):
+        parts = []
+        if self.session_changed_files:
+            parts.append(
+                "Changed files: " + ", ".join(self.session_changed_files)
+            )
+        if self.session_mutating_commands:
+            parts.append(
+                "Mutating commands: "
+                + "; ".join(_truncate(command, 180) for command in self.session_mutating_commands)
+            )
+        return "\n".join(parts)
+
+    def final_check(self):
+        if not self.enabled:
+            return _error_result("No workspace directory")
+
+        sections = []
+        diff_scope = "workspace"
+        diff_path_args = []
+        if self.session_changed_files and not self.session_mutating_commands:
+            diff_scope = "agent-edited files"
+            diff_path_args = ["--"] + self.session_changed_files
+
+        if self.session_changed_files:
+            sections.append(
+                "Agent-edited files:\n" + "\n".join(f"- {path}" for path in self.session_changed_files)
+            )
+        if self.session_mutating_commands:
+            sections.append(
+                "Agent mutating commands:\n"
+                + "\n".join(f"- {_truncate(command, 220)}" for command in self.session_mutating_commands)
+            )
+
+        sections.append(
+            f"git diff --check ({diff_scope}):\n"
+            + self._run_git_command(["diff", "--check"] + diff_path_args, "(no whitespace errors)")
+        )
+        sections.append(
+            "git status --short:\n"
+            + self._run_git_command(["status", "--short"], "(working tree clean)")
+        )
+        sections.append(
+            f"git diff --stat ({diff_scope}):\n"
+            + self._run_git_command(["diff", "--stat"] + diff_path_args, "(no tracked diff)")
+        )
+        return "\n\n".join(sections)
 
     def execute(self, name, tool_input):
         if not self.enabled:
@@ -242,7 +370,10 @@ class AgentTools:
                 "write_file": self._write_file,
                 "edit_file": self._edit_file,
                 "apply_patch": self._apply_patch,
+                "apply_unified_patch": self._apply_unified_patch,
                 "bash": self._bash,
+                "git_status": self._git_status,
+                "git_diff": self._git_diff,
                 "grep": self._grep,
                 "glob": self._glob,
             }
@@ -334,15 +465,20 @@ class AgentTools:
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
         content = _required_string(tool_input, "content", allow_empty=True)
         action = "overwrite" if file_path.exists() else "create"
+        old_content = file_path.read_text(encoding="utf-8", errors="replace") if file_path.exists() else ""
+        diff = _unified_diff_text(old_content, content, self._display_path(file_path))
 
-        if not self._confirm(
+        if not self._confirm_diff(
             f"Allow agent to {action} file?",
-            f"{self._display_path(file_path)} ({len(content)} characters)",
+            self._display_path(file_path),
+            diff or f"(no content changes, {len(content)} characters)",
+            "file_edit",
         ):
             return _error_result("User rejected write_file.")
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
+        self._record_changed_file(file_path)
         return f"Wrote {len(content)} characters to {self._display_path(file_path)}."
 
     def _edit_file(self, tool_input):
@@ -364,16 +500,19 @@ class AgentTools:
             )
 
         replace_count = occurrences if replace_all else 1
-        if not get_agent_edit_confirmation(
+        updated = content.replace(old_string, new_string, replace_count)
+        diff = _unified_diff_text(content, updated, self._display_path(file_path))
+
+        if not self._confirm_diff(
+            f"Allow agent to edit file? ({replace_count} replacement(s))",
             self._display_path(file_path),
-            replace_count,
-            old_string,
-            new_string,
+            diff,
+            "file_edit",
         ):
             return _error_result("User rejected edit_file.")
 
-        updated = content.replace(old_string, new_string, replace_count)
         file_path.write_text(updated, encoding="utf-8")
+        self._record_changed_file(file_path)
         return f"Edited {self._display_path(file_path)} ({replace_count} replacement(s))."
 
     def _apply_patch(self, tool_input):
@@ -396,23 +535,47 @@ class AgentTools:
         new_lines = new_content.splitlines()
         old_display = _format_lines(old_lines, start_line, True)
         new_display = _format_lines(new_lines, start_line, True) if new_lines else "(delete selected lines)"
-
-        if not get_agent_patch_confirmation(
-            self._display_path(file_path),
-            start_line,
-            end_line,
-            old_display,
-            new_display,
-        ):
-            return _error_result("User rejected apply_patch.")
-
         updated_lines = lines[: start_line - 1] + new_lines + lines[end_line:]
         newline = _detect_newline(content)
         updated = newline.join(updated_lines)
         if content.endswith(("\n", "\r")):
             updated += newline
+        diff = _unified_diff_text(content, updated, self._display_path(file_path))
+
+        if not self._confirm_diff(
+            f"Allow agent to patch file? (lines {start_line}-{end_line})",
+            self._display_path(file_path),
+            diff or f"Old lines:\n{old_display}\n\nNew lines:\n{new_display}",
+            "file_edit",
+        ):
+            return _error_result("User rejected apply_patch.")
+
         file_path.write_text(updated, encoding="utf-8")
+        self._record_changed_file(file_path)
         return f"Patched {self._display_path(file_path)} (lines {start_line}-{end_line})."
+
+    def _apply_unified_patch(self, tool_input):
+        file_path = self._resolve_path(_required_string(tool_input, "file_path"))
+        patch = _required_string(tool_input, "patch")
+
+        if not file_path.is_file():
+            raise AgentToolError(f"File does not exist: {self._display_path(file_path)}")
+
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        updated = _apply_unified_diff_to_content(content, patch)
+        diff = _unified_diff_text(content, updated, self._display_path(file_path))
+
+        if not self._confirm_diff(
+            "Allow agent to apply unified patch?",
+            self._display_path(file_path),
+            diff or patch,
+            "file_edit",
+        ):
+            return _error_result("User rejected apply_unified_patch.")
+
+        file_path.write_text(updated, encoding="utf-8")
+        self._record_changed_file(file_path)
+        return f"Applied unified patch to {self._display_path(file_path)}."
 
     def _bash(self, tool_input):
         command = _required_string(tool_input, "command")
@@ -422,8 +585,9 @@ class AgentTools:
         if risk_level == "blocked":
             raise AgentToolError(f"Command blocked: {risk_reason}")
         if risk_level == "confirm" and not self._confirm(
-            "Allow agent to run a command that may modify files?",
+            "Allow agent to run a command?",
             f"{risk_reason}\n{command}",
+            risk_reason,
         ):
             return _error_result("User rejected bash command.")
 
@@ -437,6 +601,8 @@ class AgentTools:
             errors="replace",
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
+        if risk_level == "confirm" and risk_reason != "script or shell execution detected":
+            self._record_mutating_command(command)
         output = completed.stdout or ""
         error_output = completed.stderr or ""
         combined = output
@@ -446,6 +612,35 @@ class AgentTools:
             combined = "(no output)"
         combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
         return f"Exit code: {completed.returncode}\n{combined}"
+
+    def _git_status(self, tool_input):
+        return self._run_git_command(["status", "--short"], "(working tree clean)")
+
+    def _git_diff(self, tool_input):
+        cached = _optional_bool(tool_input, "cached", False)
+        stat = _optional_bool(tool_input, "stat", False)
+        check = _optional_bool(tool_input, "check", False)
+        if stat and check:
+            raise AgentToolError("Use either stat=true or check=true, not both.")
+
+        args = ["diff"]
+        if cached:
+            args.append("--cached")
+        if check:
+            args.append("--check")
+            empty_message = "(no whitespace errors)"
+        elif stat:
+            args.append("--stat")
+            empty_message = "(no tracked diff)"
+        else:
+            empty_message = "(no tracked diff)"
+
+        file_path = tool_input.get("file_path")
+        if file_path:
+            resolved = self._resolve_path(file_path)
+            args.extend(["--", str(resolved.relative_to(self.workspace_dir))])
+
+        return self._run_git_command(args, empty_message)
 
     def _grep(self, tool_input):
         pattern = _required_string(tool_input, "pattern")
@@ -552,6 +747,42 @@ class AgentTools:
         except ValueError:
             return str(path)
 
+    def _record_changed_file(self, file_path):
+        display_path = self._display_path(file_path)
+        if display_path not in self._session_changed_file_set:
+            self._session_changed_file_set.add(display_path)
+            self.session_changed_files.append(display_path)
+
+    def _record_mutating_command(self, command):
+        self.session_mutating_commands.append(command)
+
+    def _run_git_command(self, args, empty_message):
+        try:
+            completed = subprocess.run(
+                ["git"] + list(args),
+                cwd=str(self.workspace_dir),
+                shell=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            return "Exit code: 127\nERROR: git executable was not found."
+        except subprocess.TimeoutExpired:
+            return f"ERROR: git command timed out after {GIT_TIMEOUT_SECONDS} seconds."
+
+        output = completed.stdout or ""
+        error_output = completed.stderr or ""
+        combined = output
+        if error_output:
+            combined = f"{combined}\n[stderr]\n{error_output}" if combined else f"[stderr]\n{error_output}"
+        if not combined:
+            combined = empty_message
+        combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
+        return f"Exit code: {completed.returncode}\n{combined}"
+
     def _validate_command_scope(self, command):
         if _has_parent_reference(command):
             raise AgentToolError("Bash command cannot contain parent directory references.")
@@ -570,9 +801,30 @@ class AgentTools:
         if re.search(r"(?i)(\$env:|%[^%\s]+%|\$home|~)", command):
             raise AgentToolError("Bash command cannot reference environment or home paths.")
 
-    def _confirm(self, title, detail):
+    def _confirm_diff(self, title, file_path, diff_content, risk_reason):
+        if self._auto_approves(risk_reason):
+            return True
+        approved = get_agent_diff_confirmation(title, file_path, diff_content)
+        self.output_needs_separator = True
+        return approved
+
+    def _confirm(self, title, detail, risk_reason=""):
+        if self._auto_approves(risk_reason):
+            return True
         answer = get_user_input(f"{title}\n{detail}\nContinue? (Y/N, Default: N): ")
+        self.output_needs_separator = True
         return answer.strip().lower() in {"y", "yes"}
+
+    def _auto_approves(self, risk_reason):
+        if self.approval_mode != AGENT_APPROVAL_AUTO:
+            return False
+        blocked_reasons = (
+            "delete command detected",
+            "mutating git command detected",
+            "package manager mutation detected",
+            "package installation detected",
+        )
+        return risk_reason not in blocked_reasons
 
 
 def normalize_workspace_dir(workspace_dir):
@@ -585,6 +837,91 @@ def normalize_workspace_dir(workspace_dir):
     if not path.is_dir():
         return None
     return path
+
+
+def _unified_diff_text(old_content, new_content, display_path):
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+    diff_lines = difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"a/{display_path}",
+        tofile=f"b/{display_path}",
+        lineterm="",
+    )
+    return "\n".join(diff_lines)
+
+
+def _apply_unified_diff_to_content(content, patch):
+    original_lines = content.splitlines()
+    output_lines = []
+    position = 0
+    patch_lines = patch.splitlines()
+    index = 0
+    saw_hunk = False
+
+    while index < len(patch_lines):
+        line = patch_lines[index]
+        hunk_match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+        if not hunk_match:
+            index += 1
+            continue
+
+        saw_hunk = True
+        old_start = int(hunk_match.group(1))
+        target = max(old_start - 1, 0)
+        if target < position:
+            raise AgentToolError("Unified patch hunks overlap or are out of order.")
+
+        output_lines.extend(original_lines[position:target])
+        position = target
+        index += 1
+
+        while index < len(patch_lines):
+            hunk_line = patch_lines[index]
+            if hunk_line.startswith("@@ "):
+                break
+            if hunk_line.startswith("\\"):
+                index += 1
+                continue
+            if not hunk_line:
+                raise AgentToolError("Invalid unified patch hunk line.")
+
+            marker = hunk_line[0]
+            text = hunk_line[1:]
+            if marker == " ":
+                _assert_patch_line_matches(original_lines, position, text)
+                output_lines.append(original_lines[position])
+                position += 1
+            elif marker == "-":
+                _assert_patch_line_matches(original_lines, position, text)
+                position += 1
+            elif marker == "+":
+                output_lines.append(text)
+            else:
+                raise AgentToolError(f"Invalid unified patch hunk marker: {marker}")
+            index += 1
+
+    if not saw_hunk:
+        raise AgentToolError("Unified patch does not contain any @@ hunks.")
+
+    output_lines.extend(original_lines[position:])
+    newline = _detect_newline(content)
+    updated = newline.join(output_lines)
+    if content.endswith(("\n", "\r")):
+        updated += newline
+    return updated
+
+
+def _assert_patch_line_matches(lines, position, expected):
+    if position >= len(lines):
+        raise AgentToolError("Unified patch context exceeds file length.")
+    actual = lines[position]
+    if actual != expected:
+        raise AgentToolError(
+            "Unified patch context mismatch at line "
+            f"{position + 1}. Expected {expected!r}, found {actual!r}."
+        )
 
 
 def _required_string(data, key, allow_empty=False):

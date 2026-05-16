@@ -17,6 +17,8 @@ DEFAULT_THINKING_MODE = False
 DEFAULT_AGENT_MODE = False
 DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
+DEFAULT_AGENT_APPROVAL_MODE = "confirm"
+AGENT_APPROVAL_MODES = {"confirm", "auto"}
 SUPPORTED_API_TYPES = {API_TYPE_GLM, API_TYPE_ANTHROPIC}
 API_TYPE_ALIASES = {
     "zhipu": API_TYPE_GLM,
@@ -43,6 +45,7 @@ class AppConfig:
     agent_mode: bool = DEFAULT_AGENT_MODE
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
+    agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
 
     def to_dict(self):
         return {
@@ -57,6 +60,7 @@ class AppConfig:
             "agent_mode": self.agent_mode,
             "max_agent_rounds": self.max_agent_rounds,
             "max_agent_tool_calls": self.max_agent_tool_calls,
+            "agent_approval_mode": self.agent_approval_mode,
         }
 
 
@@ -84,6 +88,7 @@ def _default_config():
         "agent_mode": DEFAULT_AGENT_MODE,
         "max_agent_rounds": DEFAULT_MAX_AGENT_ROUNDS,
         "max_agent_tool_calls": DEFAULT_MAX_AGENT_TOOL_CALLS,
+        "agent_approval_mode": DEFAULT_AGENT_APPROVAL_MODE,
     }
 
 
@@ -108,6 +113,13 @@ def parse_agent_rounds(value):
 
 def parse_agent_tool_calls(value):
     return _parse_positive_integer(value, "Agent max tool calls")
+
+
+def parse_agent_approval_mode(value):
+    mode = str(value or DEFAULT_AGENT_APPROVAL_MODE).strip().lower()
+    if mode not in AGENT_APPROVAL_MODES:
+        raise ValueError("Agent approval mode must be confirm or auto.")
+    return mode
 
 
 def parse_temperature(value):
@@ -161,6 +173,16 @@ def _sanitize_config(config):
     config["stream_mode"] = _parse_bool(config.get("stream_mode"), DEFAULT_STREAM_MODE)
     config["thinking_mode"] = _parse_bool(config.get("thinking_mode"), DEFAULT_THINKING_MODE)
     config["agent_mode"] = _parse_bool(config.get("agent_mode"), DEFAULT_AGENT_MODE)
+    try:
+        config["agent_approval_mode"] = parse_agent_approval_mode(
+            config.get("agent_approval_mode", DEFAULT_AGENT_APPROVAL_MODE)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid agent_approval_mode in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_AGENT_APPROVAL_MODE}."
+        )
+        config["agent_approval_mode"] = DEFAULT_AGENT_APPROVAL_MODE
 
     try:
         config["max_agent_rounds"] = parse_agent_rounds(
@@ -244,6 +266,18 @@ def _prompt_agent_tool_calls(prompt, default_value):
             print_error(str(error))
 
 
+def _prompt_agent_approval_mode(prompt, default_value):
+    while True:
+        value = get_user_input(prompt).strip()
+        if not value:
+            return default_value
+
+        try:
+            return parse_agent_approval_mode(value)
+        except ValueError as error:
+            print_error(str(error))
+
+
 def _prompt_temperature(prompt, default_value):
     while True:
         value = get_user_input(prompt).strip()
@@ -293,6 +327,7 @@ def load_config():
         agent_mode=DEFAULT_AGENT_MODE,
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
+        agent_approval_mode=DEFAULT_AGENT_APPROVAL_MODE,
     )
     _save_config(config)
 
@@ -370,6 +405,10 @@ def update_config():
         f"Agent max tool calls (Current: {config.max_agent_tool_calls}): ",
         config.max_agent_tool_calls,
     )
+    new_agent_approval_mode = _prompt_agent_approval_mode(
+        f"Agent approval mode confirm/auto (Current: {config.agent_approval_mode}): ",
+        config.agent_approval_mode,
+    )
 
     new_config = AppConfig(
         api_type=new_api_type,
@@ -383,6 +422,7 @@ def update_config():
         agent_mode=config.agent_mode,
         max_agent_rounds=new_max_agent_rounds,
         max_agent_tool_calls=new_max_agent_tool_calls,
+        agent_approval_mode=new_agent_approval_mode,
     )
     _save_config(new_config)
     return new_config

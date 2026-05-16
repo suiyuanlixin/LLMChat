@@ -52,6 +52,23 @@ def background_block(content, background_color):
     return table
 
 
+def diff_background_block(content):
+    table = Table.grid(expand=True, padding=(0, 0))
+    table.add_column(ratio=1)
+
+    lines = str(content or "").splitlines() or [""]
+    for line in lines:
+        if line.startswith("+") and not line.startswith("+++"):
+            style = f"bold {TEXT_COLOR[1]} on {SUCCESS_COLOR[0]}"
+        elif line.startswith("-") and not line.startswith("---"):
+            style = f"bold {TEXT_COLOR[1]} on {ERROR_COLOR[0]}"
+        else:
+            style = f"bold {TEXT_COLOR[1]}"
+        table.add_row(Text(line, style=style))
+
+    return table
+
+
 def _blend_channels(start, end, progress):
     return ",".join(
         str(round(start_value + (end_value - start_value) * progress))
@@ -121,10 +138,11 @@ def print_thinking(content):
     )
 
 
-def print_stream_thinking(content):
+def print_stream_thinking(content, leading_newline=True):
+    prefix = "\n" if leading_newline else ""
     console.print(
         Text.assemble(
-            "\n",
+            prefix,
             gradient_text("[*] Thinking: ", *THINK_COLOR),
             Text(content, style=f"bold {STREAM_THINK_COLOR}"),
         ),
@@ -397,6 +415,24 @@ def get_agent_patch_confirmation(file_path, start_line, end_line, old_content, n
     )
     console.print(background_block(f"Old lines:\n{old_content}", ERROR_COLOR[0]))
     console.print(background_block(f"New lines:\n{new_content}", SUCCESS_COLOR[0]))
+    answer = console.input(
+        Text.assemble(
+            gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
+        )
+    )
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def get_agent_diff_confirmation(title, file_path, diff_content):
+    console.print(
+        Text.assemble(
+            "\n",
+            gradient_text("[-]", *INFO_COLOR),
+            gradient_text(f" {title} ({file_path})\n", *TEXT_COLOR),
+        ),
+        end="",
+    )
+    console.print(diff_background_block(diff_content))
     answer = console.input(
         Text.assemble(
             gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),

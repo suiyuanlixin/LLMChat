@@ -1,5 +1,6 @@
 from ui import print_error, print_success, print_warn, print_info
 from config import (
+    parse_agent_approval_mode,
     parse_agent_rounds,
     parse_agent_tool_calls,
     parse_max_tokens,
@@ -74,6 +75,7 @@ def handle_conf(chat, args):
                 result.thinking_mode,
             )
             chat.set_agent_limits(result.max_agent_rounds, result.max_agent_tool_calls)
+            chat.set_agent_approval_mode(result.agent_approval_mode)
         except Exception as error:
             print_error(f"Failed to apply configuration: {error}")
             return True
@@ -169,10 +171,11 @@ def handle_agent(chat, args):
         current = "on" if status["enabled"] else "off"
         running = "running" if status.get("running") else "idle"
         budget = f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
+        approval = status.get("approval_mode", "confirm")
         print_info(
-            f"Current agent mode: {current} ({running}). Budget: {budget}. "
+            f"Current agent mode: {current} ({running}). Budget: {budget}. Approval: {approval}. "
             f"Usage: /agent on | /agent off | /agent stop | "
-            f"/agent budget <rounds> <tool-calls>"
+            f"/agent budget <rounds> <tool-calls> | /agent approve confirm|auto"
         )
         return True
 
@@ -222,10 +225,29 @@ def handle_agent(chat, args):
             }
         )
         print_success(f"Agent budget set to {max_rounds} rounds / {max_tool_calls} tool calls.")
+    elif mode in {"approve", "approval"}:
+        if len(parts) == 1:
+            print_info(
+                f"Current agent approval mode: {status.get('approval_mode', 'confirm')}. "
+                "Usage: /agent approve confirm|auto"
+            )
+            return True
+        if len(parts) != 2:
+            print_error("Usage: /agent approve confirm|auto")
+            return True
+        try:
+            approval_mode = parse_agent_approval_mode(parts[1])
+        except ValueError as error:
+            print_error(str(error))
+            return True
+
+        chat.set_agent_approval_mode(approval_mode)
+        save_config_field("agent_approval_mode", approval_mode)
+        print_success(f"Agent approval mode set to {approval_mode}.")
     else:
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
-            f"/agent budget <rounds> <tool-calls>."
+            f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto."
         )
     return True
 

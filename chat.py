@@ -1,6 +1,13 @@
 import json
 
-from ui import console, print_error, print_info, print_stream_thinking, print_stream_response_start, print_warn
+from ui import (
+    console,
+    print_error,
+    print_stream_thinking,
+    print_stream_thinking_continue,
+    print_stream_response_start,
+    print_warn,
+)
 from config import (
     API_TYPE_ANTHROPIC,
     API_TYPE_GLM,
@@ -11,6 +18,10 @@ from config import (
 from tools import AgentTools, anthropic_tool_schemas, glm_tool_schemas
 
 
+AGENT_CONTEXT_WARN_CHARS = 180000
+AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
+
+
 AGENT_SYSTEM_PROMPT = """You are in local workspace agent mode.
 
 Rules:
@@ -18,8 +29,11 @@ Rules:
 - Explore before editing: list directories, search, and read relevant line ranges first.
 - Prefer small, targeted changes. Do not rewrite unrelated code.
 - Use read_file with line ranges and line numbers when a file is long.
-- Prefer apply_patch for line-based edits and edit_file for exact small replacements.
+- Prefer apply_unified_patch for contextual edits, apply_patch for simple line-range edits, and edit_file for exact small replacements.
+- Use git_status and git_diff to understand existing and resulting workspace changes.
 - After editing, run a lightweight verification command when it is safe and relevant.
+- Do not claim the task is complete until you have inspected the resulting diff or verification output.
+- In the final summary, distinguish files you edited in this run from pre-existing workspace changes.
 - If a tool fails, explain the failure and try a different precise approach instead of repeating the same call.
 - Stop when the task is complete and summarize what changed."""
 
@@ -39,17 +53,23 @@ class LLMChat:
         workspace_dir=None,
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
+        agent_approval_mode="confirm",
     ):
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
-        self.agent_tools = AgentTools(workspace_dir)
+        self.agent_tools = AgentTools(workspace_dir, approval_mode=agent_approval_mode)
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
         self.max_agent_rounds = max(1, int(max_agent_rounds))
         self.max_agent_tool_calls = max(1, int(max_agent_tool_calls))
         self.agent_running = False
         self.agent_stop_requested = False
         self.agent_tool_calls = 0
+        self.agent_final_check_done = False
+        self.agent_context_warning_sent = False
+        self.agent_thinking_streamed = False
+        self.agent_thinking_needs_separator = False
+        self.agent_output_needs_separator = False
         self.configure(api_type, base_url, model, api_key, max_tokens, temperature, stream_mode)
 
     def configure(
@@ -121,6 +141,9 @@ class LLMChat:
         if max_tool_calls is not None:
             self.max_agent_tool_calls = max(1, int(max_tool_calls))
 
+    def set_agent_approval_mode(self, approval_mode):
+        self.agent_tools.set_approval_mode(approval_mode)
+
     def set_workspace_dir(self, workspace_dir):
         self.agent_tools.set_workspace_dir(workspace_dir)
         if not self.agent_tools.enabled:
@@ -144,6 +167,7 @@ class LLMChat:
             "running": self.agent_running,
             "max_rounds": self.max_agent_rounds,
             "max_tool_calls": self.max_agent_tool_calls,
+            "approval_mode": self.agent_tools.approval_mode,
         }
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
@@ -180,6 +204,8 @@ class LLMChat:
                 self._rollback_history(original_history_length)
             elif response.get("agent_stopped"):
                 self._rollback_history(original_history_length)
+            elif self.agent_mode:
+                self._compact_agent_history(original_history_length, response)
             return response
 
         except KeyboardInterrupt:
@@ -198,16 +224,34 @@ class LLMChat:
         self.agent_running = True
         self.agent_stop_requested = False
         self.agent_tool_calls = 0
+        self.agent_final_check_done = False
+        self.agent_context_warning_sent = False
+        self.agent_thinking_streamed = False
+        self.agent_thinking_needs_separator = False
+        self.agent_output_needs_separator = False
+        self.agent_tools.begin_agent_session()
         try:
             if self.api_type == API_TYPE_ANTHROPIC:
-                return self._anthropic_agent_response()
-            return self._glm_agent_response()
+                return self._finalize_agent_response(self._anthropic_agent_response())
+            return self._finalize_agent_response(self._glm_agent_response())
         except KeyboardInterrupt:
             self.agent_stop_requested = True
             print_warn("Agent stopped by user.")
-            return {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
+            return self._finalize_agent_response(
+                {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
+            )
         finally:
             self.agent_running = False
+
+    def _finalize_agent_response(self, response):
+        if response and self.agent_thinking_streamed:
+            response = dict(response)
+            response["thinking"] = ""
+            response["thinking_streamed"] = True
+            response["thinking_needs_separator"] = (
+                self.agent_thinking_needs_separator and not response.get("agent_stopped")
+            )
+        return response
 
     def _anthropic_agent_response(self):
         full_thinking = ""
@@ -217,16 +261,8 @@ class LLMChat:
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
             self._print_agent_round(round_index)
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                messages=self._anthropic_messages(),
-                system=AGENT_SYSTEM_PROMPT,
-                tools=anthropic_tool_schemas(),
-            )
-
-            blocks = self._anthropic_content_blocks(self._get_field(response, "content", []))
+            self._warn_agent_context_if_needed()
+            blocks = self._stream_anthropic_agent_turn()
             self.conversation_history.append({"role": "assistant", "content": blocks})
 
             thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
@@ -234,6 +270,9 @@ class LLMChat:
             final_response += text
 
             if not tool_uses:
+                if self._append_agent_final_check_if_needed():
+                    final_response = ""
+                    continue
                 return {"thinking": full_thinking, "response": final_response}
 
             if self._agent_tool_budget_exceeded(len(tool_uses)):
@@ -252,6 +291,7 @@ class LLMChat:
                         ],
                     }
                 )
+                self._separate_after_agent_thinking()
                 print_error(message)
                 return {"thinking": full_thinking, "response": final_response or message}
 
@@ -274,6 +314,7 @@ class LLMChat:
             self.conversation_history.append({"role": "user", "content": tool_results})
 
         message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        self._separate_after_agent_thinking()
         print_error(message)
         return {"thinking": full_thinking, "response": final_response or message}
 
@@ -285,6 +326,7 @@ class LLMChat:
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
             self._print_agent_round(round_index)
+            self._warn_agent_context_if_needed()
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=self._glm_agent_messages(),
@@ -298,9 +340,13 @@ class LLMChat:
             assistant_message, thinking_content, text, tool_calls = self._glm_message_parts(message)
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
+            self._stream_agent_thinking(thinking_content)
             final_response += text
 
             if not tool_calls:
+                if self._append_agent_final_check_if_needed():
+                    final_response = ""
+                    continue
                 return {"thinking": full_thinking, "response": final_response}
 
             if self._agent_tool_budget_exceeded(len(tool_calls)):
@@ -314,6 +360,7 @@ class LLMChat:
                             "content": _error_text(message),
                         }
                     )
+                self._separate_after_agent_thinking()
                 print_error(message)
                 return {"thinking": full_thinking, "response": final_response or message}
 
@@ -331,14 +378,87 @@ class LLMChat:
                 )
 
         message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        self._separate_after_agent_thinking()
         print_error(message)
         return {"thinking": full_thinking, "response": final_response or message}
+
+    def _stream_anthropic_agent_turn(self):
+        blocks = []
+        active_block_index = None
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            messages=self._anthropic_messages(),
+            system=AGENT_SYSTEM_PROMPT,
+            tools=anthropic_tool_schemas(),
+            stream=True,
+        )
+
+        for chunk in response:
+            chunk_type = self._get_field(chunk, "type", "")
+
+            if chunk_type == "content_block_start":
+                content_block = self._get_field(chunk, "content_block")
+                block_type = self._get_field(content_block, "type", "")
+                if block_type == "text":
+                    block = {"type": "text", "text": ""}
+                elif block_type == "thinking":
+                    block = {"type": "thinking", "thinking": ""}
+                elif block_type == "tool_use":
+                    block = {
+                        "type": "tool_use",
+                        "id": self._get_field(content_block, "id", "") or "",
+                        "name": self._get_field(content_block, "name", "") or "",
+                        "input": {},
+                        "_input_json": "",
+                    }
+                else:
+                    block = {"type": block_type or "unknown"}
+                blocks.append(block)
+                active_block_index = len(blocks) - 1
+                continue
+
+            if chunk_type == "content_block_delta" and active_block_index is not None:
+                delta = self._get_field(chunk, "delta")
+                delta_type = self._get_field(delta, "type", "")
+                block = blocks[active_block_index]
+
+                if delta_type == "text_delta":
+                    block["text"] = block.get("text", "") + (self._get_field(delta, "text", "") or "")
+                elif delta_type == "thinking_delta":
+                    thinking_delta = self._get_field(delta, "thinking", "") or ""
+                    block["thinking"] = block.get("thinking", "") + thinking_delta
+                    self._stream_agent_thinking(thinking_delta)
+                elif delta_type == "signature_delta":
+                    block["signature"] = block.get("signature", "") + (
+                        self._get_field(delta, "signature", "") or ""
+                    )
+                elif delta_type == "input_json_delta":
+                    block["_input_json"] = block.get("_input_json", "") + (
+                        self._get_field(delta, "partial_json", "") or ""
+                    )
+                continue
+
+            if chunk_type == "content_block_stop" and active_block_index is not None:
+                block = blocks[active_block_index]
+                if block.get("type") == "tool_use":
+                    raw_input = block.pop("_input_json", "")
+                    if raw_input:
+                        block["input"] = self._parse_tool_arguments(raw_input)
+                active_block_index = None
+
+        for block in blocks:
+            block.pop("_input_json", None)
+        return blocks
 
     def _agent_should_stop(self):
         return self.agent_stop_requested
 
     def _agent_stopped_response(self, thinking, response):
         message = "Agent stopped by user."
+        self._separate_after_agent_thinking()
         print_warn(message)
         return {
             "thinking": thinking,
@@ -353,18 +473,100 @@ class LLMChat:
         return f"Agent stopped after {self.max_agent_tool_calls} tool calls."
 
     def _print_agent_round(self, round_index):
-        print_info(f"Agent round {round_index}/{self.max_agent_rounds}")
+        return
+
+    def _stream_agent_thinking(self, content):
+        if not self.thinking_mode or not content:
+            return
+        leading_newline = True
+        if self.agent_output_needs_separator:
+            console.print()
+            self.agent_output_needs_separator = False
+            self.agent_thinking_streamed = False
+            self.agent_thinking_needs_separator = False
+            leading_newline = False
+        if not self.agent_thinking_streamed:
+            print_stream_thinking("", leading_newline=leading_newline)
+            self.agent_thinking_streamed = True
+        print_stream_thinking_continue(content)
+        self.agent_thinking_needs_separator = True
+
+    def _separate_after_agent_thinking(self):
+        if not self.agent_thinking_needs_separator:
+            return
+        console.print()
+        self.agent_thinking_needs_separator = False
+
+    def _warn_agent_context_if_needed(self):
+        if self.agent_context_warning_sent:
+            return
+        estimated_chars = _estimate_history_chars(self.conversation_history)
+        if estimated_chars < AGENT_CONTEXT_WARN_CHARS:
+            return
+
+        self.agent_context_warning_sent = True
+        warning = (
+            "Agent context budget warning: the current conversation and tool results are large. "
+            "Use narrower searches, read smaller line ranges, and avoid repeating bulky outputs."
+        )
+        self._separate_after_agent_thinking()
+        print_warn(warning)
+        self.agent_output_needs_separator = True
+        self.conversation_history.append({"role": "user", "content": warning})
+
+    def _compact_agent_history(self, history_start, response):
+        if history_start >= len(self.conversation_history):
+            return
+
+        user_message = self.conversation_history[history_start]
+        if user_message.get("role") != "user":
+            return
+
+        assistant_text = response.get("response", "") or ""
+        run_summary = self.agent_tools.session_summary()
+        history_text = assistant_text
+        if run_summary:
+            history_text = f"{assistant_text}\n\n[Agent run summary]\n{run_summary}".strip()
+
+        self.conversation_history = (
+            self.conversation_history[:history_start]
+            + [user_message, {"role": "assistant", "content": history_text}]
+        )
+
+    def _append_agent_final_check_if_needed(self):
+        if self.agent_final_check_done or not self.agent_tools.session_has_changes():
+            return False
+
+        self.agent_final_check_done = True
+        check_result = self.agent_tools.final_check()
+
+        self.conversation_history.append(
+            {
+                "role": "user",
+                "content": (
+                    "Automatic final verification for this local agent run:\n\n"
+                    f"{check_result}\n\n"
+                    "If the verification output shows a problem, continue using tools to fix it. "
+                    "Do not attribute pre-existing workspace changes to this run unless they are listed "
+                    "as agent-edited files or agent mutating commands. "
+                    "If the task is complete, provide the final response with a concise summary "
+                    "and mention what verification was performed."
+                ),
+            }
+        )
+        return True
 
     def _execute_agent_tool(self, name, tool_input):
         self.agent_tool_calls += 1
-        print_info(f"Tool {self.agent_tool_calls}/{self.max_agent_tool_calls}: {name} {_summarize_tool_input(tool_input)}")
+        self._separate_after_agent_thinking()
+        change_count_before = self.agent_tools.session_change_count()
         tool_result = self.agent_tools.execute(name, tool_input)
-        summary = _summarize_tool_result(tool_result)
-        if tool_result.startswith("ERROR:"):
-            print_warn(f"Tool result: {summary}")
-        else:
-            print_info(f"Tool result: {summary}")
-        return tool_result
+        if self.agent_tools.consume_output_separator():
+            self.agent_output_needs_separator = True
+        if self.agent_tools.session_change_count() > change_count_before:
+            self.agent_final_check_done = False
+        context_result = _compact_tool_result_for_context(tool_result)
+        return context_result
 
     def _rollback_history(self, history_length):
         self.conversation_history = self.conversation_history[:history_length]
@@ -641,6 +843,33 @@ def _summarize_tool_result(tool_result):
     if not tool_result:
         return "(empty)"
     return _single_line(str(tool_result).splitlines()[0], 220)
+
+
+def _compact_tool_result_for_context(tool_result):
+    text = str(tool_result or "")
+    if len(text) <= AGENT_TOOL_RESULT_CONTEXT_CHARS:
+        return text
+
+    head_chars = AGENT_TOOL_RESULT_CONTEXT_CHARS * 2 // 3
+    tail_chars = AGENT_TOOL_RESULT_CONTEXT_CHARS - head_chars - 300
+    omitted = len(text) - head_chars - tail_chars
+    if tail_chars < 0:
+        tail_chars = 0
+    return (
+        text[:head_chars]
+        + f"\n\n[tool result compacted by client: {omitted} characters omitted]\n\n"
+        + (text[-tail_chars:] if tail_chars else "")
+    )
+
+
+def _estimate_history_chars(history):
+    total = 0
+    for message in history:
+        try:
+            total += len(json.dumps(message, ensure_ascii=False, default=str))
+        except TypeError:
+            total += len(str(message))
+    return total
 
 
 def _single_line(text, max_chars):

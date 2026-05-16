@@ -51,6 +51,9 @@ def handle_response(response, model_name, stream_mode=False, thinking_mode=False
     if thinking and thinking_mode:
         print_thinking(_clean_text(thinking))
 
+    if response.get("thinking_needs_separator") and not response.get("agent_stopped"):
+        console.print()
+
     reply = _clean_text(response["response"])
     print_success(f"{model_name.upper()}: {reply}")
 
@@ -93,6 +96,7 @@ def main():
             workspace_dir=workspace_dir,
             max_agent_rounds=config.max_agent_rounds,
             max_agent_tool_calls=config.max_agent_tool_calls,
+            agent_approval_mode=config.agent_approval_mode,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")
