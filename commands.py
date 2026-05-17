@@ -101,6 +101,7 @@ def _apply_config(chat, config):
         chat.set_agent_limits(config.max_agent_rounds, config.max_agent_tool_calls)
         chat.set_agent_approval_mode(config.agent_approval_mode)
         chat.set_agent_show_thinking(config.agent_show_thinking)
+        chat.set_agent_summary_model(config.agent_summary_model)
 
         if config.agent_mode and not chat.get_agent_status().get("workspace_dir"):
             chat.set_agent_mode(False)
@@ -204,11 +205,13 @@ def handle_agent(chat, args):
         budget = f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
         approval = status.get("approval_mode", "confirm")
         show_thinking = status.get("show_thinking", "summary")
+        summary_model = status.get("summary_model") or "local"
         print_info(
             f"Current agent mode: {current} ({running}).\n"
             f"Budget: {budget}.\n"
             f"Approval: {approval}.\n"
             f"Show thinking: {show_thinking}.\n"
+            f"Summary model: {summary_model}.\n"
             f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
             f"/agent approve confirm|auto | /agent show-thinking summary|full|off"
         )

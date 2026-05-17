@@ -18,6 +18,7 @@ DEFAULT_AGENT_MODE = False
 DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
+DEFAULT_AGENT_SUMMARY_MODEL = ""
 AGENT_THINKING_OFF = "off"
 AGENT_THINKING_SUMMARY = "summary"
 AGENT_THINKING_FULL = "full"
@@ -52,6 +53,7 @@ class AppConfig:
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
     agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
+    agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
 
     def to_flat_dict(self):
         return {
@@ -68,6 +70,7 @@ class AppConfig:
             "max_agent_tool_calls": self.max_agent_tool_calls,
             "agent_approval_mode": self.agent_approval_mode,
             "agent_show_thinking": self.agent_show_thinking,
+            "agent_summary_model": self.agent_summary_model,
         }
 
     def to_dict(self):
@@ -86,6 +89,7 @@ class AppConfig:
                 "max_tool_calls": self.max_agent_tool_calls,
                 "approve": self.agent_approval_mode,
                 "show_thinking": self.agent_show_thinking,
+                "summary_model": self.agent_summary_model,
             },
         }
 
@@ -116,6 +120,7 @@ def _default_config():
         "max_agent_tool_calls": DEFAULT_MAX_AGENT_TOOL_CALLS,
         "agent_approval_mode": DEFAULT_AGENT_APPROVAL_MODE,
         "agent_show_thinking": DEFAULT_AGENT_SHOW_THINKING,
+        "agent_summary_model": DEFAULT_AGENT_SUMMARY_MODEL,
     }
 
 
@@ -215,6 +220,8 @@ def _extract_agent_config(config):
         "approval_mode": "approve",
         "approval": "approve",
         "agent_show_thinking": "show_thinking",
+        "agent_summary_model": "summary_model",
+        "thinking_summary_model": "summary_model",
     }
     for source, target in aliases.items():
         if target not in agent_config and source in agent_config:
@@ -225,6 +232,8 @@ def _extract_agent_config(config):
         "max_agent_tool_calls": "max_tool_calls",
         "agent_approval_mode": "approve",
         "agent_show_thinking": "show_thinking",
+        "agent_summary_model": "summary_model",
+        "thinking_summary_model": "summary_model",
     }
     for source, target in flat_aliases.items():
         if target not in agent_config and source in config:
@@ -260,6 +269,9 @@ def _sanitize_config(config):
     config["stream_mode"] = _parse_bool(config.get("stream_mode"), DEFAULT_STREAM_MODE)
     config["thinking_mode"] = _parse_bool(config.get("thinking_mode"), DEFAULT_THINKING_MODE)
     config["agent_mode"] = _parse_bool(agent_config.get("enable"), DEFAULT_AGENT_MODE)
+    config["agent_summary_model"] = str(
+        agent_config.get("summary_model", DEFAULT_AGENT_SUMMARY_MODEL) or ""
+    ).strip()
     try:
         config["agent_show_thinking"] = parse_agent_show_thinking(
             agent_config.get("show_thinking", DEFAULT_AGENT_SHOW_THINKING)
@@ -426,6 +438,7 @@ def load_config():
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
         agent_approval_mode=DEFAULT_AGENT_APPROVAL_MODE,
         agent_show_thinking=DEFAULT_AGENT_SHOW_THINKING,
+        agent_summary_model=DEFAULT_AGENT_SUMMARY_MODEL,
     )
     _save_config(config)
 
@@ -511,6 +524,12 @@ def update_config():
         f"Agent approval mode confirm/auto (Current: {config.agent_approval_mode}): ",
         config.agent_approval_mode,
     )
+    new_agent_summary_model = (
+        get_user_input(
+            f"Agent summary model (Current: {config.agent_summary_model or 'None'}): "
+        ).strip()
+        or config.agent_summary_model
+    )
 
     new_config = AppConfig(
         api_type=new_api_type,
@@ -526,6 +545,7 @@ def update_config():
         max_agent_tool_calls=new_max_agent_tool_calls,
         agent_approval_mode=new_agent_approval_mode,
         agent_show_thinking=config.agent_show_thinking,
+        agent_summary_model=new_agent_summary_model,
     )
     _save_config(new_config)
     return new_config

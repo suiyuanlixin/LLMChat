@@ -105,6 +105,7 @@ def main():
             max_agent_tool_calls=config.max_agent_tool_calls,
             agent_approval_mode=config.agent_approval_mode,
             agent_show_thinking=config.agent_show_thinking,
+            agent_summary_model=config.agent_summary_model,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")

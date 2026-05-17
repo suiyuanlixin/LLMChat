@@ -64,7 +64,8 @@ pip install rich zai-sdk anthropic
     "max_rounds": 12,
     "max_tool_calls": 40,
     "approve": "confirm",
-    "show_thinking": "summary"
+    "show_thinking": "summary",
+    "summary_model": ""
   }
 }
 ```
@@ -86,6 +87,7 @@ pip install rich zai-sdk anthropic
 | `agent_mode.max_tool_calls` | 每次用户请求中，agent 最多调用多少次工具。 |
 | `agent_mode.approve` | Agent 写操作审批模式，只支持 `confirm` 或 `auto`。 |
 | `agent_mode.show_thinking` | Agent thinking 显示方式，支持 `summary`、`full`、`off`。`true` 等同于 `summary`，`false` 等同于 `off`。它不改变模型 thinking 是否开启。 |
+| `agent_mode.summary_model` | Agent thinking 概括模型。留空时使用本地规则生成一句话；填写轻量模型名时，会复用当前 API 配置发起单独的流式请求来生成一句话概括。 |
 
 `config.json` 已被 `.gitignore` 忽略，适合存放本地密钥和个人配置。
 
@@ -213,7 +215,7 @@ Anthropic Agent 模式使用 streaming API 读取工具调用事件和 thinking 
 
 Agent 运行时会隐藏 round 编号、工具调用编号、工具结果摘要和 final check 摘要等中间噪音，只保留必要的确认、警告、错误和最终回复。Thinking、确认框和最终回复之间会自动保持一行间距。
 
-Agent 模式在 `show_thinking=summary` 时只显示一句话概括，避免完整 thinking 中的大段代码影响阅读。开启流式模式时，Agent 最终回复会以伪流式方式显示。
+Agent 模式在 `show_thinking=summary` 时只显示一句话概括，避免完整 thinking 中的大段代码影响阅读。配置 `agent_mode.summary_model` 后，会使用轻量模型单独发起流式请求生成概括；未配置时使用本地规则伪流式显示。开启流式模式时，Agent 最终回复会以伪流式方式显示。
 
 ## 会话记录
 

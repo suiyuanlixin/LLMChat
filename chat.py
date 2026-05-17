@@ -31,6 +31,13 @@ AGENT_CONTEXT_WARN_CHARS = 180000
 AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
 AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS = 0.006
 AGENT_RESPONSE_CHAR_DELAY_SECONDS = 0.003
+AGENT_SUMMARY_MAX_TOKENS = 96
+AGENT_SUMMARY_SYSTEM_PROMPT = (
+    "Summarize hidden local-agent thinking for a terminal status line. "
+    "Return exactly one short sentence, with no markdown, code, quotes, or prefix. "
+    "Describe what the agent is doing now, not step-by-step reasoning. "
+    "Use the same language as the thinking when obvious."
+)
 
 
 AGENT_SYSTEM_PROMPT = """You are in local workspace agent mode.
@@ -66,6 +73,7 @@ class LLMChat:
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
         agent_approval_mode="confirm",
         agent_show_thinking=True,
+        agent_summary_model="",
     ):
         self.conversation_history = []
         self.client = None
@@ -77,6 +85,7 @@ class LLMChat:
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
         self.agent_show_thinking = parse_agent_show_thinking(agent_show_thinking)
+        self.agent_summary_model = str(agent_summary_model or "").strip()
         self.max_agent_rounds = max(1, int(max_agent_rounds))
         self.max_agent_tool_calls = max(1, int(max_agent_tool_calls))
         self.agent_running = False
@@ -167,6 +176,9 @@ class LLMChat:
     def set_agent_show_thinking(self, enabled):
         self.agent_show_thinking = parse_agent_show_thinking(enabled)
 
+    def set_agent_summary_model(self, model):
+        self.agent_summary_model = str(model or "").strip()
+
     def set_workspace_dir(self, workspace_dir):
         self.agent_tools.set_workspace_dir(workspace_dir)
         if not self.agent_tools.enabled:
@@ -192,6 +204,7 @@ class LLMChat:
             "max_tool_calls": self.max_agent_tool_calls,
             "approval_mode": self.agent_tools.approval_mode,
             "show_thinking": self.agent_show_thinking,
+            "summary_model": self.agent_summary_model,
         }
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
@@ -559,10 +572,6 @@ class LLMChat:
         ):
             return
 
-        summary = _summarize_agent_thinking(content)
-        if not summary:
-            return
-
         replace_current_line = (
             console.is_terminal
             and self.agent_summary_thinking_active
@@ -584,26 +593,102 @@ class LLMChat:
             self.agent_thinking_needs_separator = False
             self.agent_summary_thinking_active = False
 
-        self._print_agent_thinking_summary(
-            summary,
+        summary = self._stream_agent_thinking_summary_with_model(
+            content,
             leading_newline=leading_newline,
             replace_current_line=replace_current_line,
         )
+        if not summary:
+            summary = _summarize_agent_thinking(content)
+            if not summary:
+                return
+            self._print_agent_thinking_summary(
+                summary,
+                leading_newline=leading_newline,
+                replace_current_line=replace_current_line,
+            )
+
         self.agent_thinking_streamed = True
         self.agent_thinking_needs_separator = True
         self.agent_summary_thinking_active = True
 
     def _print_agent_thinking_summary(self, summary, leading_newline=True, replace_current_line=False):
+        self._start_agent_thinking_summary_line(leading_newline, replace_current_line)
+        for character in summary:
+            print_stream_thinking_continue(character)
+            if console.is_terminal:
+                time.sleep(AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS)
+
+    def _start_agent_thinking_summary_line(self, leading_newline=True, replace_current_line=False):
         if replace_current_line:
             clear_current_line()
             print_stream_thinking("", leading_newline=False)
         else:
             print_stream_thinking("", leading_newline=leading_newline)
 
-        for character in summary:
-            print_stream_thinking_continue(character)
-            if console.is_terminal:
-                time.sleep(AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS)
+    def _stream_agent_thinking_summary_with_model(
+        self,
+        content,
+        leading_newline=True,
+        replace_current_line=False,
+    ):
+        if not self.agent_summary_model:
+            return ""
+
+        prompt = _summary_model_prompt(content)
+        if not prompt:
+            return ""
+
+        summary_text = ""
+        started = False
+
+        def emit(delta):
+            nonlocal started, summary_text
+            delta = _clean_summary_stream_delta(delta)
+            if not summary_text:
+                delta = delta.lstrip()
+            if not delta:
+                return
+            if not started:
+                self._start_agent_thinking_summary_line(leading_newline, replace_current_line)
+                started = True
+            summary_text += delta
+            print_stream_thinking_continue(delta)
+
+        try:
+            if self.api_type == API_TYPE_ANTHROPIC:
+                response = self.client.messages.create(
+                    model=self.agent_summary_model,
+                    max_tokens=AGENT_SUMMARY_MAX_TOKENS,
+                    temperature=min(float(self.temperature), 0.3),
+                    system=AGENT_SUMMARY_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                )
+                for chunk in response:
+                    if self._get_field(chunk, "type", "") != "content_block_delta":
+                        continue
+                    delta = self._get_field(chunk, "delta")
+                    if self._get_field(delta, "type", "") == "text_delta":
+                        emit(self._get_field(delta, "text", "") or "")
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.agent_summary_model,
+                    messages=[
+                        {"role": "system", "content": AGENT_SUMMARY_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=min(float(self.temperature), 0.3),
+                    max_tokens=AGENT_SUMMARY_MAX_TOKENS,
+                    stream=True,
+                )
+                for chunk in response:
+                    delta = chunk.choices[0].delta
+                    emit(getattr(delta, "content", "") or "")
+        except Exception:
+            return summary_text.strip()
+
+        return summary_text.strip()
 
     def _stream_agent_response_text(self, content, pseudo=False):
         if not self.stream_mode or not content:
@@ -1021,6 +1106,41 @@ def _summarize_agent_thinking(content):
     return _single_line(sentence, 120)
 
 
+def _summary_model_prompt(content):
+    text = _summary_model_source_text(content)
+    if not text:
+        return ""
+    return (
+        "Summarize this agent thinking into one short terminal status sentence.\n\n"
+        f"{_single_line(text, 4000)}"
+    )
+
+
+def _summary_model_source_text(content):
+    text = str(content or "")
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = text.replace("`", "")
+
+    kept_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _looks_like_code_line(stripped):
+            continue
+        stripped = _strip_list_marker(stripped)
+        if stripped:
+            kept_lines.append(stripped)
+    return "\n".join(kept_lines)
+
+
+def _clean_summary_stream_delta(delta):
+    text = str(delta or "")
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = text.replace("`", "")
+    return text
+
+
 def _strip_code_from_thinking(content):
     text = str(content or "")
     text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
@@ -1111,7 +1231,7 @@ def _pick_thinking_summary_sentence(text):
 
 
 def _summary_sentence_candidates(text):
-    raw_sentences = re.split(r"(?<=[.!?。！？])\s*|\n+", text)
+    raw_sentences = re.split(r"(?<=[!?。！？])\s*|(?<=\.)\s+|\n+", text)
     sentences = []
     for raw_sentence in raw_sentences:
         sentence = _clean_summary_sentence(raw_sentence)
