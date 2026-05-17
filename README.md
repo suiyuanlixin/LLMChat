@@ -229,7 +229,7 @@ record/2026-04-25-22-33.json
 
 ```json
 {
-  "version": "2.0",
+  "version": "2.5.0",
   "model": "model-name",
   "created_at": "2026-04-25T22:33:00",
   "conversation": [

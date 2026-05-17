@@ -9,7 +9,7 @@ from rich.table import Table
 
 console = Console()
 
-VERSION = "2.0.0"
+VERSION = "2.5.0"
 
 SUCCESS_COLOR = ["#67b6a6", "#92ded2"]
 INFO_COLOR = ["#6d8da8", "#97cbe3"]
