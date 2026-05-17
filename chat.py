@@ -1,25 +1,36 @@
 import json
+import re
+import time
 
 from ui import (
+    clear_current_line,
+    clean_and_print_stream_response,
+    clean_display_text,
     console,
     print_error,
     print_stream_thinking,
     print_stream_thinking_continue,
+    print_stream_response_continue,
     print_stream_response_start,
     print_warn,
 )
 from config import (
     API_TYPE_ANTHROPIC,
     API_TYPE_GLM,
+    AGENT_THINKING_FULL,
+    AGENT_THINKING_SUMMARY,
     DEFAULT_MAX_AGENT_ROUNDS,
     DEFAULT_MAX_AGENT_TOOL_CALLS,
     normalize_api_type,
+    parse_agent_show_thinking,
 )
 from tools import AgentTools, anthropic_tool_schemas, glm_tool_schemas
 
 
 AGENT_CONTEXT_WARN_CHARS = 180000
 AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
+AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS = 0.006
+AGENT_RESPONSE_CHAR_DELAY_SECONDS = 0.003
 
 
 AGENT_SYSTEM_PROMPT = """You are in local workspace agent mode.
@@ -54,12 +65,18 @@ class LLMChat:
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
         agent_approval_mode="confirm",
+        agent_show_thinking=True,
     ):
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
-        self.agent_tools = AgentTools(workspace_dir, approval_mode=agent_approval_mode)
+        self.agent_tools = AgentTools(
+            workspace_dir,
+            approval_mode=agent_approval_mode,
+            visible_output_callback=self._before_agent_visible_output,
+        )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
+        self.agent_show_thinking = parse_agent_show_thinking(agent_show_thinking)
         self.max_agent_rounds = max(1, int(max_agent_rounds))
         self.max_agent_tool_calls = max(1, int(max_agent_tool_calls))
         self.agent_running = False
@@ -69,6 +86,9 @@ class LLMChat:
         self.agent_context_warning_sent = False
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
+        self.agent_summary_thinking_active = False
+        self.agent_response_streamed = False
+        self.agent_response_started = False
         self.agent_output_needs_separator = False
         self.configure(api_type, base_url, model, api_key, max_tokens, temperature, stream_mode)
 
@@ -144,6 +164,9 @@ class LLMChat:
     def set_agent_approval_mode(self, approval_mode):
         self.agent_tools.set_approval_mode(approval_mode)
 
+    def set_agent_show_thinking(self, enabled):
+        self.agent_show_thinking = parse_agent_show_thinking(enabled)
+
     def set_workspace_dir(self, workspace_dir):
         self.agent_tools.set_workspace_dir(workspace_dir)
         if not self.agent_tools.enabled:
@@ -168,6 +191,7 @@ class LLMChat:
             "max_rounds": self.max_agent_rounds,
             "max_tool_calls": self.max_agent_tool_calls,
             "approval_mode": self.agent_tools.approval_mode,
+            "show_thinking": self.agent_show_thinking,
         }
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
@@ -212,11 +236,14 @@ class LLMChat:
             if self.agent_running:
                 self.request_agent_stop()
                 self._rollback_history(original_history_length)
+                self._separate_after_agent_thinking()
                 print_warn("Agent stopped by user.")
                 return {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
             raise
         except Exception as error:
             self._rollback_history(original_history_length)
+            if self.agent_running:
+                self._separate_after_agent_thinking()
             print_error(f"Request error: {error}")
             return None
 
@@ -228,6 +255,9 @@ class LLMChat:
         self.agent_context_warning_sent = False
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
+        self.agent_summary_thinking_active = False
+        self.agent_response_streamed = False
+        self.agent_response_started = False
         self.agent_output_needs_separator = False
         self.agent_tools.begin_agent_session()
         try:
@@ -244,13 +274,26 @@ class LLMChat:
             self.agent_running = False
 
     def _finalize_agent_response(self, response):
+        if response and self.agent_show_thinking != AGENT_THINKING_FULL:
+            response = dict(response)
+            response["thinking"] = ""
+            response["thinking_streamed"] = self.agent_thinking_streamed
+            response["response_streamed"] = self.agent_response_streamed
+            response["thinking_needs_separator"] = (
+                self.agent_thinking_needs_separator and not response.get("agent_stopped")
+            )
+            return response
         if response and self.agent_thinking_streamed:
             response = dict(response)
             response["thinking"] = ""
             response["thinking_streamed"] = True
+            response["response_streamed"] = self.agent_response_streamed
             response["thinking_needs_separator"] = (
                 self.agent_thinking_needs_separator and not response.get("agent_stopped")
             )
+        elif response:
+            response = dict(response)
+            response["response_streamed"] = self.agent_response_streamed
         return response
 
     def _anthropic_agent_response(self):
@@ -273,6 +316,7 @@ class LLMChat:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
             if self._agent_tool_budget_exceeded(len(tool_uses)):
@@ -340,13 +384,14 @@ class LLMChat:
             assistant_message, thinking_content, text, tool_calls = self._glm_message_parts(message)
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
-            self._stream_agent_thinking(thinking_content)
+            self._show_agent_thinking(thinking_content)
             final_response += text
 
             if not tool_calls:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
             if self._agent_tool_budget_exceeded(len(tool_calls)):
@@ -426,7 +471,8 @@ class LLMChat:
                 block = blocks[active_block_index]
 
                 if delta_type == "text_delta":
-                    block["text"] = block.get("text", "") + (self._get_field(delta, "text", "") or "")
+                    text_delta = self._get_field(delta, "text", "") or ""
+                    block["text"] = block.get("text", "") + text_delta
                 elif delta_type == "thinking_delta":
                     thinking_delta = self._get_field(delta, "thinking", "") or ""
                     block["thinking"] = block.get("thinking", "") + thinking_delta
@@ -447,6 +493,8 @@ class LLMChat:
                     raw_input = block.pop("_input_json", "")
                     if raw_input:
                         block["input"] = self._parse_tool_arguments(raw_input)
+                elif block.get("type") == "thinking":
+                    self._show_agent_thinking_summary(block.get("thinking", ""))
                 active_block_index = None
 
         for block in blocks:
@@ -476,7 +524,11 @@ class LLMChat:
         return
 
     def _stream_agent_thinking(self, content):
-        if not self.thinking_mode or not content:
+        if (
+            not self.thinking_mode
+            or self.agent_show_thinking != AGENT_THINKING_FULL
+            or not content
+        ):
             return
         leading_newline = True
         if self.agent_output_needs_separator:
@@ -484,18 +536,106 @@ class LLMChat:
             self.agent_output_needs_separator = False
             self.agent_thinking_streamed = False
             self.agent_thinking_needs_separator = False
+            self.agent_summary_thinking_active = False
             leading_newline = False
         if not self.agent_thinking_streamed:
             print_stream_thinking("", leading_newline=leading_newline)
             self.agent_thinking_streamed = True
         print_stream_thinking_continue(content)
         self.agent_thinking_needs_separator = True
+        self.agent_summary_thinking_active = False
+
+    def _show_agent_thinking(self, content):
+        if self.agent_show_thinking == AGENT_THINKING_FULL:
+            self._stream_agent_thinking(content)
+        elif self.agent_show_thinking == AGENT_THINKING_SUMMARY:
+            self._show_agent_thinking_summary(content)
+
+    def _show_agent_thinking_summary(self, content):
+        if (
+            not self.thinking_mode
+            or self.agent_show_thinking != AGENT_THINKING_SUMMARY
+            or not content
+        ):
+            return
+
+        summary = _summarize_agent_thinking(content)
+        if not summary:
+            return
+
+        replace_current_line = (
+            console.is_terminal
+            and self.agent_summary_thinking_active
+            and self.agent_thinking_needs_separator
+            and not self.agent_output_needs_separator
+        )
+        leading_newline = True
+        if self.agent_output_needs_separator:
+            console.print()
+            self.agent_output_needs_separator = False
+            self.agent_thinking_streamed = False
+            self.agent_thinking_needs_separator = False
+            self.agent_summary_thinking_active = False
+            leading_newline = False
+        elif replace_current_line:
+            leading_newline = False
+        elif self.agent_thinking_needs_separator:
+            console.print()
+            self.agent_thinking_needs_separator = False
+            self.agent_summary_thinking_active = False
+
+        self._print_agent_thinking_summary(
+            summary,
+            leading_newline=leading_newline,
+            replace_current_line=replace_current_line,
+        )
+        self.agent_thinking_streamed = True
+        self.agent_thinking_needs_separator = True
+        self.agent_summary_thinking_active = True
+
+    def _print_agent_thinking_summary(self, summary, leading_newline=True, replace_current_line=False):
+        if replace_current_line:
+            clear_current_line()
+            print_stream_thinking("", leading_newline=False)
+        else:
+            print_stream_thinking("", leading_newline=leading_newline)
+
+        for character in summary:
+            print_stream_thinking_continue(character)
+            if console.is_terminal:
+                time.sleep(AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS)
+
+    def _stream_agent_response_text(self, content, pseudo=False):
+        if not self.stream_mode or not content:
+            return
+        if pseudo:
+            content = clean_display_text(content)
+            if not content:
+                return
+        if not self.agent_response_started:
+            self._separate_after_agent_thinking()
+            if self.agent_output_needs_separator:
+                console.print()
+                self.agent_output_needs_separator = False
+            print_stream_response_start(self.model)
+            self.agent_response_started = True
+        if pseudo and console.is_terminal:
+            for character in content:
+                print_stream_response_continue(character)
+                time.sleep(AGENT_RESPONSE_CHAR_DELAY_SECONDS)
+        else:
+            clean_and_print_stream_response(content)
+        self.agent_response_streamed = True
 
     def _separate_after_agent_thinking(self):
         if not self.agent_thinking_needs_separator:
             return
         console.print()
         self.agent_thinking_needs_separator = False
+        self.agent_summary_thinking_active = False
+
+    def _before_agent_visible_output(self):
+        self._separate_after_agent_thinking()
 
     def _warn_agent_context_if_needed(self):
         if self.agent_context_warning_sent:
@@ -558,11 +698,11 @@ class LLMChat:
 
     def _execute_agent_tool(self, name, tool_input):
         self.agent_tool_calls += 1
-        self._separate_after_agent_thinking()
         change_count_before = self.agent_tools.session_change_count()
         tool_result = self.agent_tools.execute(name, tool_input)
         if self.agent_tools.consume_output_separator():
             self.agent_output_needs_separator = True
+            self.agent_summary_thinking_active = False
         if self.agent_tools.session_change_count() > change_count_before:
             self.agent_final_check_done = False
         context_result = _compact_tool_result_for_context(tool_result)
@@ -870,6 +1010,140 @@ def _estimate_history_chars(history):
         except TypeError:
             total += len(str(message))
     return total
+
+
+def _summarize_agent_thinking(content):
+    text = _strip_code_from_thinking(content)
+    if not text:
+        return "Working out the next agent step."
+
+    sentence = _pick_thinking_summary_sentence(text)
+    return _single_line(sentence, 120)
+
+
+def _strip_code_from_thinking(content):
+    text = str(content or "")
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"`[^`]*`", " ", text)
+
+    kept_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _looks_like_code_line(stripped):
+            continue
+        stripped = _strip_list_marker(stripped)
+        if stripped:
+            kept_lines.append(stripped)
+    return "\n".join(kept_lines)
+
+
+def _looks_like_code_line(line):
+    code_prefixes = (
+        "{",
+        "}",
+        "[",
+        "]",
+        "(",
+        ")",
+        "<",
+        ">",
+        "+",
+        "-",
+        "*",
+        "#",
+        "//",
+        "/*",
+        "*/",
+        "def ",
+        "class ",
+        "import ",
+        "from ",
+        "return ",
+        "if ",
+        "elif ",
+        "else:",
+        "for ",
+        "while ",
+        "try:",
+        "except ",
+        "with ",
+        "async ",
+        "await ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+    )
+    if line.startswith(code_prefixes):
+        return True
+
+    code_marks = sum(
+        line.count(mark)
+        for mark in ("=", "{", "}", "(", ")", "[", "]", ";", "=>", "::", "</", "/>")
+    )
+    if code_marks >= 5:
+        return True
+
+    if len(line) > 160 and code_marks >= 3:
+        return True
+    return False
+
+
+def _pick_thinking_summary_sentence(text):
+    sentences = _summary_sentence_candidates(text)
+    if not sentences:
+        return text
+
+    intent_pattern = re.compile(
+        r"("
+        r"need|plan|check|inspect|read|search|find|edit|update|modify|implement|"
+        r"verify|test|compare|decide|ensure|confirm|analy[sz]e|定位|检查|读取|"
+        r"搜索|查找|修改|更新|实现|验证|测试|确认|分析|计划|整理"
+        r")",
+        re.IGNORECASE,
+    )
+    for sentence in sentences:
+        if intent_pattern.search(sentence):
+            return _finish_summary_sentence(sentence)
+    return _finish_summary_sentence(sentences[0])
+
+
+def _summary_sentence_candidates(text):
+    raw_sentences = re.split(r"(?<=[.!?。！？])\s*|\n+", text)
+    sentences = []
+    for raw_sentence in raw_sentences:
+        sentence = _clean_summary_sentence(raw_sentence)
+        if sentence:
+            sentences.append(sentence)
+    return sentences
+
+
+def _clean_summary_sentence(sentence):
+    sentence = _strip_list_marker(str(sentence or ""))
+    sentence = re.sub(r"[:：]\s*(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?\s*$", "", sentence)
+    sentence = sentence.strip(" \t\r\n-:;：")
+    if not sentence or re.fullmatch(r"(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?", sentence):
+        return ""
+    return sentence
+
+
+def _strip_list_marker(text):
+    return re.sub(
+        r"^\s*(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]\s*",
+        "",
+        str(text or "").strip(),
+    )
+
+
+def _finish_summary_sentence(sentence):
+    sentence = str(sentence or "").strip()
+    if not sentence or sentence[-1] in ".!?。！？":
+        return sentence
+    if re.search(r"[\u4e00-\u9fff]", sentence):
+        return sentence + "。"
+    return sentence + "."
 
 
 def _single_line(text, max_chars):

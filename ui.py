@@ -157,6 +157,13 @@ def print_stream_thinking_continue(content):
     console.print(Text(content, style=f"bold {STREAM_THINK_COLOR}"), end="")
 
 
+def clear_current_line():
+    if not console.is_terminal:
+        return
+    console.file.write("\r\033[2K")
+    console.file.flush()
+
+
 def print_stream_response_start(model_name):
     console.print(
         Text.assemble(
@@ -175,6 +182,10 @@ def clean_and_print_stream_response(content):
     # Remove leading \n
     if content.startswith("\n"):
         content = content[1:]
+    console.print(Text(content, style=f"bold {STREAM_RESPONSE_COLOR}"), end="")
+
+
+def print_stream_response_continue(content):
     console.print(Text(content, style=f"bold {STREAM_RESPONSE_COLOR}"), end="")
 
 

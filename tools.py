@@ -271,8 +271,14 @@ class AgentToolError(Exception):
 
 
 class AgentTools:
-    def __init__(self, workspace_dir=None, approval_mode=AGENT_APPROVAL_CONFIRM):
+    def __init__(
+        self,
+        workspace_dir=None,
+        approval_mode=AGENT_APPROVAL_CONFIRM,
+        visible_output_callback=None,
+    ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
+        self.visible_output_callback = visible_output_callback
         self.set_approval_mode(approval_mode)
         self.begin_agent_session()
 
@@ -288,6 +294,9 @@ class AgentTools:
         if mode not in {AGENT_APPROVAL_CONFIRM, AGENT_APPROVAL_AUTO}:
             mode = AGENT_APPROVAL_CONFIRM
         self.approval_mode = mode
+
+    def set_visible_output_callback(self, callback):
+        self.visible_output_callback = callback
 
     def begin_agent_session(self):
         self.session_changed_files = []
@@ -804,16 +813,21 @@ class AgentTools:
     def _confirm_diff(self, title, file_path, diff_content, risk_reason):
         if self._auto_approves(risk_reason):
             return True
+        self._before_visible_output()
         approved = get_agent_diff_confirmation(title, file_path, diff_content)
-        self.output_needs_separator = True
         return approved
 
     def _confirm(self, title, detail, risk_reason=""):
         if self._auto_approves(risk_reason):
             return True
+        self._before_visible_output()
         answer = get_user_input(f"{title}\n{detail}\nContinue? (Y/N, Default: N): ")
-        self.output_needs_separator = True
         return answer.strip().lower() in {"y", "yes"}
+
+    def _before_visible_output(self):
+        if self.visible_output_callback:
+            self.visible_output_callback()
+        self.output_needs_separator = True
 
     def _auto_approves(self, risk_reason):
         if self.approval_mode != AGENT_APPROVAL_AUTO:

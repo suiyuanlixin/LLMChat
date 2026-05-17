@@ -18,7 +18,12 @@ DEFAULT_AGENT_MODE = False
 DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
+AGENT_THINKING_OFF = "off"
+AGENT_THINKING_SUMMARY = "summary"
+AGENT_THINKING_FULL = "full"
+DEFAULT_AGENT_SHOW_THINKING = AGENT_THINKING_SUMMARY
 AGENT_APPROVAL_MODES = {"confirm", "auto"}
+AGENT_THINKING_MODES = {AGENT_THINKING_OFF, AGENT_THINKING_SUMMARY, AGENT_THINKING_FULL}
 SUPPORTED_API_TYPES = {API_TYPE_GLM, API_TYPE_ANTHROPIC}
 API_TYPE_ALIASES = {
     "zhipu": API_TYPE_GLM,
@@ -46,8 +51,9 @@ class AppConfig:
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
+    agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
 
-    def to_dict(self):
+    def to_flat_dict(self):
         return {
             "api_type": self.api_type,
             "base_url": self.base_url,
@@ -61,6 +67,26 @@ class AppConfig:
             "max_agent_rounds": self.max_agent_rounds,
             "max_agent_tool_calls": self.max_agent_tool_calls,
             "agent_approval_mode": self.agent_approval_mode,
+            "agent_show_thinking": self.agent_show_thinking,
+        }
+
+    def to_dict(self):
+        return {
+            "api_type": self.api_type,
+            "base_url": self.base_url,
+            "model": self.model,
+            "api_key": self.api_key,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream_mode": self.stream_mode,
+            "thinking_mode": self.thinking_mode,
+            "agent_mode": {
+                "enable": self.agent_mode,
+                "max_rounds": self.max_agent_rounds,
+                "max_tool_calls": self.max_agent_tool_calls,
+                "approve": self.agent_approval_mode,
+                "show_thinking": self.agent_show_thinking,
+            },
         }
 
 
@@ -89,6 +115,7 @@ def _default_config():
         "max_agent_rounds": DEFAULT_MAX_AGENT_ROUNDS,
         "max_agent_tool_calls": DEFAULT_MAX_AGENT_TOOL_CALLS,
         "agent_approval_mode": DEFAULT_AGENT_APPROVAL_MODE,
+        "agent_show_thinking": DEFAULT_AGENT_SHOW_THINKING,
     }
 
 
@@ -116,10 +143,35 @@ def parse_agent_tool_calls(value):
 
 
 def parse_agent_approval_mode(value):
-    mode = str(value or DEFAULT_AGENT_APPROVAL_MODE).strip().lower()
+    if value is None:
+        mode = DEFAULT_AGENT_APPROVAL_MODE
+    elif isinstance(value, bool):
+        raise ValueError("Agent approval mode must be confirm or auto.")
+    else:
+        mode = str(value).strip().lower() or DEFAULT_AGENT_APPROVAL_MODE
     if mode not in AGENT_APPROVAL_MODES:
         raise ValueError("Agent approval mode must be confirm or auto.")
     return mode
+
+
+def parse_agent_show_thinking(value):
+    if isinstance(value, bool):
+        return AGENT_THINKING_SUMMARY if value else AGENT_THINKING_OFF
+    if value is None:
+        return DEFAULT_AGENT_SHOW_THINKING
+
+    mode = str(value).strip().lower()
+    if mode in AGENT_THINKING_MODES:
+        return mode
+    if mode in {"true", "ture", "1", "yes", "on"}:
+        return AGENT_THINKING_SUMMARY
+    if mode in {"false", "0", "no", "off", "none", "hide", "hidden"}:
+        return AGENT_THINKING_OFF
+    if mode in {"summary", "brief", "short", "summarize", "summarized"}:
+        return AGENT_THINKING_SUMMARY
+    if mode in {"full", "raw", "verbose", "all"}:
+        return AGENT_THINKING_FULL
+    raise ValueError("Agent thinking display must be summary, full, or off.")
 
 
 def parse_temperature(value):
@@ -138,7 +190,7 @@ def _parse_bool(value, default):
         return value
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes", "on"}:
+        if normalized in {"true", "ture", "1", "yes", "on"}:
             return True
         if normalized in {"false", "0", "no", "off"}:
             return False
@@ -148,7 +200,42 @@ def _parse_bool(value, default):
     return bool(value)
 
 
+def _extract_agent_config(config):
+    raw_agent_config = config.get("agent_mode", DEFAULT_AGENT_MODE)
+    if isinstance(raw_agent_config, dict):
+        agent_config = dict(raw_agent_config)
+    else:
+        agent_config = {"enable": raw_agent_config}
+
+    aliases = {
+        "enabled": "enable",
+        "max_agent_rounds": "max_rounds",
+        "max_agent_tool_calls": "max_tool_calls",
+        "agent_approval_mode": "approve",
+        "approval_mode": "approve",
+        "approval": "approve",
+        "agent_show_thinking": "show_thinking",
+    }
+    for source, target in aliases.items():
+        if target not in agent_config and source in agent_config:
+            agent_config[target] = agent_config[source]
+
+    flat_aliases = {
+        "max_agent_rounds": "max_rounds",
+        "max_agent_tool_calls": "max_tool_calls",
+        "agent_approval_mode": "approve",
+        "agent_show_thinking": "show_thinking",
+    }
+    for source, target in flat_aliases.items():
+        if target not in agent_config and source in config:
+            agent_config[target] = config[source]
+
+    return agent_config
+
+
 def _sanitize_config(config):
+    agent_config = _extract_agent_config(config)
+
     config["api_type"] = normalize_api_type(config.get("api_type"))
     if config["api_type"] not in SUPPORTED_API_TYPES:
         print_warn(f"Unsupported API type: {config['api_type']}. Fallback to {DEFAULT_API_TYPE}.")
@@ -172,41 +259,51 @@ def _sanitize_config(config):
 
     config["stream_mode"] = _parse_bool(config.get("stream_mode"), DEFAULT_STREAM_MODE)
     config["thinking_mode"] = _parse_bool(config.get("thinking_mode"), DEFAULT_THINKING_MODE)
-    config["agent_mode"] = _parse_bool(config.get("agent_mode"), DEFAULT_AGENT_MODE)
+    config["agent_mode"] = _parse_bool(agent_config.get("enable"), DEFAULT_AGENT_MODE)
     try:
-        config["agent_approval_mode"] = parse_agent_approval_mode(
-            config.get("agent_approval_mode", DEFAULT_AGENT_APPROVAL_MODE)
+        config["agent_show_thinking"] = parse_agent_show_thinking(
+            agent_config.get("show_thinking", DEFAULT_AGENT_SHOW_THINKING)
         )
     except ValueError as error:
         print_warn(
-            f"Invalid agent_approval_mode in {CONFIG_FILE}: {error} "
+            f"Invalid agent_mode.show_thinking in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_AGENT_SHOW_THINKING}."
+        )
+        config["agent_show_thinking"] = DEFAULT_AGENT_SHOW_THINKING
+    try:
+        config["agent_approval_mode"] = parse_agent_approval_mode(
+            agent_config.get("approve", DEFAULT_AGENT_APPROVAL_MODE)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid agent_mode.approve in {CONFIG_FILE}: {error} "
             f"Fallback to {DEFAULT_AGENT_APPROVAL_MODE}."
         )
         config["agent_approval_mode"] = DEFAULT_AGENT_APPROVAL_MODE
 
     try:
         config["max_agent_rounds"] = parse_agent_rounds(
-            config.get("max_agent_rounds", DEFAULT_MAX_AGENT_ROUNDS)
+            agent_config.get("max_rounds", DEFAULT_MAX_AGENT_ROUNDS)
         )
     except ValueError as error:
         print_warn(
-            f"Invalid max_agent_rounds in {CONFIG_FILE}: {error} "
+            f"Invalid agent_mode.max_rounds in {CONFIG_FILE}: {error} "
             f"Fallback to {DEFAULT_MAX_AGENT_ROUNDS}."
         )
         config["max_agent_rounds"] = DEFAULT_MAX_AGENT_ROUNDS
 
     try:
         config["max_agent_tool_calls"] = parse_agent_tool_calls(
-            config.get("max_agent_tool_calls", DEFAULT_MAX_AGENT_TOOL_CALLS)
+            agent_config.get("max_tool_calls", DEFAULT_MAX_AGENT_TOOL_CALLS)
         )
     except ValueError as error:
         print_warn(
-            f"Invalid max_agent_tool_calls in {CONFIG_FILE}: {error} "
+            f"Invalid agent_mode.max_tool_calls in {CONFIG_FILE}: {error} "
             f"Fallback to {DEFAULT_MAX_AGENT_TOOL_CALLS}."
         )
         config["max_agent_tool_calls"] = DEFAULT_MAX_AGENT_TOOL_CALLS
 
-    return AppConfig(**{key: config[key] for key in _default_config()})
+    return AppConfig(**{key: config[key] for key in AppConfig().to_flat_dict()})
 
 
 def _prompt_api_type(current_api_type):
@@ -328,10 +425,15 @@ def load_config():
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
         agent_approval_mode=DEFAULT_AGENT_APPROVAL_MODE,
+        agent_show_thinking=DEFAULT_AGENT_SHOW_THINKING,
     )
     _save_config(config)
 
     return config
+
+
+def reload_config():
+    return _load_existing_config()
 
 
 def _persist_config(config):
@@ -352,7 +454,7 @@ def save_config_field(key, value):
 
 
 def save_config_fields(fields):
-    config = _load_existing_config().to_dict()
+    config = _load_existing_config().to_flat_dict()
     for key in fields:
         if key not in config:
             raise ValueError(f"Unknown config key: {key}")
@@ -423,6 +525,7 @@ def update_config():
         max_agent_rounds=new_max_agent_rounds,
         max_agent_tool_calls=new_max_agent_tool_calls,
         agent_approval_mode=new_agent_approval_mode,
+        agent_show_thinking=config.agent_show_thinking,
     )
     _save_config(new_config)
     return new_config

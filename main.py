@@ -47,6 +47,13 @@ def handle_response(response, model_name, stream_mode=False, thinking_mode=False
         print()
         return
 
+    if response.get("response_streamed"):
+        print()
+        return
+
+    if response.get("agent_stopped"):
+        return
+
     thinking = response.get("thinking")
     if thinking and thinking_mode:
         print_thinking(_clean_text(thinking))
@@ -97,6 +104,7 @@ def main():
             max_agent_rounds=config.max_agent_rounds,
             max_agent_tool_calls=config.max_agent_tool_calls,
             agent_approval_mode=config.agent_approval_mode,
+            agent_show_thinking=config.agent_show_thinking,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")
@@ -121,6 +129,10 @@ def main():
             handle_response(response, chat.model, chat.stream_mode and not chat.agent_mode, chat.thinking_mode)
 
         except KeyboardInterrupt:
+            console.print()
+            print_success("Conversation interrupted, goodbye!")
+            break
+        except EOFError:
             console.print()
             print_success("Conversation interrupted, goodbye!")
             break

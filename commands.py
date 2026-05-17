@@ -2,9 +2,11 @@ from ui import print_error, print_success, print_warn, print_info
 from config import (
     parse_agent_approval_mode,
     parse_agent_rounds,
+    parse_agent_show_thinking,
     parse_agent_tool_calls,
     parse_max_tokens,
     parse_temperature,
+    reload_config,
     save_config_field,
     save_config_fields,
     update_config,
@@ -17,12 +19,12 @@ COMMANDS = {
     "/clear": "Clear the conversation history.",
     "/save": "Save the current conversation history to a JSON file.",
     "/load": "Load a previous conversation from JSON file.",
-    "/conf": "Update the API type, base URL, API Key and model configuration.",
+    "/conf": "Update configuration, or reload config.json (Example: /conf reload).",
     "/token": "Set the maximum tokens for responses (Example: /token 4096).",
     "/temp": "Set the temperature for responses (Example: /temp 0.7).",
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
-    "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent budget 12 40).",
+    "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
 }
 
 
@@ -61,25 +63,54 @@ def handle_clear(chat, args):
 
 
 def handle_conf(chat, args):
+    if args:
+        action = args.strip().lower()
+        if action == "reload":
+            result = reload_config()
+            if _apply_config(chat, result):
+                chat.clear_history()
+                print_success("Configuration reloaded from config.json.")
+            return True
+
+        print_error("Usage: /conf | /conf reload")
+        return True
+
     result = update_config()
     if result:
-        try:
-            chat.configure(
-                result.api_type,
-                result.base_url,
-                result.model,
-                result.api_key,
-                result.max_tokens,
-                result.temperature,
-                result.stream_mode,
-                result.thinking_mode,
-            )
-            chat.set_agent_limits(result.max_agent_rounds, result.max_agent_tool_calls)
-            chat.set_agent_approval_mode(result.agent_approval_mode)
-        except Exception as error:
-            print_error(f"Failed to apply configuration: {error}")
-            return True
-        chat.clear_history()
+        if _apply_config(chat, result):
+            chat.clear_history()
+    return True
+
+
+def _apply_config(chat, config):
+    if not config.api_key:
+        print_error("Configuration API Key is empty. Reload aborted.")
+        return False
+
+    try:
+        chat.configure(
+            config.api_type,
+            config.base_url,
+            config.model,
+            config.api_key,
+            config.max_tokens,
+            config.temperature,
+            config.stream_mode,
+            config.thinking_mode,
+        )
+        chat.set_agent_limits(config.max_agent_rounds, config.max_agent_tool_calls)
+        chat.set_agent_approval_mode(config.agent_approval_mode)
+        chat.set_agent_show_thinking(config.agent_show_thinking)
+
+        if config.agent_mode and not chat.get_agent_status().get("workspace_dir"):
+            chat.set_agent_mode(False)
+            save_config_field("agent_mode", False)
+            print_warn("Agent mode requires a startup workspace directory and has been turned off.")
+        else:
+            chat.set_agent_mode(config.agent_mode)
+    except Exception as error:
+        print_error(f"Failed to apply configuration: {error}")
+        return False
     return True
 
 
@@ -172,10 +203,14 @@ def handle_agent(chat, args):
         running = "running" if status.get("running") else "idle"
         budget = f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
         approval = status.get("approval_mode", "confirm")
+        show_thinking = status.get("show_thinking", "summary")
         print_info(
-            f"Current agent mode: {current} ({running}). Budget: {budget}. Approval: {approval}. "
-            f"Usage: /agent on | /agent off | /agent stop | "
-            f"/agent budget <rounds> <tool-calls> | /agent approve confirm|auto"
+            f"Current agent mode: {current} ({running}).\n"
+            f"Budget: {budget}.\n"
+            f"Approval: {approval}.\n"
+            f"Show thinking: {show_thinking}.\n"
+            f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
+            f"/agent approve confirm|auto | /agent show-thinking summary|full|off"
         )
         return True
 
@@ -244,10 +279,31 @@ def handle_agent(chat, args):
         chat.set_agent_approval_mode(approval_mode)
         save_config_field("agent_approval_mode", approval_mode)
         print_success(f"Agent approval mode set to {approval_mode}.")
+    elif mode in {"show-thinking", "show_thinking", "thinking"}:
+        if len(parts) == 1:
+            current = status.get("show_thinking", "summary")
+            print_info(
+                f"Current agent thinking display: {current}. "
+                "Usage: /agent show-thinking summary|full|off"
+            )
+            return True
+        if len(parts) != 2:
+            print_error("Usage: /agent show-thinking summary|full|off")
+            return True
+        try:
+            show_thinking = parse_agent_show_thinking(parts[1])
+        except ValueError as error:
+            print_error(str(error))
+            return True
+
+        chat.set_agent_show_thinking(show_thinking)
+        save_config_field("agent_show_thinking", show_thinking)
+        print_success(f"Agent thinking display set to {show_thinking}.")
     else:
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
-            f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto."
+            f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto, "
+            f"/agent show-thinking summary|full|off."
         )
     return True
 
