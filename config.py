@@ -7,6 +7,7 @@ from ui import print_error, print_success, print_warn, print_info, get_user_inpu
 CONFIG_FILE = "config.json"
 API_TYPE_GLM = "glm"
 API_TYPE_ANTHROPIC = "anthropic"
+API_TYPE_OPENAI = "openai"
 DEFAULT_API_TYPE = API_TYPE_GLM
 DEFAULT_BASE_URL = ""
 DEFAULT_MODEL = "glm-4.7"
@@ -25,17 +26,7 @@ AGENT_THINKING_FULL = "full"
 DEFAULT_AGENT_SHOW_THINKING = AGENT_THINKING_SUMMARY
 AGENT_APPROVAL_MODES = {"confirm", "auto"}
 AGENT_THINKING_MODES = {AGENT_THINKING_OFF, AGENT_THINKING_SUMMARY, AGENT_THINKING_FULL}
-SUPPORTED_API_TYPES = {API_TYPE_GLM, API_TYPE_ANTHROPIC}
-API_TYPE_ALIASES = {
-    "zhipu": API_TYPE_GLM,
-    "zhipuai": API_TYPE_GLM,
-    "bigmodel": API_TYPE_GLM,
-    "claude": API_TYPE_ANTHROPIC,
-    "anthropic-compatible": API_TYPE_ANTHROPIC,
-    "anthropic_compatible": API_TYPE_ANTHROPIC,
-    "deepseek": API_TYPE_ANTHROPIC,
-    "minimax": API_TYPE_ANTHROPIC,
-}
+SUPPORTED_API_TYPES = {API_TYPE_GLM, API_TYPE_ANTHROPIC, API_TYPE_OPENAI}
 
 
 @dataclass
@@ -95,8 +86,7 @@ class AppConfig:
 
 
 def normalize_api_type(api_type):
-    value = str(api_type or DEFAULT_API_TYPE).strip().lower()
-    return API_TYPE_ALIASES.get(value, value)
+    return str(api_type or DEFAULT_API_TYPE).strip().lower()
 
 
 def _normalize_base_url(api_type, base_url):
@@ -319,7 +309,7 @@ def _sanitize_config(config):
 
 
 def _prompt_api_type(current_api_type):
-    prompt = f"API type (glm/anthropic, Current: {current_api_type}): "
+    prompt = f"API type (glm/anthropic/openai, Current: {current_api_type}): "
     value = get_user_input(prompt).strip()
     if not value:
         return current_api_type

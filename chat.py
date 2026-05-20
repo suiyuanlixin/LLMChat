@@ -2,8 +2,10 @@ import json
 import re
 import time
 
+from rich.cells import cell_len
+
 from ui import (
-    clear_current_line,
+    clear_current_lines,
     clean_and_print_stream_response,
     clean_display_text,
     console,
@@ -17,6 +19,7 @@ from ui import (
 from config import (
     API_TYPE_ANTHROPIC,
     API_TYPE_GLM,
+    API_TYPE_OPENAI,
     AGENT_THINKING_FULL,
     AGENT_THINKING_SUMMARY,
     DEFAULT_MAX_AGENT_ROUNDS,
@@ -24,7 +27,7 @@ from config import (
     normalize_api_type,
     parse_agent_show_thinking,
 )
-from tools import AgentTools, anthropic_tool_schemas, glm_tool_schemas
+from tools import AgentTools, anthropic_tool_schemas, glm_tool_schemas, openai_tool_schemas
 
 
 AGENT_CONTEXT_WARN_CHARS = 180000
@@ -32,9 +35,11 @@ AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
 AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS = 0.006
 AGENT_RESPONSE_CHAR_DELAY_SECONDS = 0.003
 AGENT_SUMMARY_MAX_TOKENS = 96
+AGENT_SUMMARY_PREFIX_CHARS = len("[*] Thinking: ")
 AGENT_SUMMARY_SYSTEM_PROMPT = (
     "Summarize hidden local-agent thinking for a terminal status line. "
-    "Return exactly one short sentence, with no markdown, code, quotes, or prefix. "
+    "Return one very short sentence, ideally 4-8 words or 8-16 Chinese characters. "
+    "Prefer brevity over detail. Use no markdown, code, quotes, or prefix. "
     "Describe what the agent is doing now, not step-by-step reasoning. "
     "Use the same language as the thinking when obvious."
 )
@@ -96,6 +101,7 @@ class LLMChat:
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
         self.agent_summary_thinking_active = False
+        self.agent_summary_rendered_lines = 1
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
@@ -113,7 +119,7 @@ class LLMChat:
         thinking_mode=None,
     ):
         api_type = normalize_api_type(api_type)
-        if api_type not in {API_TYPE_GLM, API_TYPE_ANTHROPIC}:
+        if api_type not in {API_TYPE_GLM, API_TYPE_ANTHROPIC, API_TYPE_OPENAI}:
             raise ValueError(f"Unsupported API type: {api_type}")
 
         base_url = "" if api_type == API_TYPE_GLM else (base_url or "").strip()
@@ -144,6 +150,17 @@ class LLMChat:
             if base_url:
                 kwargs["base_url"] = base_url
             return anthropic.Anthropic(**kwargs)
+
+        if api_type == API_TYPE_OPENAI:
+            try:
+                from openai import OpenAI
+            except ImportError as error:
+                raise RuntimeError("OpenAI SDK is not installed. Run: pip install openai") from error
+
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            return OpenAI(**kwargs)
 
         try:
             from zai import ZhipuAiClient
@@ -229,11 +246,7 @@ class LLMChat:
                 response = self._parse_anthropic_response(response)
             else:
                 response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.conversation_history,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    thinking={"type": "enabled"} if self.thinking_mode else {},
+                    **self._chat_completion_kwargs(messages=self.conversation_history)
                 )
                 response = self._parse_response(response)
 
@@ -269,6 +282,7 @@ class LLMChat:
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
         self.agent_summary_thinking_active = False
+        self.agent_summary_rendered_lines = 1
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
@@ -276,7 +290,7 @@ class LLMChat:
         try:
             if self.api_type == API_TYPE_ANTHROPIC:
                 return self._finalize_agent_response(self._anthropic_agent_response())
-            return self._finalize_agent_response(self._glm_agent_response())
+            return self._finalize_agent_response(self._chat_completion_agent_response())
         except KeyboardInterrupt:
             self.agent_stop_requested = True
             print_warn("Agent stopped by user.")
@@ -375,7 +389,7 @@ class LLMChat:
         print_error(message)
         return {"thinking": full_thinking, "response": final_response or message}
 
-    def _glm_agent_response(self):
+    def _chat_completion_agent_response(self):
         full_thinking = ""
         final_response = ""
 
@@ -385,16 +399,14 @@ class LLMChat:
             self._print_agent_round(round_index)
             self._warn_agent_context_if_needed()
             response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self._glm_agent_messages(),
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                thinking={"type": "enabled"} if self.thinking_mode else {},
-                tools=glm_tool_schemas(),
+                **self._chat_completion_kwargs(
+                    messages=self._chat_agent_messages(),
+                    tools=self._chat_tool_schemas(),
+                )
             )
 
             message = response.choices[0].message
-            assistant_message, thinking_content, text, tool_calls = self._glm_message_parts(message)
+            assistant_message, thinking_content, text, tool_calls = self._chat_message_parts(message)
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             self._show_agent_thinking(thinking_content)
@@ -411,12 +423,11 @@ class LLMChat:
                 message = self._agent_tool_budget_message()
                 for tool_call in tool_calls:
                     self.conversation_history.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": tool_call["name"],
-                            "content": _error_text(message),
-                        }
+                        self._chat_tool_result_message(
+                            tool_call["id"],
+                            tool_call["name"],
+                            _error_text(message),
+                        )
                     )
                 self._separate_after_agent_thinking()
                 print_error(message)
@@ -427,12 +438,11 @@ class LLMChat:
                     return self._agent_stopped_response(full_thinking, final_response)
                 tool_result = self._execute_agent_tool(tool_call["name"], tool_call["arguments"])
                 self.conversation_history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": tool_call["name"],
-                        "content": tool_result,
-                    }
+                    self._chat_tool_result_message(
+                        tool_call["id"],
+                        tool_call["name"],
+                        tool_result,
+                    )
                 )
 
         message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
@@ -550,6 +560,7 @@ class LLMChat:
             self.agent_thinking_streamed = False
             self.agent_thinking_needs_separator = False
             self.agent_summary_thinking_active = False
+            self.agent_summary_rendered_lines = 1
             leading_newline = False
         if not self.agent_thinking_streamed:
             print_stream_thinking("", leading_newline=leading_newline)
@@ -585,6 +596,7 @@ class LLMChat:
             self.agent_thinking_streamed = False
             self.agent_thinking_needs_separator = False
             self.agent_summary_thinking_active = False
+            self.agent_summary_rendered_lines = 1
             leading_newline = False
         elif replace_current_line:
             leading_newline = False
@@ -592,6 +604,7 @@ class LLMChat:
             console.print()
             self.agent_thinking_needs_separator = False
             self.agent_summary_thinking_active = False
+            self.agent_summary_rendered_lines = 1
 
         summary = self._stream_agent_thinking_summary_with_model(
             content,
@@ -613,18 +626,29 @@ class LLMChat:
         self.agent_summary_thinking_active = True
 
     def _print_agent_thinking_summary(self, summary, leading_newline=True, replace_current_line=False):
+        summary = _clean_summary_stream_delta(summary).strip()
+        if not summary:
+            return
         self._start_agent_thinking_summary_line(leading_newline, replace_current_line)
         for character in summary:
             print_stream_thinking_continue(character)
             if console.is_terminal:
                 time.sleep(AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS)
+        self.agent_summary_rendered_lines = self._agent_summary_rendered_line_count(summary)
 
     def _start_agent_thinking_summary_line(self, leading_newline=True, replace_current_line=False):
         if replace_current_line:
-            clear_current_line()
+            clear_current_lines(self.agent_summary_rendered_lines)
             print_stream_thinking("", leading_newline=False)
         else:
             print_stream_thinking("", leading_newline=leading_newline)
+
+    def _agent_summary_rendered_line_count(self, summary):
+        if not console.is_terminal:
+            return 1
+        width = max(1, int(console.width or 80))
+        text_length = AGENT_SUMMARY_PREFIX_CHARS + cell_len(str(summary or ""))
+        return max(1, (text_length + width - 1) // width)
 
     def _stream_agent_thinking_summary_with_model(
         self,
@@ -640,6 +664,7 @@ class LLMChat:
             return ""
 
         summary_text = ""
+        raw_summary_text = ""
         started = False
 
         def emit(delta):
@@ -654,6 +679,7 @@ class LLMChat:
                 started = True
             summary_text += delta
             print_stream_thinking_continue(delta)
+            self.agent_summary_rendered_lines = self._agent_summary_rendered_line_count(summary_text)
 
         try:
             if self.api_type == API_TYPE_ANTHROPIC:
@@ -672,7 +698,7 @@ class LLMChat:
                     if self._get_field(delta, "type", "") == "text_delta":
                         emit(self._get_field(delta, "text", "") or "")
             else:
-                response = self.client.chat.completions.create(
+                kwargs = self._chat_completion_kwargs(
                     model=self.agent_summary_model,
                     messages=[
                         {"role": "system", "content": AGENT_SUMMARY_SYSTEM_PROMPT},
@@ -681,10 +707,28 @@ class LLMChat:
                     temperature=min(float(self.temperature), 0.3),
                     max_tokens=AGENT_SUMMARY_MAX_TOKENS,
                     stream=True,
+                    include_reasoning=False,
                 )
+                if self._uses_minimax_openai_compat(self.agent_summary_model):
+                    kwargs["extra_body"] = {"reasoning_split": True}
+
+                response = self.client.chat.completions.create(**kwargs)
                 for chunk in response:
                     delta = chunk.choices[0].delta
-                    emit(getattr(delta, "content", "") or "")
+                    _, raw_summary_text = self._split_stream_delta(
+                        raw_summary_text,
+                        self._get_field(delta, "content", "") or "",
+                    )
+                    clean_summary = _clean_summary_stream_delta(
+                        _clean_content_text(raw_summary_text)
+                    ).strip()
+                    visible_delta, summary_text_candidate = self._split_stream_delta(
+                        summary_text,
+                        clean_summary,
+                    )
+                    if visible_delta:
+                        emit(visible_delta)
+                        summary_text = summary_text_candidate
         except Exception:
             return summary_text.strip()
 
@@ -718,6 +762,7 @@ class LLMChat:
         console.print()
         self.agent_thinking_needs_separator = False
         self.agent_summary_thinking_active = False
+        self.agent_summary_rendered_lines = 1
 
     def _before_agent_visible_output(self):
         self._separate_after_agent_thinking()
@@ -802,40 +847,48 @@ class LLMChat:
 
         try:
             response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.conversation_history,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                thinking={"type": "enabled"} if self.thinking_mode else {},
-                stream=True,
+                **self._chat_completion_kwargs(
+                    messages=self.conversation_history,
+                    stream=True,
+                )
             )
 
             if self.thinking_mode:
                 print_stream_thinking("")
             full_thinking = ""
+            raw_thinking = ""
             full_response = ""
+            raw_response = ""
             thinking_ended = False
 
             for chunk in response:
                 delta = chunk.choices[0].delta
-                reasoning = getattr(delta, "reasoning_content", "") or ""
+                reasoning, full_thinking, raw_thinking = self._stream_reasoning_delta(
+                    delta,
+                    full_thinking,
+                    raw_thinking,
+                )
                 if reasoning:
-                    full_thinking += reasoning
                     if callback_thinking and self.thinking_mode:
                         callback_thinking(reasoning)
 
-                content = getattr(delta, "content", "") or ""
+                content, full_response, raw_response = self._stream_content_delta(
+                    self._get_field(delta, "content", "") or "",
+                    full_response,
+                    raw_response,
+                )
                 if content:
                     if not thinking_ended:
                         if full_thinking and not full_thinking.endswith("\n"):
                             console.print()
                         print_stream_response_start(model_name)
                         thinking_ended = True
-                    full_response += content
                     if callback_response:
                         callback_response(content)
 
-            self.conversation_history.append({"role": "assistant", "content": full_response})
+            self.conversation_history.append(
+                self._chat_stream_assistant_message(full_response, full_thinking)
+            )
             return {"thinking": full_thinking, "response": full_response}
 
         except Exception as error:
@@ -904,13 +957,10 @@ class LLMChat:
     def _parse_response(self, response):
         try:
             message = response.choices[0].message
-            assistant_message = getattr(message, "content", "") or ""
-            thinking_content = getattr(message, "reasoning_content", "") or ""
+            assistant_message, thinking_content, text, _ = self._chat_message_parts(message)
 
-            self.conversation_history.append(
-                {"role": "assistant", "content": assistant_message}
-            )
-            return {"thinking": thinking_content, "response": assistant_message}
+            self.conversation_history.append(assistant_message)
+            return {"thinking": thinking_content, "response": text}
         except (AttributeError, IndexError) as error:
             print_error(f"Failed to parse response: {error}")
             return None
@@ -980,12 +1030,16 @@ class LLMChat:
                 tool_uses.append(block)
         return thinking, text, tool_uses
 
-    def _glm_message_parts(self, message):
-        text = self._get_field(message, "content", "") or ""
-        thinking_content = self._get_field(message, "reasoning_content", "") or ""
+    def _chat_message_parts(self, message):
+        text = self._message_content_text(self._get_field(message, "content", "") or "")
+        thinking_content = self._message_reasoning_text(message)
         raw_tool_calls = self._get_field(message, "tool_calls", None) or []
 
         assistant_message = {"role": "assistant", "content": text}
+        reasoning_details = self._get_field(message, "reasoning_details", None)
+        if reasoning_details:
+            assistant_message["reasoning_details"] = self._plain_data(reasoning_details)
+
         tool_calls = []
         if raw_tool_calls:
             assistant_tool_calls = []
@@ -1037,8 +1091,154 @@ class LLMChat:
             messages.append({"role": role, "content": message.get("content", "")})
         return messages
 
-    def _glm_agent_messages(self):
+    def _chat_agent_messages(self):
         return [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + self.conversation_history
+
+    def _chat_completion_kwargs(
+        self,
+        model=None,
+        messages=None,
+        temperature=None,
+        max_tokens=None,
+        stream=False,
+        tools=None,
+        include_reasoning=True,
+    ):
+        kwargs = {
+            "model": model or self.model,
+            "messages": messages if messages is not None else self.conversation_history,
+            "temperature": self.temperature if temperature is None else temperature,
+            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
+        }
+        if self.api_type == API_TYPE_GLM and include_reasoning:
+            kwargs["thinking"] = {"type": "enabled"} if self.thinking_mode else {}
+        elif include_reasoning and self._uses_minimax_openai_compat(model):
+            kwargs["extra_body"] = {"reasoning_split": True}
+        if stream:
+            kwargs["stream"] = True
+        if tools is not None:
+            kwargs["tools"] = tools
+        return kwargs
+
+    def _chat_tool_schemas(self):
+        if self.api_type == API_TYPE_OPENAI:
+            return openai_tool_schemas()
+        return glm_tool_schemas()
+
+    def _chat_tool_result_message(self, tool_call_id, name, content):
+        message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        }
+        if self.api_type == API_TYPE_GLM and name:
+            message["name"] = name
+        return message
+
+    def _chat_stream_assistant_message(self, content, thinking):
+        message = {"role": "assistant", "content": content}
+        if self._uses_minimax_openai_compat() and thinking:
+            message["reasoning_details"] = [{"text": thinking}]
+        return message
+
+    def _uses_minimax_openai_compat(self, model=None):
+        if self.api_type != API_TYPE_OPENAI:
+            return False
+        base_url = str(self.base_url or "").lower()
+        model_name = str(model or self.model or "").lower()
+        return "minimax" in base_url or "minimaxi" in base_url or model_name.startswith("minimax")
+
+    def _message_reasoning_text(self, message):
+        reasoning_content = self._get_field(message, "reasoning_content", "") or ""
+        reasoning_details = self._reasoning_details_text(
+            self._get_field(message, "reasoning_details", None)
+        )
+        reasoning = self._get_field(message, "reasoning", "") or ""
+        return _clean_reasoning_text(reasoning_content or reasoning_details or reasoning)
+
+    def _message_content_text(self, content):
+        if self._uses_minimax_openai_compat():
+            return _clean_content_text(content)
+        return str(content or "")
+
+    def _stream_content_delta(self, content, current_response, raw_response):
+        if not self._uses_minimax_openai_compat():
+            delta, current_response = self._split_stream_delta(current_response, content)
+            return delta, current_response, raw_response
+
+        delta, raw_response = self._split_stream_delta(raw_response, content)
+        if not delta and not content:
+            return "", current_response, raw_response
+        clean_response = _clean_content_text(raw_response)
+        clean_delta, clean_response = self._split_stream_delta(current_response, clean_response)
+        return clean_delta, clean_response, raw_response
+
+    def _stream_reasoning_delta(self, delta, current_thinking, raw_thinking):
+        reasoning = (
+            self._get_field(delta, "reasoning_content", "")
+            or self._get_field(delta, "reasoning", "")
+            or ""
+        )
+        if reasoning:
+            raw_thinking += reasoning
+            clean_thinking = _clean_reasoning_text(raw_thinking)
+            clean_delta, clean_thinking = self._split_stream_delta(current_thinking, clean_thinking)
+            return clean_delta, clean_thinking, raw_thinking
+
+        reasoning_details = self._reasoning_details_text(
+            self._get_field(delta, "reasoning_details", None)
+        )
+        if reasoning_details:
+            if raw_thinking and reasoning_details.startswith(raw_thinking):
+                raw_thinking = reasoning_details
+            else:
+                raw_thinking += reasoning_details
+            clean_thinking = _clean_reasoning_text(raw_thinking)
+            clean_delta, clean_thinking = self._split_stream_delta(current_thinking, clean_thinking)
+            return clean_delta, clean_thinking, raw_thinking
+        return "", current_thinking, raw_thinking
+
+    def _reasoning_details_text(self, details):
+        if not details:
+            return ""
+        if isinstance(details, str):
+            return details
+        if isinstance(details, dict):
+            return details.get("text") or details.get("content") or ""
+        if isinstance(details, (list, tuple)):
+            return "".join(self._reasoning_details_text(detail) for detail in details)
+
+        text = self._get_field(details, "text", None)
+        if text is not None:
+            return str(text)
+        content = self._get_field(details, "content", None)
+        if content is not None:
+            return str(content)
+        return ""
+
+    @staticmethod
+    def _split_stream_delta(current_text, next_text):
+        next_text = str(next_text or "")
+        if not next_text:
+            return "", current_text
+        if current_text and next_text.startswith(current_text):
+            return next_text[len(current_text) :], next_text
+        return next_text, current_text + next_text
+
+    def _plain_data(self, value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, list):
+            return [self._plain_data(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._plain_data(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._plain_data(item) for key, item in value.items()}
+        if hasattr(value, "model_dump"):
+            return self._plain_data(value.model_dump(exclude_none=True))
+        if hasattr(value, "to_dict"):
+            return self._plain_data(value.to_dict())
+        return value
 
     @staticmethod
     def _get_field(item, field, default=None):
@@ -1097,13 +1297,29 @@ def _estimate_history_chars(history):
     return total
 
 
+def _clean_reasoning_text(content):
+    text = str(content or "")
+    text = re.sub(r"<\s*/?\s*think\s*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _clean_content_text(content):
+    text = str(content or "")
+    text = re.sub(r"<\s*think\s*>.*?<\s*/\s*think\s*>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<\s*think\s*>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<\s*/\s*think\s*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE)
+    return text
+
+
 def _summarize_agent_thinking(content):
     text = _strip_code_from_thinking(content)
     if not text:
         return "Working out the next agent step."
 
     sentence = _pick_thinking_summary_sentence(text)
-    return _single_line(sentence, 120)
+    return _single_line_unlimited(sentence)
 
 
 def _summary_model_prompt(content):
@@ -1111,7 +1327,8 @@ def _summary_model_prompt(content):
     if not text:
         return ""
     return (
-        "Summarize this agent thinking into one short terminal status sentence.\n\n"
+        "Summarize this agent thinking into one very short terminal status sentence. "
+        "Keep it as short as possible while still being useful.\n\n"
         f"{_single_line(text, 4000)}"
     )
 
@@ -1271,6 +1488,10 @@ def _single_line(text, max_chars):
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3] + "..."
+
+
+def _single_line_unlimited(text):
+    return " ".join(str(text or "").split())
 
 
 def _error_text(message):

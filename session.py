@@ -90,17 +90,17 @@ def load_conversation():
             model = data.get("model", "").upper()
             conversation = data.get("conversation", [])
             msg_count = f"{len(conversation)} Messages"
-            display = f"{formatted} <json> <{version}> <{model}> <{msg_count}>"
+            display = f"{formatted} <{version}> <{model}> <{msg_count}>"
             file_info.append((f, display))
         except Exception:
             file_info.append((f, f))
 
     print_info("Available conversations:")
     for i, (fname, display) in enumerate(file_info, 1):
-        parts = display.split(" <json>", 1)
+        parts = display.split(" <", 1)
         if len(parts) == 2:
             date_part = parts[0]
-            meta_part = f" <json>{parts[1]}"
+            meta_part = f" <{parts[1]}"
             console.print(
                 Text.assemble(
                     gradient_text(f"[{i}] {date_part}", *TEXT_COLOR),

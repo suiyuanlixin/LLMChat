@@ -164,6 +164,16 @@ def clear_current_line():
     console.file.flush()
 
 
+def clear_current_lines(line_count):
+    if not console.is_terminal:
+        return
+    line_count = max(1, int(line_count or 1))
+    console.file.write("\r\033[2K")
+    for _ in range(line_count - 1):
+        console.file.write("\033[1A\r\033[2K")
+    console.file.flush()
+
+
 def print_stream_response_start(model_name):
     console.print(
         Text.assemble(
@@ -256,7 +266,7 @@ def _get_last_record_text(line_number):
 
     filename = visible_files[file_index]
 
-    # Format: 2026-04-25-14-30.json -> " 2026.04.25 14:30 <json> <version> <MODEL>"
+    # Format: 2026-04-25-14-30.json -> " 2026.04.25 14:30 <version> <MODEL>"
     name = filename[:-5]
     parts = name.split("-")
     if len(parts) >= 5:
@@ -282,7 +292,6 @@ def _get_last_record_text(line_number):
 
     return _dashboard_text_from_segments(
         (f" {formatted}", TEXT_COLOR),
-        (" <json>", THINK_COLOR),
         (f" <{version}>", THINK_COLOR),
         (f" <{model}>", THINK_COLOR),
         (f" <{msg_count}>", THINK_COLOR),

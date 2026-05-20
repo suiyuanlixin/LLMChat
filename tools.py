@@ -266,6 +266,10 @@ def glm_tool_schemas():
     ]
 
 
+def openai_tool_schemas():
+    return glm_tool_schemas()
+
+
 class AgentToolError(Exception):
     pass
 
