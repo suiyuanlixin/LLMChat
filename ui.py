@@ -1,5 +1,10 @@
 import os
 import json
+import sys
+
+if os.name == "nt":
+    import ctypes
+    import msvcrt
 
 from rich.text import Text
 from rich.color import Color
@@ -20,6 +25,8 @@ TEXT_COLOR = ["#cfd7e3", "#f6f6f6", "#e1ebf0"]
 THINK_COLOR = ["#7e7d80", "#b4b1b2"]
 STREAM_THINK_COLOR = "#7e7d80"
 STREAM_RESPONSE_COLOR = "#f6f6f6"
+VK_SHIFT = 0x10
+VK_ALT = 0x12
 
 
 def gradient_text(content, start_color, end_color, mid_color=None):
@@ -391,14 +398,62 @@ def show_dashboard(model_name, workspace_dir=None):
     )
 
 
-def get_user_input(prompt_text):
-    return console.input(
-        Text.assemble(
-            "\n",
-            gradient_text("[-]", *INFO_COLOR),
-            gradient_text(f" {prompt_text}", *TEXT_COLOR),
-        )
-    ).strip()
+def _input_prompt(prompt_text):
+    return Text.assemble(
+        "\n",
+        gradient_text("[-]", *INFO_COLOR),
+        gradient_text(f" {prompt_text}", *TEXT_COLOR),
+    )
+
+
+def _key_down(key):
+    return bool(ctypes.windll.user32.GetAsyncKeyState(key) & 0x8000)
+
+
+def _read_windows_multiline_input(prompt):
+    chars = []
+    console.print(prompt, end="")
+
+    while True:
+        ch = msvcrt.getwch()
+
+        if ch in ("\x00", "\xe0"):
+            msvcrt.getwch()
+            continue
+
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x1a":
+            raise EOFError
+
+        if ch in ("\r", "\n"):
+            if _key_down(VK_SHIFT) or _key_down(VK_ALT):
+                chars.append("\n")
+                console.file.write("\n")
+                console.file.flush()
+                continue
+
+            console.file.write("\n")
+            console.file.flush()
+            return "".join(chars)
+
+        if ch == "\b":
+            if chars and chars[-1] != "\n":
+                chars.pop()
+                console.file.write("\b \b")
+                console.file.flush()
+            continue
+
+        chars.append(ch)
+        console.file.write(ch)
+        console.file.flush()
+
+
+def get_user_input(prompt_text, multiline=False):
+    prompt = _input_prompt(prompt_text)
+    if multiline and os.name == "nt" and sys.stdin.isatty():
+        return _read_windows_multiline_input(prompt).strip()
+    return console.input(prompt).strip()
 
 
 def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content):

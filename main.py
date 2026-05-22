@@ -113,7 +113,7 @@ def main():
 
     while True:
         try:
-            user_input = get_user_input("You: ")
+            user_input = get_user_input("You: ", multiline=True)
 
             if not user_input:
                 print_error("Please enter a non-empty message.")
