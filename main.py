@@ -1,4 +1,6 @@
 import sys
+import re
+from pathlib import Path
 
 from ui import (
     console,
@@ -15,7 +17,10 @@ from ui import (
 from config import load_config, save_config_field
 from chat import LLMChat
 from commands import process_command
-from tools import normalize_workspace_dir
+from tools import MAX_READ_CHARS, normalize_workspace_dir
+
+
+FILE_REFERENCE_PATTERN = re.compile(r"\[([^\[\]\r\n]+)\]")
 
 
 def _clean_text(text):
@@ -75,6 +80,70 @@ def get_startup_workspace(argv):
     return str(workspace), None
 
 
+def _is_file_reference_path(path_text):
+    value = str(path_text or "").strip()
+    if not value:
+        return False
+    if value.startswith(("/", "\\", "~")):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        return True
+    return value.startswith(("./", ".\\", "../", "..\\"))
+
+
+def _external_file_references(user_input):
+    references = []
+    seen = set()
+    for match in FILE_REFERENCE_PATTERN.finditer(user_input):
+        path_text = match.group(1).strip()
+        if not _is_file_reference_path(path_text):
+            continue
+        if path_text in seen:
+            continue
+        seen.add(path_text)
+        references.append(path_text)
+    return references
+
+
+def _read_external_file_reference(path_text):
+    try:
+        path = Path(path_text).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"Referenced file does not exist: {path_text}") from error
+
+    if not path.is_file():
+        raise ValueError(f"Referenced path is not a file: {path}")
+
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise ValueError(f"Failed to read referenced file: {path}") from error
+
+    truncated = content[:MAX_READ_CHARS]
+    if len(content) > MAX_READ_CHARS:
+        truncated += f"\n\n[referenced file truncated after {MAX_READ_CHARS} characters]"
+    return path, truncated
+
+
+def attach_external_file_references(user_input):
+    references = _external_file_references(user_input)
+    if not references:
+        return user_input
+
+    blocks = [
+        (
+            "[Referenced external files]\n"
+            "The user explicitly attached these read-only file contents. "
+            "They do not grant access to directories or other external files."
+        )
+    ]
+    for path_text in references:
+        path, content = _read_external_file_reference(path_text)
+        blocks.append(f"--- File: {path} ---\n{content}\n--- End file: {path} ---")
+
+    return f"{user_input}\n\n" + "\n\n".join(blocks)
+
+
 def main():
     config = load_config()
     workspace_dir, workspace_error = get_startup_workspace(sys.argv)
@@ -129,6 +198,12 @@ def main():
                     break
                 if should_continue is True:
                     continue
+
+            try:
+                user_input = attach_external_file_references(user_input)
+            except ValueError as error:
+                print_error(str(error))
+                continue
 
             response = chat.send_message(user_input, stream_print_thinking, stream_print_response)
             handle_response(response, chat.model, chat.stream_mode and not chat.agent_mode, chat.thinking_mode)
