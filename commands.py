@@ -25,6 +25,7 @@ COMMANDS = {
     "/temp": "Set the temperature for responses (Example: /temp 0.7).",
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
+    "/comp": "Compact the current conversation context immediately.",
     "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
 }
 
@@ -103,6 +104,12 @@ def _apply_config(chat, config):
         chat.set_agent_approval_mode(config.agent_approval_mode)
         chat.set_agent_show_thinking(config.agent_show_thinking)
         chat.set_agent_summary_model(config.agent_summary_model)
+        chat.set_compaction_config(
+            config.compaction_enable,
+            config.compaction_max_chars,
+            config.compaction_keep_recent_messages,
+            config.compaction_compact_model,
+        )
 
         if config.agent_mode and not chat.get_agent_status().get("workspace_dir"):
             chat.set_agent_mode(False)
@@ -193,6 +200,28 @@ def handle_think(chat, args):
         print_success("Thinking mode turned off.")
     else:
         print_error(f"Invalid option: {think}. Use /think on or /think off.")
+    return True
+
+
+def handle_comp(chat, args):
+    if args:
+        print_error("Usage: /comp")
+        return True
+
+    result = chat.compact_context(manual=True)
+    if result.get("compacted"):
+        print_success(
+            "Context compacted: "
+            f"{result.get('before_messages')} -> {result.get('after_messages')} messages, "
+            f"{result.get('before_chars')} -> {result.get('after_chars')} chars."
+        )
+        return True
+
+    reason = result.get("reason") or "Context compaction was cancelled."
+    if result.get("error"):
+        print_error(reason)
+    else:
+        print_info(reason)
     return True
 
 
@@ -320,6 +349,7 @@ COMMAND_HANDLERS = {
     "/load": handle_load,
     "/mode": handle_mode,
     "/think": handle_think,
+    "/comp": handle_comp,
     "/agent": handle_agent,
     "/token": handle_token,
     "/temp": handle_temp,

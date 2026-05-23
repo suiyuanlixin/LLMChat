@@ -106,6 +106,10 @@ def main():
             agent_approval_mode=config.agent_approval_mode,
             agent_show_thinking=config.agent_show_thinking,
             agent_summary_model=config.agent_summary_model,
+            compaction_enable=config.compaction_enable,
+            compaction_max_chars=config.compaction_max_chars,
+            compaction_keep_recent_messages=config.compaction_keep_recent_messages,
+            compaction_compact_model=config.compaction_compact_model,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")

@@ -21,6 +21,10 @@ DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
 DEFAULT_AGENT_SUMMARY_MODEL = ""
+DEFAULT_COMPACTION_ENABLE = True
+DEFAULT_COMPACTION_MAX_CHARS = 60000
+DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
+DEFAULT_COMPACTION_COMPACT_MODEL = ""
 AGENT_THINKING_OFF = "off"
 AGENT_THINKING_SUMMARY = "summary"
 AGENT_THINKING_FULL = "full"
@@ -51,6 +55,10 @@ class AppConfig:
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
     agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
     agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
+    compaction_enable: bool = DEFAULT_COMPACTION_ENABLE
+    compaction_max_chars: int = DEFAULT_COMPACTION_MAX_CHARS
+    compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
+    compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
 
     def to_flat_dict(self):
         return {
@@ -68,6 +76,10 @@ class AppConfig:
             "agent_approval_mode": self.agent_approval_mode,
             "agent_show_thinking": self.agent_show_thinking,
             "agent_summary_model": self.agent_summary_model,
+            "compaction_enable": self.compaction_enable,
+            "compaction_max_chars": self.compaction_max_chars,
+            "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
+            "compaction_compact_model": self.compaction_compact_model,
         }
 
     def to_dict(self):
@@ -87,6 +99,12 @@ class AppConfig:
                 "approve": self.agent_approval_mode,
                 "show_thinking": self.agent_show_thinking,
                 "summary_model": self.agent_summary_model,
+            },
+            "compaction": {
+                "enable": self.compaction_enable,
+                "max_chars": self.compaction_max_chars,
+                "keep_recent_messages": self.compaction_keep_recent_messages,
+                "compact_model": self.compaction_compact_model,
             },
         }
 
@@ -121,6 +139,12 @@ def _default_config():
         "agent_approval_mode": DEFAULT_AGENT_APPROVAL_MODE,
         "agent_show_thinking": DEFAULT_AGENT_SHOW_THINKING,
         "agent_summary_model": DEFAULT_AGENT_SUMMARY_MODEL,
+        "compaction": {
+            "enable": DEFAULT_COMPACTION_ENABLE,
+            "max_chars": DEFAULT_COMPACTION_MAX_CHARS,
+            "keep_recent_messages": DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
+            "compact_model": DEFAULT_COMPACTION_COMPACT_MODEL,
+        },
     }
 
 
@@ -145,6 +169,14 @@ def parse_agent_rounds(value):
 
 def parse_agent_tool_calls(value):
     return _parse_positive_integer(value, "Agent max tool calls")
+
+
+def parse_compaction_max_chars(value):
+    return _parse_positive_integer(value, "Compaction max chars")
+
+
+def parse_compaction_keep_recent_messages(value):
+    return _parse_positive_integer(value, "Compaction keep recent messages")
 
 
 def parse_agent_approval_mode(value):
@@ -242,8 +274,42 @@ def _extract_agent_config(config):
     return agent_config
 
 
+def _extract_compaction_config(config):
+    raw_compaction_config = config.get("compaction", {})
+    if isinstance(raw_compaction_config, dict):
+        compaction_config = dict(raw_compaction_config)
+    else:
+        compaction_config = {"enable": raw_compaction_config}
+
+    aliases = {
+        "enabled": "enable",
+        "max_context_chars": "max_chars",
+        "context_max_chars": "max_chars",
+        "keep_recent": "keep_recent_messages",
+        "recent_messages": "keep_recent_messages",
+        "summary_model": "compact_model",
+        "compaction_model": "compact_model",
+    }
+    for source, target in aliases.items():
+        if target not in compaction_config and source in compaction_config:
+            compaction_config[target] = compaction_config[source]
+
+    flat_aliases = {
+        "compaction_enable": "enable",
+        "compaction_max_chars": "max_chars",
+        "compaction_keep_recent_messages": "keep_recent_messages",
+        "compaction_compact_model": "compact_model",
+    }
+    for source, target in flat_aliases.items():
+        if target not in compaction_config and source in config:
+            compaction_config[target] = config[source]
+
+    return compaction_config
+
+
 def _sanitize_config(config):
     agent_config = _extract_agent_config(config)
+    compaction_config = _extract_compaction_config(config)
 
     config["api_type"] = normalize_api_type(config.get("api_type"))
     if config["api_type"] not in SUPPORTED_API_TYPES:
@@ -314,6 +380,37 @@ def _sanitize_config(config):
             f"Fallback to {DEFAULT_MAX_AGENT_TOOL_CALLS}."
         )
         config["max_agent_tool_calls"] = DEFAULT_MAX_AGENT_TOOL_CALLS
+
+    config["compaction_enable"] = _parse_bool(
+        compaction_config.get("enable"),
+        DEFAULT_COMPACTION_ENABLE,
+    )
+    try:
+        config["compaction_max_chars"] = parse_compaction_max_chars(
+            compaction_config.get("max_chars", DEFAULT_COMPACTION_MAX_CHARS)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid compaction.max_chars in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_COMPACTION_MAX_CHARS}."
+        )
+        config["compaction_max_chars"] = DEFAULT_COMPACTION_MAX_CHARS
+    try:
+        config["compaction_keep_recent_messages"] = parse_compaction_keep_recent_messages(
+            compaction_config.get(
+                "keep_recent_messages",
+                DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
+            )
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid compaction.keep_recent_messages in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES}."
+        )
+        config["compaction_keep_recent_messages"] = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
+    config["compaction_compact_model"] = str(
+        compaction_config.get("compact_model", DEFAULT_COMPACTION_COMPACT_MODEL) or ""
+    ).strip()
 
     return AppConfig(**{key: config[key] for key in AppConfig().to_flat_dict()})
 
@@ -449,6 +546,10 @@ def load_config():
         agent_approval_mode=DEFAULT_AGENT_APPROVAL_MODE,
         agent_show_thinking=DEFAULT_AGENT_SHOW_THINKING,
         agent_summary_model=DEFAULT_AGENT_SUMMARY_MODEL,
+        compaction_enable=DEFAULT_COMPACTION_ENABLE,
+        compaction_max_chars=DEFAULT_COMPACTION_MAX_CHARS,
+        compaction_keep_recent_messages=DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
+        compaction_compact_model=DEFAULT_COMPACTION_COMPACT_MODEL,
     )
     _save_config(config)
 
@@ -543,6 +644,12 @@ def update_config():
         ).strip()
         or config.agent_summary_model
     )
+    new_compaction_compact_model = (
+        get_user_input(
+            f"Compaction compact model (Current: {config.compaction_compact_model or 'Current model'}): "
+        ).strip()
+        or config.compaction_compact_model
+    )
 
     new_config = AppConfig(
         api_type=new_api_type,
@@ -559,6 +666,10 @@ def update_config():
         agent_approval_mode=new_agent_approval_mode,
         agent_show_thinking=config.agent_show_thinking,
         agent_summary_model=new_agent_summary_model,
+        compaction_enable=config.compaction_enable,
+        compaction_max_chars=config.compaction_max_chars,
+        compaction_keep_recent_messages=config.compaction_keep_recent_messages,
+        compaction_compact_model=new_compaction_compact_model,
     )
     _save_config(new_config)
     return new_config

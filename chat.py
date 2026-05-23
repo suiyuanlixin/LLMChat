@@ -10,6 +10,7 @@ from ui import (
     clean_display_text,
     console,
     print_error,
+    print_info,
     print_stream_thinking,
     print_stream_thinking_continue,
     print_stream_response_continue,
@@ -43,6 +44,8 @@ AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS = 0.006
 AGENT_RESPONSE_CHAR_DELAY_SECONDS = 0.003
 AGENT_SUMMARY_MAX_TOKENS = 96
 AGENT_SUMMARY_PREFIX_CHARS = len("[*] Thinking: ")
+COMPACTION_MAX_TOKENS = 2048
+COMPACTION_SUMMARY_PREFIX = "[Compressed conversation summary for continuity]"
 AGENT_SUMMARY_SYSTEM_PROMPT = (
     "Summarize hidden local-agent thinking for a terminal status line. "
     "Return one very short sentence, ideally 4-8 words or 8-16 Chinese characters. "
@@ -68,6 +71,18 @@ Rules:
 - Stop when the task is complete and summarize what changed."""
 
 
+COMPACTION_SYSTEM_PROMPT = """You compact chat context for a terminal LLM client.
+
+Return an updated continuity summary for the next model request. Preserve:
+- user goals, preferences, constraints, and decisions
+- important project facts, filenames, commands, errors, and verification results
+- unresolved questions, pending tasks, and promised next steps
+- any existing compressed summary that is still relevant
+
+Do not invent facts. Remove low-value chatter and duplicate wording. Keep the
+summary concise but complete enough for future turns."""
+
+
 class LLMChat:
     def __init__(
         self,
@@ -86,10 +101,20 @@ class LLMChat:
         agent_approval_mode="confirm",
         agent_show_thinking=True,
         agent_summary_model="",
+        compaction_enable=True,
+        compaction_max_chars=60000,
+        compaction_keep_recent_messages=12,
+        compaction_compact_model="",
     ):
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
+        self.set_compaction_config(
+            compaction_enable,
+            compaction_max_chars,
+            compaction_keep_recent_messages,
+            compaction_compact_model,
+        )
         self.agent_tools = AgentTools(
             workspace_dir,
             approval_mode=agent_approval_mode,
@@ -216,6 +241,22 @@ class LLMChat:
     def set_agent_summary_model(self, model):
         self.agent_summary_model = str(model or "").strip()
 
+    def set_compaction_config(
+        self,
+        enabled=None,
+        max_chars=None,
+        keep_recent_messages=None,
+        compact_model=None,
+    ):
+        if enabled is not None:
+            self.compaction_enable = bool(enabled)
+        if max_chars is not None:
+            self.compaction_max_chars = max(1, int(max_chars))
+        if keep_recent_messages is not None:
+            self.compaction_keep_recent_messages = max(1, int(keep_recent_messages))
+        if compact_model is not None:
+            self.compaction_compact_model = str(compact_model or "").strip()
+
     def set_workspace_dir(self, workspace_dir):
         self.agent_tools.set_workspace_dir(workspace_dir)
         if not self.agent_tools.enabled:
@@ -245,10 +286,14 @@ class LLMChat:
         }
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
-        original_history_length = len(self.conversation_history)
+        original_history = self._history_snapshot()
         self.conversation_history.append({"role": "user", "content": user_message})
 
         try:
+            self._auto_compact_context()
+            self._sanitize_orphan_tool_results_in_history()
+            user_message_index = len(self.conversation_history) - 1
+
             if self.agent_mode and not self.agent_tools.enabled:
                 self.agent_mode = False
 
@@ -276,23 +321,23 @@ class LLMChat:
                 response = self._parse_response(response)
 
             if response is None:
-                self._rollback_history(original_history_length)
+                self._restore_history(original_history)
             elif response.get("agent_stopped"):
-                self._rollback_history(original_history_length)
+                self._restore_history(original_history)
             elif self.agent_mode:
-                self._compact_agent_history(original_history_length, response)
+                self._compact_agent_history(user_message_index, response)
             return response
 
         except KeyboardInterrupt:
             if self.agent_running:
                 self.request_agent_stop()
-                self._rollback_history(original_history_length)
+                self._restore_history(original_history)
                 self._separate_after_agent_thinking()
                 print_warn("Agent stopped by user.")
                 return {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
             raise
         except Exception as error:
-            self._rollback_history(original_history_length)
+            self._restore_history(original_history)
             if self.agent_running:
                 self._separate_after_agent_thinking()
             print_error(f"Request error: {error}")
@@ -897,6 +942,309 @@ class LLMChat:
         self.agent_output_needs_separator = True
         self.conversation_history.append({"role": "user", "content": warning})
 
+    def _auto_compact_context(self):
+        if not self.compaction_enable:
+            return {"compacted": False, "reason": "Context compaction is disabled."}
+
+        estimated_chars = _estimate_history_chars(self.conversation_history)
+        if estimated_chars < self.compaction_max_chars:
+            return {
+                "compacted": False,
+                "reason": "Context is below the compaction threshold.",
+                "before_chars": estimated_chars,
+            }
+
+        result = self.compact_context(manual=False)
+        if result.get("compacted"):
+            print_info(
+                "Context compacted automatically: "
+                f"{result.get('before_messages')} -> {result.get('after_messages')} messages."
+            )
+        elif result.get("error"):
+            print_warn(result.get("reason", "Automatic context compaction failed."))
+        return result
+
+    def compact_context(self, manual=False):
+        before_messages = len(self.conversation_history)
+        before_chars = _estimate_history_chars(self.conversation_history)
+        keep_recent = max(1, int(self.compaction_keep_recent_messages))
+        compact_model = self.compaction_compact_model or self.model
+
+        if before_messages <= keep_recent:
+            return {
+                "compacted": False,
+                "reason": (
+                    "Context compaction cancelled: "
+                    f"{before_messages} messages is not more than keep_recent_messages={keep_recent}."
+                ),
+                "before_messages": before_messages,
+                "before_chars": before_chars,
+                "model": compact_model,
+            }
+
+        recent_messages = self.conversation_history[-keep_recent:]
+        source_messages = self.conversation_history[:-keep_recent]
+        existing_summary, source_messages = self._split_existing_compaction_summary(source_messages)
+        source_messages, recent_messages = self._fold_leading_tool_results_into_source(
+            source_messages,
+            recent_messages,
+        )
+        if not source_messages and not existing_summary:
+            return {
+                "compacted": False,
+                "reason": "Context compaction cancelled: no messages older than the recent window.",
+                "before_messages": before_messages,
+                "before_chars": before_chars,
+                "model": compact_model,
+            }
+
+        try:
+            summary = self._create_compaction_summary(
+                existing_summary,
+                source_messages,
+                compact_model,
+            )
+        except Exception as error:
+            return {
+                "compacted": False,
+                "error": True,
+                "reason": f"Context compaction failed: {error}",
+                "before_messages": before_messages,
+                "before_chars": before_chars,
+                "model": compact_model,
+            }
+
+        summary = summary.strip()
+        if not summary:
+            return {
+                "compacted": False,
+                "error": True,
+                "reason": "Context compaction failed: compact model returned an empty summary.",
+                "before_messages": before_messages,
+                "before_chars": before_chars,
+                "model": compact_model,
+            }
+
+        self.conversation_history = [
+            {"role": "user", "content": self._compaction_summary_message(summary)},
+            *recent_messages,
+        ]
+        removed_tool_results = self._sanitize_orphan_tool_results_in_history()
+        after_chars = _estimate_history_chars(self.conversation_history)
+        return {
+            "compacted": True,
+            "manual": manual,
+            "before_messages": before_messages,
+            "after_messages": len(self.conversation_history),
+            "before_chars": before_chars,
+            "after_chars": after_chars,
+            "model": compact_model,
+            "removed_orphan_tool_results": removed_tool_results,
+        }
+
+    def _create_compaction_summary(self, existing_summary, source_messages, compact_model):
+        prompt = self._compaction_prompt(existing_summary, source_messages)
+        messages = [
+            {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        temperature = min(float(self.temperature), 0.2)
+
+        if self.api_type == API_TYPE_ANTHROPIC:
+            response = self.client.messages.create(
+                model=compact_model,
+                max_tokens=COMPACTION_MAX_TOKENS,
+                temperature=temperature,
+                system=COMPACTION_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return self._anthropic_response_text(response)
+
+        if self.api_type == API_TYPE_OLLAMA:
+            response = self.client.chat(
+                **self._ollama_chat_kwargs(
+                    model=compact_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=COMPACTION_MAX_TOKENS,
+                    include_reasoning=False,
+                )
+            )
+            message = self._get_field(response, "message", {})
+            return str(self._get_field(message, "content", "") or "")
+
+        response = self.client.chat.completions.create(
+            **self._chat_completion_kwargs(
+                model=compact_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=COMPACTION_MAX_TOKENS,
+                include_reasoning=False,
+            )
+        )
+        message = response.choices[0].message
+        return _clean_content_text(self._get_field(message, "content", "") or "")
+
+    def _compaction_prompt(self, existing_summary, source_messages):
+        existing_summary = str(existing_summary or "").strip()
+        compacted_messages = self._format_messages_for_compaction(source_messages)
+        if not compacted_messages:
+            compacted_messages = "(No additional messages.)"
+        if not existing_summary:
+            existing_summary = "(No existing summary.)"
+
+        return (
+            "Update the compressed conversation summary for future turns.\n\n"
+            "Existing compressed summary:\n"
+            f"{existing_summary}\n\n"
+            "Messages to fold into the summary:\n"
+            f"{compacted_messages}\n\n"
+            "Return only the updated compressed summary."
+        )
+
+    def _format_messages_for_compaction(self, messages):
+        formatted = []
+        for index, message in enumerate(messages, start=1):
+            role = message.get("role", "unknown")
+            content = self._message_content_for_compaction(message)
+            formatted.append(f"[{index}] {role}:\n{content}")
+        return "\n\n".join(formatted)
+
+    def _message_content_for_compaction(self, message):
+        parts = []
+        content = message.get("content", "")
+        if content:
+            parts.append(self._plain_text_for_compaction(content))
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            parts.append(
+                "tool_calls: "
+                + json.dumps(self._plain_data(tool_calls), ensure_ascii=False)
+            )
+        tool_name = message.get("tool_name") or message.get("name")
+        if tool_name:
+            parts.append(f"tool_name: {tool_name}")
+        return "\n".join(parts).strip() or "(empty)"
+
+    def _plain_text_for_compaction(self, content):
+        if isinstance(content, str):
+            return content
+        if isinstance(content, (list, dict)):
+            try:
+                return json.dumps(content, ensure_ascii=False, default=str)
+            except TypeError:
+                return clean_display_text(content)
+        return str(content or "")
+
+    def _split_existing_compaction_summary(self, messages):
+        if not messages:
+            return "", []
+        first_message = messages[0]
+        content = str(first_message.get("content", "") or "")
+        if (
+            first_message.get("role") == "user"
+            and content.startswith(COMPACTION_SUMMARY_PREFIX)
+        ):
+            summary = content[len(COMPACTION_SUMMARY_PREFIX) :].strip()
+            return summary, messages[1:]
+        return "", messages
+
+    def _fold_leading_tool_results_into_source(self, source_messages, recent_messages):
+        source_messages = list(source_messages)
+        recent_messages = list(recent_messages)
+        while recent_messages and self._message_has_tool_result(recent_messages[0]):
+            source_messages.append(recent_messages.pop(0))
+        return source_messages, recent_messages
+
+    def _message_has_tool_result(self, message):
+        if message.get("role") == "tool":
+            return True
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(self._get_field(block, "type") == "tool_result" for block in content)
+
+    @staticmethod
+    def _compaction_summary_message(summary):
+        return f"{COMPACTION_SUMMARY_PREFIX}\n{summary.strip()}"
+
+    def _sanitize_orphan_tool_results_in_history(self):
+        available_tool_ids = set()
+        cleaned = []
+        removed_count = 0
+
+        for message in self.conversation_history:
+            filtered_message, removed, consumed_tool_ids = self._filter_orphan_tool_results(
+                message,
+                available_tool_ids,
+            )
+            removed_count += removed
+            if filtered_message is None:
+                continue
+
+            cleaned.append(filtered_message)
+            available_tool_ids.update(self._message_tool_use_ids(filtered_message))
+            for tool_id in consumed_tool_ids:
+                available_tool_ids.discard(tool_id)
+
+        if removed_count:
+            self.conversation_history = cleaned
+        return removed_count
+
+    def _filter_orphan_tool_results(self, message, available_tool_ids):
+        role = message.get("role")
+        if role == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "")
+            if tool_call_id and tool_call_id not in available_tool_ids:
+                return None, 1, set()
+            return message, 0, {tool_call_id} if tool_call_id else set()
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            return message, 0, set()
+
+        filtered_content = []
+        removed_count = 0
+        consumed_tool_ids = set()
+        for block in content:
+            if self._get_field(block, "type") != "tool_result":
+                filtered_content.append(block)
+                continue
+
+            tool_use_id = str(self._get_field(block, "tool_use_id", "") or "")
+            if tool_use_id and tool_use_id not in available_tool_ids:
+                removed_count += 1
+                continue
+
+            filtered_content.append(block)
+            if tool_use_id:
+                consumed_tool_ids.add(tool_use_id)
+
+        if not removed_count:
+            return message, 0, consumed_tool_ids
+        if not filtered_content:
+            return None, removed_count, consumed_tool_ids
+
+        filtered_message = dict(message)
+        filtered_message["content"] = filtered_content
+        return filtered_message, removed_count, consumed_tool_ids
+
+    def _message_tool_use_ids(self, message):
+        tool_ids = []
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if self._get_field(block, "type") == "tool_use":
+                    tool_id = str(self._get_field(block, "id", "") or "")
+                    if tool_id:
+                        tool_ids.append(tool_id)
+
+        for tool_call in message.get("tool_calls") or []:
+            tool_id = str(self._get_field(tool_call, "id", "") or "")
+            if tool_id:
+                tool_ids.append(tool_id)
+        return tool_ids
+
     def _compact_agent_history(self, history_start, response):
         if history_start >= len(self.conversation_history):
             return
@@ -951,8 +1299,11 @@ class LLMChat:
         context_result = _compact_tool_result_for_context(tool_result)
         return context_result
 
-    def _rollback_history(self, history_length):
-        self.conversation_history = self.conversation_history[:history_length]
+    def _history_snapshot(self):
+        return [dict(message) for message in self.conversation_history]
+
+    def _restore_history(self, history):
+        self.conversation_history = [dict(message) for message in history]
 
     def _stream_response(self, callback_thinking, callback_response, model_name):
         if self.api_type == API_TYPE_ANTHROPIC:
@@ -1139,25 +1490,33 @@ class LLMChat:
 
     def _parse_anthropic_response(self, response):
         try:
-            content = self._get_field(response, "content", [])
-            full_thinking = ""
-            full_response = ""
-
-            if isinstance(content, str):
-                full_response = content
-            else:
-                for block in content or []:
-                    block_type = self._get_field(block, "type", "")
-                    if block_type == "thinking":
-                        full_thinking += self._get_field(block, "thinking", "") or ""
-                    elif block_type == "text":
-                        full_response += self._get_field(block, "text", "") or ""
+            full_thinking, full_response = self._anthropic_response_parts(response)
 
             self.conversation_history.append({"role": "assistant", "content": full_response})
             return {"thinking": full_thinking, "response": full_response}
         except (AttributeError, TypeError) as error:
             print_error(f"Failed to parse response: {error}")
             return None
+
+    def _anthropic_response_text(self, response):
+        _, text = self._anthropic_response_parts(response)
+        return text
+
+    def _anthropic_response_parts(self, response):
+        content = self._get_field(response, "content", [])
+        full_thinking = ""
+        full_response = ""
+
+        if isinstance(content, str):
+            full_response = content
+        else:
+            for block in content or []:
+                block_type = self._get_field(block, "type", "")
+                if block_type == "thinking":
+                    full_thinking += self._get_field(block, "thinking", "") or ""
+                elif block_type == "text":
+                    full_response += self._get_field(block, "text", "") or ""
+        return full_thinking, full_response
 
     def _anthropic_content_blocks(self, content):
         if isinstance(content, str):
