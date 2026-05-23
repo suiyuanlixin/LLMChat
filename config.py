@@ -100,7 +100,7 @@ class AppConfig:
                 "show_thinking": self.agent_show_thinking,
                 "summary_model": self.agent_summary_model,
             },
-            "compaction": {
+            "auto_compact": {
                 "enable": self.compaction_enable,
                 "max_chars": self.compaction_max_chars,
                 "keep_recent_messages": self.compaction_keep_recent_messages,
@@ -139,7 +139,7 @@ def _default_config():
         "agent_approval_mode": DEFAULT_AGENT_APPROVAL_MODE,
         "agent_show_thinking": DEFAULT_AGENT_SHOW_THINKING,
         "agent_summary_model": DEFAULT_AGENT_SUMMARY_MODEL,
-        "compaction": {
+        "auto_compact": {
             "enable": DEFAULT_COMPACTION_ENABLE,
             "max_chars": DEFAULT_COMPACTION_MAX_CHARS,
             "keep_recent_messages": DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
@@ -172,11 +172,11 @@ def parse_agent_tool_calls(value):
 
 
 def parse_compaction_max_chars(value):
-    return _parse_positive_integer(value, "Compaction max chars")
+    return _parse_positive_integer(value, "Auto compact max chars")
 
 
 def parse_compaction_keep_recent_messages(value):
-    return _parse_positive_integer(value, "Compaction keep recent messages")
+    return _parse_positive_integer(value, "Auto compact keep recent messages")
 
 
 def parse_agent_approval_mode(value):
@@ -275,7 +275,7 @@ def _extract_agent_config(config):
 
 
 def _extract_compaction_config(config):
-    raw_compaction_config = config.get("compaction", {})
+    raw_compaction_config = config.get("auto_compact", {})
     if isinstance(raw_compaction_config, dict):
         compaction_config = dict(raw_compaction_config)
     else:
@@ -287,18 +287,17 @@ def _extract_compaction_config(config):
         "context_max_chars": "max_chars",
         "keep_recent": "keep_recent_messages",
         "recent_messages": "keep_recent_messages",
-        "summary_model": "compact_model",
-        "compaction_model": "compact_model",
+        "auto_compact_model": "compact_model",
     }
     for source, target in aliases.items():
         if target not in compaction_config and source in compaction_config:
             compaction_config[target] = compaction_config[source]
 
     flat_aliases = {
-        "compaction_enable": "enable",
-        "compaction_max_chars": "max_chars",
-        "compaction_keep_recent_messages": "keep_recent_messages",
-        "compaction_compact_model": "compact_model",
+        "auto_compact_enable": "enable",
+        "auto_compact_max_chars": "max_chars",
+        "auto_compact_keep_recent_messages": "keep_recent_messages",
+        "auto_compact_compact_model": "compact_model",
     }
     for source, target in flat_aliases.items():
         if target not in compaction_config and source in config:
@@ -391,7 +390,7 @@ def _sanitize_config(config):
         )
     except ValueError as error:
         print_warn(
-            f"Invalid compaction.max_chars in {CONFIG_FILE}: {error} "
+            f"Invalid auto_compact.max_chars in {CONFIG_FILE}: {error} "
             f"Fallback to {DEFAULT_COMPACTION_MAX_CHARS}."
         )
         config["compaction_max_chars"] = DEFAULT_COMPACTION_MAX_CHARS
@@ -404,7 +403,7 @@ def _sanitize_config(config):
         )
     except ValueError as error:
         print_warn(
-            f"Invalid compaction.keep_recent_messages in {CONFIG_FILE}: {error} "
+            f"Invalid auto_compact.keep_recent_messages in {CONFIG_FILE}: {error} "
             f"Fallback to {DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES}."
         )
         config["compaction_keep_recent_messages"] = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
@@ -646,7 +645,7 @@ def update_config():
     )
     new_compaction_compact_model = (
         get_user_input(
-            f"Compaction compact model (Current: {config.compaction_compact_model or 'Current model'}): "
+            f"Auto compact model (Current: {config.compaction_compact_model or 'Current model'}): "
         ).strip()
         or config.compaction_compact_model
     )
