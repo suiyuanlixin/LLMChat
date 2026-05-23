@@ -1,6 +1,7 @@
 import json
 import re
 import time
+from pathlib import Path
 
 from rich.cells import cell_len
 
@@ -46,6 +47,19 @@ AGENT_SUMMARY_MAX_TOKENS = 96
 AGENT_SUMMARY_PREFIX_CHARS = len("[*] Thinking: ")
 COMPACTION_MAX_TOKENS = 2048
 COMPACTION_SUMMARY_PREFIX = "[Compressed conversation summary for continuity]"
+USER_PROMPT_FILE = "prompt.md"
+USER_PROMPT_MAX_CHARS = 20000
+USER_PROMPT_TEMPLATE = """<!--
+在这里写你的自定义提示词、人格、回复风格和偏好。
+默认模板内容不会发送给模型；请把真实提示词写在注释外。
+
+示例：
+- 默认使用中文回答。
+- 回答尽量简洁，优先给出可执行结论。
+- 修改代码时保持项目现有风格，避免无关重构。
+-->
+"""
+USER_PROMPT_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 AGENT_SUMMARY_SYSTEM_PROMPT = (
     "Summarize hidden local-agent thinking for a terminal status line. "
     "Return one very short sentence, ideally 4-8 words or 8-16 Chinese characters. "
@@ -55,7 +69,17 @@ AGENT_SUMMARY_SYSTEM_PROMPT = (
 )
 
 
-AGENT_SYSTEM_PROMPT = """You are in local workspace agent mode.
+NORMAL_SYSTEM_PROMPT = (
+    "You are the built-in assistant for the LLMChat project, a terminal LLM "
+    "chat client. Help the user discuss, understand, configure, and improve "
+    "this project."
+)
+
+
+AGENT_PROJECT_PROMPT = """You are the built-in local file-editing agent for the LLMChat project, a terminal LLM chat client. Help the user inspect and modify this project safely."""
+
+
+AGENT_SYSTEM_PROMPT = f"""{AGENT_PROJECT_PROMPT}
 
 Rules:
 - Work only inside the configured workspace and use tools for local file facts.
@@ -83,6 +107,50 @@ Do not invent facts. Remove low-value chatter and duplicate wording. Keep the
 summary concise but complete enough for future turns."""
 
 
+def _ensure_user_prompt_file():
+    prompt_path = Path(USER_PROMPT_FILE)
+    if prompt_path.exists():
+        return
+
+    try:
+        prompt_path.write_text(USER_PROMPT_TEMPLATE, encoding="utf-8")
+    except OSError as error:
+        print_warn(f"Failed to create {USER_PROMPT_FILE}: {error}")
+
+
+def _read_user_custom_prompt():
+    prompt_path = Path(USER_PROMPT_FILE)
+    if not prompt_path.is_file():
+        return ""
+
+    try:
+        content = prompt_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        print_warn(f"Failed to read {USER_PROMPT_FILE}: {error}")
+        return ""
+
+    content = USER_PROMPT_COMMENT_PATTERN.sub("", content).strip()
+    if not content:
+        return ""
+    if len(content) <= USER_PROMPT_MAX_CHARS:
+        return content
+    return (
+        content[:USER_PROMPT_MAX_CHARS]
+        + f"\n\n[{USER_PROMPT_FILE} truncated after {USER_PROMPT_MAX_CHARS} characters]"
+    )
+
+
+def _with_user_custom_prompt(base_prompt):
+    custom_prompt = _read_user_custom_prompt()
+    if not custom_prompt:
+        return base_prompt
+    return (
+        f"{base_prompt}\n\n"
+        f"User custom instructions from {USER_PROMPT_FILE}:\n"
+        f"{custom_prompt}"
+    )
+
+
 class LLMChat:
     def __init__(
         self,
@@ -106,6 +174,7 @@ class LLMChat:
         compaction_keep_recent_messages=12,
         compaction_compact_model="",
     ):
+        _ensure_user_prompt_file()
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
@@ -306,6 +375,7 @@ class LLMChat:
                     model=self.model,
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
+                    system=self._normal_system_prompt(),
                     messages=self._anthropic_messages(),
                 )
                 response = self._parse_anthropic_response(response)
@@ -587,7 +657,7 @@ class LLMChat:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             messages=self._anthropic_messages(),
-            system=AGENT_SYSTEM_PROMPT,
+            system=self._agent_system_prompt(),
             tools=anthropic_tool_schemas(),
             stream=True,
         )
@@ -1413,6 +1483,7 @@ class LLMChat:
                 model=self.model,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
+                system=self._normal_system_prompt(),
                 messages=self._anthropic_messages(),
                 stream=True,
             )
@@ -1696,13 +1767,33 @@ class LLMChat:
         return converted
 
     def _chat_agent_messages(self):
-        return [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + self.conversation_history
+        return [{"role": "system", "content": self._agent_system_prompt()}] + self.conversation_history
+
+    def _chat_messages(self, messages=None):
+        source_messages = messages if messages is not None else self.conversation_history
+        if source_messages and source_messages[0].get("role") == "system":
+            return source_messages
+        return [{"role": "system", "content": self._normal_system_prompt()}] + source_messages
 
     def _ollama_agent_messages(self):
         return self._ollama_messages(
-            [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+            [{"role": "system", "content": self._agent_system_prompt()}]
             + self.conversation_history
         )
+
+    def _ollama_normal_messages(self, messages=None):
+        source_messages = messages if messages is not None else self.conversation_history
+        if source_messages and source_messages[0].get("role") == "system":
+            return self._ollama_messages(source_messages)
+        return self._ollama_messages(
+            [{"role": "system", "content": self._normal_system_prompt()}] + source_messages
+        )
+
+    def _normal_system_prompt(self):
+        return _with_user_custom_prompt(NORMAL_SYSTEM_PROMPT)
+
+    def _agent_system_prompt(self):
+        return _with_user_custom_prompt(AGENT_SYSTEM_PROMPT)
 
     def _chat_completion_kwargs(
         self,
@@ -1716,7 +1807,7 @@ class LLMChat:
     ):
         kwargs = {
             "model": model or self.model,
-            "messages": messages if messages is not None else self.conversation_history,
+            "messages": self._chat_messages(messages),
             "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
@@ -1746,7 +1837,7 @@ class LLMChat:
         }
         kwargs = {
             "model": model or self.model,
-            "messages": self._ollama_messages(messages),
+            "messages": self._ollama_normal_messages(messages),
             "options": options,
             "think": self._ollama_think_value(model, include_reasoning),
         }
