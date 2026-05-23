@@ -8,6 +8,7 @@ CONFIG_FILE = "config.json"
 API_TYPE_GLM = "glm"
 API_TYPE_ANTHROPIC = "anthropic"
 API_TYPE_OPENAI = "openai"
+API_TYPE_OLLAMA = "ollama"
 DEFAULT_API_TYPE = API_TYPE_GLM
 DEFAULT_BASE_URL = ""
 DEFAULT_MODEL = "glm-4.7"
@@ -26,7 +27,12 @@ AGENT_THINKING_FULL = "full"
 DEFAULT_AGENT_SHOW_THINKING = AGENT_THINKING_SUMMARY
 AGENT_APPROVAL_MODES = {"confirm", "auto"}
 AGENT_THINKING_MODES = {AGENT_THINKING_OFF, AGENT_THINKING_SUMMARY, AGENT_THINKING_FULL}
-SUPPORTED_API_TYPES = {API_TYPE_GLM, API_TYPE_ANTHROPIC, API_TYPE_OPENAI}
+SUPPORTED_API_TYPES = {
+    API_TYPE_GLM,
+    API_TYPE_ANTHROPIC,
+    API_TYPE_OPENAI,
+    API_TYPE_OLLAMA,
+}
 
 
 @dataclass
@@ -87,6 +93,10 @@ class AppConfig:
 
 def normalize_api_type(api_type):
     return str(api_type or DEFAULT_API_TYPE).strip().lower()
+
+
+def requires_api_key(api_type):
+    return normalize_api_type(api_type) != API_TYPE_OLLAMA
 
 
 def _normalize_base_url(api_type, base_url):
@@ -309,7 +319,7 @@ def _sanitize_config(config):
 
 
 def _prompt_api_type(current_api_type):
-    prompt = f"API type (glm/anthropic/openai, Current: {current_api_type}): "
+    prompt = f"API type (glm/anthropic/openai/ollama, Current: {current_api_type}): "
     value = get_user_input(prompt).strip()
     if not value:
         return current_api_type
@@ -326,6 +336,13 @@ def _prompt_base_url(api_type, current_base_url):
         return ""
 
     current = current_base_url or "None"
+    if api_type == API_TYPE_OLLAMA:
+        return (
+            get_user_input(
+                f"Base URL (Current: {current}, empty uses local Ollama): "
+            ).strip()
+            or current_base_url
+        )
     return get_user_input(f"Base URL (Current: {current}): ").strip() or current_base_url
 
 
@@ -391,7 +408,7 @@ def _prompt_temperature(prompt, default_value):
 
 def load_config():
     config = _load_existing_config()
-    if config.api_key:
+    if config.api_key or not requires_api_key(config.api_type):
         return config
 
     print_warn("Configuration file does not exist or API Key is empty!")
@@ -404,7 +421,10 @@ def load_config():
         ).strip()
         or config.model
     )
-    api_key = get_user_input("Please enter your API Key: ").strip()
+    api_key_prompt = "Please enter your API Key: "
+    if not requires_api_key(api_type):
+        api_key_prompt = "Please enter your API Key (optional for Ollama local): "
+    api_key = get_user_input(api_key_prompt).strip()
     max_tokens = _prompt_max_tokens(
         f"Please enter the maximum tokens (Default: {DEFAULT_MAX_TOKENS}): ",
         DEFAULT_MAX_TOKENS,
@@ -491,8 +511,11 @@ def update_config():
         or config.model
     )
     masked_key = config.api_key[:10] + "..." if config.api_key else "None"
+    api_key_label = "API Key"
+    if not requires_api_key(new_api_type):
+        api_key_label = "API Key (optional for Ollama local)"
     new_api_key = (
-        get_user_input(f"API Key (Current: {masked_key}): ").strip() or config.api_key
+        get_user_input(f"{api_key_label} (Current: {masked_key}): ").strip() or config.api_key
     )
     new_max_tokens = _prompt_max_tokens(
         f"Max tokens (Current: {config.max_tokens}): ",

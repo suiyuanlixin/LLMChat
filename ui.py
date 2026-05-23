@@ -8,6 +8,7 @@ if os.name == "nt":
 
 from rich.text import Text
 from rich.color import Color
+from rich.cells import cell_len
 from rich.panel import Panel
 from rich.console import Console
 from rich.table import Table
@@ -410,6 +411,14 @@ def _key_down(key):
     return bool(ctypes.windll.user32.GetAsyncKeyState(key) & 0x8000)
 
 
+def _erase_input_character(character):
+    width = max(1, cell_len(str(character or "")))
+    console.file.write("\b" * width)
+    console.file.write(" " * width)
+    console.file.write("\b" * width)
+    console.file.flush()
+
+
 def _read_windows_multiline_input(prompt):
     chars = []
     console.print(prompt, end="")
@@ -439,9 +448,7 @@ def _read_windows_multiline_input(prompt):
 
         if ch == "\b":
             if chars and chars[-1] != "\n":
-                chars.pop()
-                console.file.write("\b \b")
-                console.file.flush()
+                _erase_input_character(chars.pop())
             continue
 
         chars.append(ch)

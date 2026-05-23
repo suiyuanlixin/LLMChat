@@ -6,6 +6,7 @@ from config import (
     parse_agent_tool_calls,
     parse_max_tokens,
     parse_temperature,
+    requires_api_key,
     reload_config,
     save_config_field,
     save_config_fields,
@@ -83,7 +84,7 @@ def handle_conf(chat, args):
 
 
 def _apply_config(chat, config):
-    if not config.api_key:
+    if not config.api_key and requires_api_key(config.api_type):
         print_error("Configuration API Key is empty. Reload aborted.")
         return False
 
@@ -197,7 +198,6 @@ def handle_think(chat, args):
 
 def handle_agent(chat, args):
     status = chat.get_agent_status()
-    workspace = status["workspace_dir"] or "No workspace directory"
 
     if args is None:
         current = "on" if status["enabled"] else "off"
@@ -227,7 +227,7 @@ def handle_agent(chat, args):
             return True
         chat.set_agent_mode(True)
         save_config_field("agent_mode", True)
-        print_success(f"Agent mode turned on.")
+        print_success("Agent mode turned on.")
     elif mode == "off" and len(parts) == 1:
         chat.set_agent_mode(False)
         save_config_field("agent_mode", False)

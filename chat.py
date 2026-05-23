@@ -19,6 +19,7 @@ from ui import (
 from config import (
     API_TYPE_ANTHROPIC,
     API_TYPE_GLM,
+    API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
     AGENT_THINKING_FULL,
     AGENT_THINKING_SUMMARY,
@@ -27,7 +28,13 @@ from config import (
     normalize_api_type,
     parse_agent_show_thinking,
 )
-from tools import AgentTools, anthropic_tool_schemas, glm_tool_schemas, openai_tool_schemas
+from tools import (
+    AgentTools,
+    anthropic_tool_schemas,
+    glm_tool_schemas,
+    ollama_tool_schemas,
+    openai_tool_schemas,
+)
 
 
 AGENT_CONTEXT_WARN_CHARS = 180000
@@ -119,7 +126,7 @@ class LLMChat:
         thinking_mode=None,
     ):
         api_type = normalize_api_type(api_type)
-        if api_type not in {API_TYPE_GLM, API_TYPE_ANTHROPIC, API_TYPE_OPENAI}:
+        if api_type not in {API_TYPE_GLM, API_TYPE_ANTHROPIC, API_TYPE_OPENAI, API_TYPE_OLLAMA}:
             raise ValueError(f"Unsupported API type: {api_type}")
 
         base_url = "" if api_type == API_TYPE_GLM else (base_url or "").strip()
@@ -161,6 +168,19 @@ class LLMChat:
             if base_url:
                 kwargs["base_url"] = base_url
             return OpenAI(**kwargs)
+
+        if api_type == API_TYPE_OLLAMA:
+            try:
+                from ollama import Client
+            except ImportError as error:
+                raise RuntimeError("Ollama SDK is not installed. Run: pip install ollama") from error
+
+            kwargs = {}
+            if base_url:
+                kwargs["host"] = base_url
+            if api_key:
+                kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
+            return Client(**kwargs)
 
         try:
             from zai import ZhipuAiClient
@@ -244,6 +264,11 @@ class LLMChat:
                     messages=self._anthropic_messages(),
                 )
                 response = self._parse_anthropic_response(response)
+            elif self.api_type == API_TYPE_OLLAMA:
+                response = self.client.chat(
+                    **self._ollama_chat_kwargs(messages=self.conversation_history)
+                )
+                response = self._parse_ollama_response(response)
             else:
                 response = self.client.chat.completions.create(
                     **self._chat_completion_kwargs(messages=self.conversation_history)
@@ -290,6 +315,8 @@ class LLMChat:
         try:
             if self.api_type == API_TYPE_ANTHROPIC:
                 return self._finalize_agent_response(self._anthropic_agent_response())
+            if self.api_type == API_TYPE_OLLAMA:
+                return self._finalize_agent_response(self._ollama_agent_response())
             return self._finalize_agent_response(self._chat_completion_agent_response())
         except KeyboardInterrupt:
             self.agent_stop_requested = True
@@ -443,6 +470,62 @@ class LLMChat:
                         tool_call["name"],
                         tool_result,
                     )
+                )
+
+        message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        self._separate_after_agent_thinking()
+        print_error(message)
+        return {"thinking": full_thinking, "response": final_response or message}
+
+    def _ollama_agent_response(self):
+        full_thinking = ""
+        final_response = ""
+
+        for round_index in range(1, self.max_agent_rounds + 1):
+            if self._agent_should_stop():
+                return self._agent_stopped_response(full_thinking, final_response)
+            self._print_agent_round(round_index)
+            self._warn_agent_context_if_needed()
+            response = self.client.chat(
+                **self._ollama_chat_kwargs(
+                    messages=self._ollama_agent_messages(),
+                    tools=ollama_tool_schemas(),
+                )
+            )
+
+            message = self._get_field(response, "message", {})
+            assistant_message, thinking_content, text, tool_calls = self._ollama_message_parts(message)
+            self.conversation_history.append(assistant_message)
+            full_thinking += thinking_content
+            self._show_agent_thinking(thinking_content)
+            final_response += text
+
+            if not tool_calls:
+                if self._append_agent_final_check_if_needed():
+                    final_response = ""
+                    continue
+                self._stream_agent_response_text(final_response, pseudo=True)
+                return {"thinking": full_thinking, "response": final_response}
+
+            if self._agent_tool_budget_exceeded(len(tool_calls)):
+                message = self._agent_tool_budget_message()
+                for tool_call in tool_calls:
+                    self.conversation_history.append(
+                        self._ollama_tool_result_message(
+                            tool_call["name"],
+                            _error_text(message),
+                        )
+                    )
+                self._separate_after_agent_thinking()
+                print_error(message)
+                return {"thinking": full_thinking, "response": final_response or message}
+
+            for tool_call in tool_calls:
+                if self._agent_should_stop():
+                    return self._agent_stopped_response(full_thinking, final_response)
+                tool_result = self._execute_agent_tool(tool_call["name"], tool_call["arguments"])
+                self.conversation_history.append(
+                    self._ollama_tool_result_message(tool_call["name"], tool_result)
                 )
 
         message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
@@ -697,6 +780,36 @@ class LLMChat:
                     delta = self._get_field(chunk, "delta")
                     if self._get_field(delta, "type", "") == "text_delta":
                         emit(self._get_field(delta, "text", "") or "")
+            elif self.api_type == API_TYPE_OLLAMA:
+                response = self.client.chat(
+                    **self._ollama_chat_kwargs(
+                        model=self.agent_summary_model,
+                        messages=[
+                            {"role": "system", "content": AGENT_SUMMARY_SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=min(float(self.temperature), 0.3),
+                        max_tokens=AGENT_SUMMARY_MAX_TOKENS,
+                        stream=True,
+                        include_reasoning=False,
+                    )
+                )
+                for chunk in response:
+                    message = self._get_field(chunk, "message", {})
+                    _, raw_summary_text = self._split_stream_delta(
+                        raw_summary_text,
+                        self._get_field(message, "content", "") or "",
+                    )
+                    clean_summary = _clean_summary_stream_delta(
+                        _clean_content_text(raw_summary_text)
+                    ).strip()
+                    visible_delta, summary_text_candidate = self._split_stream_delta(
+                        summary_text,
+                        clean_summary,
+                    )
+                    if visible_delta:
+                        emit(visible_delta)
+                        summary_text = summary_text_candidate
             else:
                 kwargs = self._chat_completion_kwargs(
                     model=self.agent_summary_model,
@@ -844,6 +957,8 @@ class LLMChat:
     def _stream_response(self, callback_thinking, callback_response, model_name):
         if self.api_type == API_TYPE_ANTHROPIC:
             return self._stream_anthropic_response(callback_thinking, callback_response, model_name)
+        if self.api_type == API_TYPE_OLLAMA:
+            return self._stream_ollama_response(callback_thinking, callback_response, model_name)
 
         try:
             response = self.client.chat.completions.create(
@@ -890,6 +1005,52 @@ class LLMChat:
                 self._chat_stream_assistant_message(full_response, full_thinking)
             )
             return {"thinking": full_thinking, "response": full_response}
+
+        except Exception as error:
+            print_error(f"Stream error: {error}")
+            return None
+
+    def _stream_ollama_response(self, callback_thinking, callback_response, model_name):
+        try:
+            response = self.client.chat(
+                **self._ollama_chat_kwargs(
+                    messages=self.conversation_history,
+                    stream=True,
+                )
+            )
+
+            if self.thinking_mode:
+                print_stream_thinking("")
+            full_thinking = ""
+            full_response = ""
+            response_started = False
+
+            for chunk in response:
+                message = self._get_field(chunk, "message", {})
+                thinking = self._get_field(message, "thinking", "") or ""
+                if thinking:
+                    full_thinking += thinking
+                    if callback_thinking and self.thinking_mode:
+                        callback_thinking(thinking)
+
+                content = self._get_field(message, "content", "") or ""
+                if content:
+                    if not response_started:
+                        if full_thinking and not full_thinking.endswith("\n"):
+                            console.print()
+                        print_stream_response_start(model_name)
+                        response_started = True
+                    full_response += content
+                    if callback_response:
+                        callback_response(content)
+
+            self.conversation_history.append(
+                self._ollama_assistant_message(full_response, full_thinking)
+            )
+            return {
+                "thinking": _clean_reasoning_text(full_thinking),
+                "response": full_response,
+            }
 
         except Exception as error:
             print_error(f"Stream error: {error}")
@@ -962,6 +1123,17 @@ class LLMChat:
             self.conversation_history.append(assistant_message)
             return {"thinking": thinking_content, "response": text}
         except (AttributeError, IndexError) as error:
+            print_error(f"Failed to parse response: {error}")
+            return None
+
+    def _parse_ollama_response(self, response):
+        try:
+            message = self._get_field(response, "message", {})
+            assistant_message, thinking_content, text, _ = self._ollama_message_parts(message)
+
+            self.conversation_history.append(assistant_message)
+            return {"thinking": thinking_content, "response": text}
+        except (AttributeError, TypeError) as error:
             print_error(f"Failed to parse response: {error}")
             return None
 
@@ -1071,6 +1243,49 @@ class LLMChat:
 
         return assistant_message, thinking_content, text, tool_calls
 
+    def _ollama_message_parts(self, message):
+        text = str(self._get_field(message, "content", "") or "")
+        thinking_content = _clean_reasoning_text(
+            self._get_field(message, "thinking", "") or ""
+        )
+        raw_tool_calls = self._get_field(message, "tool_calls", None) or []
+
+        tool_calls = []
+        assistant_tool_calls = []
+        for index, call in enumerate(raw_tool_calls):
+            function = self._get_field(call, "function", {}) or {}
+            name = self._get_field(function, "name", "") or ""
+            arguments = self._get_field(function, "arguments", {}) or {}
+            parsed_arguments = self._parse_tool_arguments(arguments)
+            function_call = {
+                "name": name,
+                "arguments": parsed_arguments,
+            }
+            raw_index = self._get_field(function, "index", None)
+            if raw_index is not None:
+                function_call["index"] = raw_index
+            elif len(raw_tool_calls) > 1:
+                function_call["index"] = index
+            assistant_tool_calls.append(
+                {
+                    "type": self._get_field(call, "type", "function") or "function",
+                    "function": function_call,
+                }
+            )
+            tool_calls.append(
+                {
+                    "name": name,
+                    "arguments": parsed_arguments,
+                }
+            )
+
+        assistant_message = self._ollama_assistant_message(
+            text,
+            thinking_content,
+            assistant_tool_calls,
+        )
+        return assistant_message, thinking_content, text, tool_calls
+
     @staticmethod
     def _parse_tool_arguments(arguments):
         if isinstance(arguments, dict):
@@ -1091,8 +1306,44 @@ class LLMChat:
             messages.append({"role": role, "content": message.get("content", "")})
         return messages
 
+    def _ollama_messages(self, messages=None):
+        converted = []
+        source_messages = messages if messages is not None else self.conversation_history
+        for message in source_messages:
+            role = message.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                continue
+
+            converted_message = {
+                "role": role,
+                "content": self._message_content_text_for_ollama(
+                    message.get("content", "")
+                ),
+            }
+            if role == "assistant":
+                thinking = message.get("thinking")
+                if thinking:
+                    converted_message["thinking"] = thinking
+                tool_calls = self._ollama_normalized_tool_calls(
+                    message.get("tool_calls") or []
+                )
+                if tool_calls:
+                    converted_message["tool_calls"] = tool_calls
+            elif role == "tool":
+                tool_name = message.get("tool_name") or message.get("name") or ""
+                if tool_name:
+                    converted_message["tool_name"] = tool_name
+            converted.append(converted_message)
+        return converted
+
     def _chat_agent_messages(self):
         return [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + self.conversation_history
+
+    def _ollama_agent_messages(self):
+        return self._ollama_messages(
+            [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+            + self.conversation_history
+        )
 
     def _chat_completion_kwargs(
         self,
@@ -1120,6 +1371,32 @@ class LLMChat:
             kwargs["tools"] = tools
         return kwargs
 
+    def _ollama_chat_kwargs(
+        self,
+        model=None,
+        messages=None,
+        temperature=None,
+        max_tokens=None,
+        stream=False,
+        tools=None,
+        include_reasoning=True,
+    ):
+        options = {
+            "temperature": self.temperature if temperature is None else temperature,
+            "num_predict": self.max_tokens if max_tokens is None else max_tokens,
+        }
+        kwargs = {
+            "model": model or self.model,
+            "messages": self._ollama_messages(messages),
+            "options": options,
+            "think": self._ollama_think_value(model, include_reasoning),
+        }
+        if stream:
+            kwargs["stream"] = True
+        if tools is not None:
+            kwargs["tools"] = tools
+        return kwargs
+
     def _chat_tool_schemas(self):
         if self.api_type == API_TYPE_OPENAI:
             return openai_tool_schemas()
@@ -1135,11 +1412,70 @@ class LLMChat:
             message["name"] = name
         return message
 
+    @staticmethod
+    def _ollama_tool_result_message(name, content):
+        return {
+            "role": "tool",
+            "tool_name": name,
+            "content": content,
+        }
+
     def _chat_stream_assistant_message(self, content, thinking):
         message = {"role": "assistant", "content": content}
         if self._uses_minimax_openai_compat() and thinking:
             message["reasoning_details"] = [{"text": thinking}]
         return message
+
+    @staticmethod
+    def _ollama_assistant_message(content, thinking="", tool_calls=None):
+        message = {"role": "assistant", "content": content}
+        if thinking:
+            message["thinking"] = thinking
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return message
+
+    def _ollama_think_value(self, model=None, include_reasoning=True):
+        if not include_reasoning:
+            return False
+        if not self.thinking_mode:
+            return False
+        model_name = str(model or self.model or "").lower()
+        if "gpt-oss" in model_name:
+            return "medium"
+        return True
+
+    def _message_content_text_for_ollama(self, content):
+        if isinstance(content, str):
+            return content
+        if isinstance(content, (list, dict)):
+            return clean_display_text(content)
+        return str(content or "")
+
+    def _ollama_normalized_tool_calls(self, tool_calls):
+        normalized = []
+        for index, call in enumerate(tool_calls or []):
+            function = self._get_field(call, "function", {}) or {}
+            name = self._get_field(function, "name", "") or ""
+            arguments = self._parse_tool_arguments(
+                self._get_field(function, "arguments", {}) or {}
+            )
+            function_call = {
+                "name": name,
+                "arguments": arguments,
+            }
+            raw_index = self._get_field(function, "index", None)
+            if raw_index is not None:
+                function_call["index"] = raw_index
+            elif len(tool_calls) > 1:
+                function_call["index"] = index
+            normalized.append(
+                {
+                    "type": self._get_field(call, "type", "function") or "function",
+                    "function": function_call,
+                }
+            )
+        return normalized
 
     def _uses_minimax_openai_compat(self, model=None):
         if self.api_type != API_TYPE_OPENAI:
