@@ -26,6 +26,7 @@ COMMANDS = {
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
     "/comp": "Compact the current conversation context immediately.",
+    "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
     "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
 }
 
@@ -210,10 +211,18 @@ def handle_comp(chat, args):
 
     result = chat.compact_context(manual=True)
     if result.get("compacted"):
+        memory_update = result.get("memory_update") or {}
+        memory_changed = memory_update.get("changed") or []
+        memory_suffix = ""
+        if memory_changed:
+            memory_suffix = f" Memory updated: {', '.join(memory_changed)}."
+        elif memory_update.get("error"):
+            memory_suffix = f" Memory update failed: {memory_update.get('error')}."
         print_success(
             "Context compacted: "
             f"{result.get('before_messages')} -> {result.get('after_messages')} messages, "
             f"{result.get('before_chars')} -> {result.get('after_chars')} chars."
+            f"{memory_suffix}"
         )
         return True
 
@@ -223,6 +232,77 @@ def handle_comp(chat, args):
     else:
         print_info(reason)
     return True
+
+
+def handle_memory(chat, args):
+    store = getattr(chat, "memory_store", None)
+    if store is None:
+        print_error("Persistent memory is not initialized.")
+        return True
+
+    action = "show"
+    value = ""
+    if args:
+        parts = args.strip().split(maxsplit=1)
+        action = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+
+    if action in {"show", "status"}:
+        print_info(
+            "Persistent memory files:\n"
+            f"{store.paths_summary()}\n\n"
+            "Usage: /memory core | /memory prefs | /memory today | "
+            "/memory date YYYY-MM-DD | /memory search <query>"
+        )
+        _print_memory_section("Core memory", store.read_core_body())
+        _print_memory_section("Preference memory", store.read_preference_body())
+        today = store.episodic_for_date()
+        if today:
+            _print_memory_section("Today's episodic memory", today)
+        return True
+
+    if action == "core":
+        _print_memory_section("Core memory", store.read_core_body())
+        return True
+
+    if action in {"prefs", "preferences", "preference"}:
+        _print_memory_section("Preference memory", store.read_preference_body())
+        return True
+
+    if action in {"today", "daily"}:
+        _print_memory_section("Today's episodic memory", store.episodic_for_date())
+        return True
+
+    if action == "date":
+        if not value:
+            print_error("Usage: /memory date YYYY-MM-DD")
+            return True
+        _print_memory_section(f"Episodic memory for {value}", store.episodic_for_date(value))
+        return True
+
+    if action == "search":
+        if not value:
+            print_error("Usage: /memory search <query>")
+            return True
+        _print_memory_section(f"Episodic memory search: {value}", store.search_episodic(value))
+        return True
+
+    if action in {"path", "paths"}:
+        print_info(store.paths_summary())
+        return True
+
+    print_error(
+        "Usage: /memory core | /memory prefs | /memory today | "
+        "/memory date YYYY-MM-DD | /memory search <query> | /memory path"
+    )
+    return True
+
+
+def _print_memory_section(title, content):
+    content = str(content or "").strip()
+    if not content:
+        content = "(empty)"
+    print_info(f"{title}:\n{content}")
 
 
 def handle_agent(chat, args):
@@ -350,6 +430,7 @@ COMMAND_HANDLERS = {
     "/mode": handle_mode,
     "/think": handle_think,
     "/comp": handle_comp,
+    "/memory": handle_memory,
     "/agent": handle_agent,
     "/token": handle_token,
     "/temp": handle_temp,

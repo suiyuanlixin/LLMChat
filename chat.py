@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from config import (
     normalize_api_type,
     parse_agent_show_thinking,
 )
+from memory import MemoryStore, parse_memory_update_response
 from tools import (
     AgentTools,
     anthropic_tool_schemas,
@@ -46,6 +48,7 @@ AGENT_RESPONSE_CHAR_DELAY_SECONDS = 0.003
 AGENT_SUMMARY_MAX_TOKENS = 96
 AGENT_SUMMARY_PREFIX_CHARS = len("[*] Thinking: ")
 COMPACTION_MAX_TOKENS = 2048
+MEMORY_UPDATE_MAX_TOKENS = 4096
 COMPACTION_SUMMARY_PREFIX = "[Compressed conversation summary for continuity]"
 USER_PROMPT_FILE = "prompt.md"
 USER_PROMPT_MAX_CHARS = 20000
@@ -61,11 +64,9 @@ USER_PROMPT_TEMPLATE = """<!--
 """
 USER_PROMPT_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 AGENT_SUMMARY_SYSTEM_PROMPT = (
-    "Summarize hidden local-agent thinking for a terminal status line. "
-    "Return one very short sentence, ideally 4-8 words or 8-16 Chinese characters. "
-    "Prefer brevity over detail. Use no markdown, code, quotes, or prefix. "
-    "Describe what the agent is doing now, not step-by-step reasoning. "
-    "Use the same language as the thinking when obvious."
+    "把 agent 的内部思考压成一句很短的终端状态。"
+    "优先中文，除非输入明显要求其他语言。"
+    "不要 markdown、代码、引号或前缀。只说正在做什么。"
 )
 
 
@@ -95,16 +96,13 @@ Rules:
 - Stop when the task is complete and summarize what changed."""
 
 
-COMPACTION_SYSTEM_PROMPT = """You compact chat context for a terminal LLM client.
+COMPACTION_SYSTEM_PROMPT = """你负责压缩聊天上下文。
+只返回连续性摘要。保留目标、偏好、约束、决定、项目事实、错误、验证、待办和仍有用的旧摘要。
+遵循持久记忆，尤其语言偏好。不要编造。简洁。"""
 
-Return an updated continuity summary for the next model request. Preserve:
-- user goals, preferences, constraints, and decisions
-- important project facts, filenames, commands, errors, and verification results
-- unresolved questions, pending tasks, and promised next steps
-- any existing compressed summary that is still relevant
 
-Do not invent facts. Remove low-value chatter and duplicate wording. Keep the
-summary concise but complete enough for future turns."""
+MEMORY_UPDATE_SYSTEM_PROMPT = """你负责更新持久记忆。
+只返回 JSON。遵循持久记忆和偏好记忆，尤其语言偏好。事实准确；情景记忆可以有人情味，但不能编造。"""
 
 
 def _ensure_user_prompt_file():
@@ -151,6 +149,19 @@ def _with_user_custom_prompt(base_prompt):
     )
 
 
+def _with_persistent_memory(base_prompt, memory_store):
+    if memory_store is None:
+        return base_prompt
+    try:
+        memory_block = memory_store.system_prompt_block()
+    except Exception as error:
+        print_warn(f"Failed to read persistent memory: {error}")
+        return base_prompt
+    if not memory_block:
+        return base_prompt
+    return f"{base_prompt}\n\n{memory_block}"
+
+
 class LLMChat:
     def __init__(
         self,
@@ -175,6 +186,9 @@ class LLMChat:
         compaction_compact_model="",
     ):
         _ensure_user_prompt_file()
+        self.memory_store = MemoryStore()
+        self.memory_lock = threading.Lock()
+        self.first_episodic_memory_pending = False
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
@@ -357,6 +371,7 @@ class LLMChat:
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
         original_history = self._history_snapshot()
         self.conversation_history.append({"role": "user", "content": user_message})
+        self._record_preference_signal(user_message)
 
         try:
             self._auto_compact_context()
@@ -1030,6 +1045,7 @@ class LLMChat:
                 "Context compacted automatically: "
                 f"{result.get('before_messages')} -> {result.get('after_messages')} messages."
             )
+            self._print_memory_update_result(result.get("memory_update"))
         elif result.get("error"):
             print_warn(result.get("reason", "Automatic context compaction failed."))
         return result
@@ -1095,6 +1111,11 @@ class LLMChat:
                 "model": compact_model,
             }
 
+        memory_update = self._schedule_memory_update_from_compaction(
+            summary,
+            source_messages,
+            compact_model,
+        )
         self.conversation_history = [
             {"role": "user", "content": self._compaction_summary_message(summary)},
             *recent_messages,
@@ -1110,12 +1131,17 @@ class LLMChat:
             "after_chars": after_chars,
             "model": compact_model,
             "removed_orphan_tool_results": removed_tool_results,
+            "memory_update": memory_update,
         }
 
     def _create_compaction_summary(self, existing_summary, source_messages, compact_model):
         prompt = self._compaction_prompt(existing_summary, source_messages)
+        system_prompt = _with_persistent_memory(
+            COMPACTION_SYSTEM_PROMPT,
+            self.memory_store,
+        )
         messages = [
-            {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
         temperature = min(float(self.temperature), 0.2)
@@ -1125,7 +1151,7 @@ class LLMChat:
                 model=compact_model,
                 max_tokens=COMPACTION_MAX_TOKENS,
                 temperature=temperature,
-                system=COMPACTION_SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
             )
             return self._anthropic_response_text(response)
@@ -1155,6 +1181,163 @@ class LLMChat:
         message = response.choices[0].message
         return _clean_content_text(self._get_field(message, "content", "") or "")
 
+    def _schedule_memory_update_from_compaction(self, summary, source_messages, compact_model):
+        compacted_messages = self._format_messages_for_compaction(source_messages)
+        self._start_memory_background_task(
+            self._update_memory_from_compaction,
+            summary,
+            compacted_messages,
+            compact_model,
+        )
+        return {"changed": [], "scheduled": True}
+
+    def _update_memory_from_compaction(self, summary, compacted_messages, compact_model):
+        try:
+            prompt = self.memory_store.build_update_prompt(compacted_messages, summary)
+            raw_update = self._create_memory_update(prompt, compact_model)
+            update = parse_memory_update_response(raw_update)
+            if not update:
+                return {
+                    "changed": [],
+                    "error": "memory update model returned no parseable JSON",
+                }
+            with self.memory_lock:
+                return self.memory_store.apply_update(update)
+        except Exception as error:
+            return {"changed": [], "error": str(error)}
+
+    def write_first_episodic_memory_if_needed(self):
+        with self.memory_lock:
+            if self.memory_store.read_episodic_text():
+                return {"changed": [], "reason": "Episodic memory already has entries."}
+            if self.first_episodic_memory_pending:
+                return {"changed": [], "reason": "First episodic memory is already pending."}
+
+            messages = self._last_completed_dialogue_messages()
+            if not messages:
+                return {"changed": [], "reason": "No completed dialogue turn to remember."}
+
+            self.first_episodic_memory_pending = True
+
+        formatted_messages = self._format_messages_for_compaction(messages)
+        self._start_memory_background_task(
+            self._write_first_episodic_memory,
+            formatted_messages,
+        )
+        return {"changed": [], "scheduled": True}
+
+    def _write_first_episodic_memory(self, formatted_messages):
+        try:
+            prompt = self.memory_store.build_first_episodic_prompt(formatted_messages)
+            compact_model = self.compaction_compact_model or self.model
+            raw_update = self._create_memory_update(prompt, compact_model)
+            update = parse_memory_update_response(raw_update)
+            episodic_entry = ""
+            if isinstance(update, dict):
+                episodic_entry = update.get("episodic_entry", update.get("episodic", ""))
+            if not str(episodic_entry or "").strip():
+                return {
+                    "changed": [],
+                    "error": "first episodic memory model returned no episodic_entry",
+                }
+
+            with self.memory_lock:
+                if self.memory_store.read_episodic_text():
+                    return {"changed": [], "reason": "Episodic memory already has entries."}
+                if self.memory_store.append_first_episodic_entry(episodic_entry):
+                    return {"changed": ["episodic"]}
+                return {"changed": []}
+        except Exception as error:
+            return {"changed": [], "error": str(error)}
+        finally:
+            with self.memory_lock:
+                self.first_episodic_memory_pending = False
+
+    def _start_memory_background_task(self, target, *args):
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        thread.start()
+        return thread
+
+    def _last_completed_dialogue_messages(self):
+        last_assistant_index = None
+        for index in range(len(self.conversation_history) - 1, -1, -1):
+            if self.conversation_history[index].get("role") == "assistant":
+                last_assistant_index = index
+                break
+        if last_assistant_index is None:
+            return []
+
+        start_index = None
+        for index in range(last_assistant_index - 1, -1, -1):
+            if self.conversation_history[index].get("role") == "user":
+                start_index = index
+                break
+        if start_index is None:
+            return []
+
+        return self.conversation_history[start_index : last_assistant_index + 1]
+
+    def _create_memory_update(self, prompt, compact_model):
+        system_prompt = _with_persistent_memory(
+            MEMORY_UPDATE_SYSTEM_PROMPT,
+            self.memory_store,
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        temperature = min(float(self.temperature), 0.2)
+
+        if self.api_type == API_TYPE_ANTHROPIC:
+            response = self.client.messages.create(
+                model=compact_model,
+                max_tokens=MEMORY_UPDATE_MAX_TOKENS,
+                temperature=temperature,
+                system=system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return self._anthropic_response_text(response)
+
+        if self.api_type == API_TYPE_OLLAMA:
+            response = self.client.chat(
+                **self._ollama_chat_kwargs(
+                    model=compact_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=MEMORY_UPDATE_MAX_TOKENS,
+                    include_reasoning=False,
+                )
+            )
+            message = self._get_field(response, "message", {})
+            return str(self._get_field(message, "content", "") or "")
+
+        response = self.client.chat.completions.create(
+            **self._chat_completion_kwargs(
+                model=compact_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=MEMORY_UPDATE_MAX_TOKENS,
+                include_reasoning=False,
+            )
+        )
+        message = response.choices[0].message
+        return _clean_content_text(self._get_field(message, "content", "") or "")
+
+    def _print_memory_update_result(self, memory_update):
+        if not memory_update:
+            return
+        changed = memory_update.get("changed") or []
+        if changed:
+            print_info("Persistent memory updated: " + ", ".join(changed) + ".")
+        elif memory_update.get("error"):
+            print_warn(f"Persistent memory update failed: {memory_update.get('error')}")
+
+    def _record_preference_signal(self, user_message):
+        try:
+            self.memory_store.record_preference_signal(user_message)
+        except Exception as error:
+            print_warn(f"Failed to record preference memory: {error}")
+
     def _compaction_prompt(self, existing_summary, source_messages):
         existing_summary = str(existing_summary or "").strip()
         compacted_messages = self._format_messages_for_compaction(source_messages)
@@ -1164,12 +1347,12 @@ class LLMChat:
             existing_summary = "(No existing summary.)"
 
         return (
-            "Update the compressed conversation summary for future turns.\n\n"
-            "Existing compressed summary:\n"
+            "为后续对话更新压缩摘要。遵循持久记忆和用户偏好，尤其语言偏好。只返回摘要。\n\n"
+            "已有摘要：\n"
             f"{existing_summary}\n\n"
-            "Messages to fold into the summary:\n"
+            "需要合并的消息：\n"
             f"{compacted_messages}\n\n"
-            "Return only the updated compressed summary."
+            "只返回更新后的压缩摘要。"
         )
 
     def _format_messages_for_compaction(self, messages):
@@ -1790,10 +1973,14 @@ class LLMChat:
         )
 
     def _normal_system_prompt(self):
-        return _with_user_custom_prompt(NORMAL_SYSTEM_PROMPT)
+        return _with_user_custom_prompt(
+            _with_persistent_memory(NORMAL_SYSTEM_PROMPT, self.memory_store)
+        )
 
     def _agent_system_prompt(self):
-        return _with_user_custom_prompt(AGENT_SYSTEM_PROMPT)
+        return _with_user_custom_prompt(
+            _with_persistent_memory(AGENT_SYSTEM_PROMPT, self.memory_store)
+        )
 
     def _chat_completion_kwargs(
         self,
@@ -2102,7 +2289,7 @@ def _clean_content_text(content):
 def _summarize_agent_thinking(content):
     text = _strip_code_from_thinking(content)
     if not text:
-        return "Working out the next agent step."
+        return "整理下一步。"
 
     sentence = _pick_thinking_summary_sentence(text)
     return _single_line_unlimited(sentence)
@@ -2113,8 +2300,7 @@ def _summary_model_prompt(content):
     if not text:
         return ""
     return (
-        "Summarize this agent thinking into one very short terminal status sentence. "
-        "Keep it as short as possible while still being useful.\n\n"
+        "把这段 agent 思考压成一句很短的终端状态，优先中文，越短越好。\n\n"
         f"{_single_line(text, 4000)}"
     )
 
