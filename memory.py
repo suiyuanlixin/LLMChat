@@ -13,7 +13,7 @@ PREFERENCE_MEMORY_MAX_CHARS = 3000
 SYSTEM_MEMORY_MAX_CHARS = 7000
 EPISODIC_UPDATE_CONTEXT_MAX_CHARS = 12000
 EPISODIC_ENTRY_MAX_TITLE_CHARS = 16
-EPISODIC_ENTRY_MAX_BULLETS = 2
+EPISODIC_ENTRY_MAX_BULLETS = None
 EPISODIC_ENTRY_MAX_BULLET_CHARS = 28
 EPISODIC_FIRST_ENTRY_MAX_BULLET_CHARS = 120
 
@@ -91,7 +91,7 @@ class MemoryStore:
         return (
             "从压缩上下文更新持久记忆。只返回 JSON：episodic_entry、core_memory、preference_memory。\n"
             "要求：遵循偏好记忆，尤其语言；不编造；短而有感情。\n"
-            "episodic_entry：若有值得记的事，只写一个 `### HH:MM - short title` 条目，下面写 1-2 条 `-` 要点；不要写多个 `###`。像一条条日记。用最平常的话。用户说了什么意图（概括，别引用）？写你干了什么（必须），一个你身上发生的最简单的事实或你的感受（可选），不要解释为什么，不要比喻。要有人的感觉。直接写。每条尽量不超过 20 字。没有则空字符串。\n"
+            "episodic_entry：若有值得记的事，只写一个 `### HH:MM - short title` 条目，下面写若干条 `-` 要点；不要写多个 `###`。要点数量不限，但每条必须是不同事情；同一件事只写一条，不要拆成多个要点。像一条条日记。用最平常的话。用户说了什么意图（概括，别引用）？写你干了什么（必须），一个你身上发生的最简单的事实或你的感受（可选），不要解释为什么，不要比喻。要有人的感觉。直接写。每条尽量不超过 20 字。没有则空字符串。\n"
             "core_memory：写 `# Core Memory` 下方正文，保留长期目标、任务、事实、约束，整文件小于 3000 字。\n"
             "preference_memory：写 `# Preference Memory` 下方正文，必须且仅保留 `## Critical`、`## High`、`## Medium`、`## Low` 四级标题。\n\n"
             f"当前时间：{current_date} {current_time}\n"
@@ -144,19 +144,19 @@ class MemoryStore:
             update.get("episodic_entry", update.get("episodic", ""))
         )
         if episodic_entry:
-            self.append_episodic_entry(episodic_entry, now=now)
-            changed.append("episodic")
+            if self.append_episodic_entry(episodic_entry, now=now):
+                changed.append("episodic")
 
         if "core_memory" in update or "core" in update:
             core = _clean_model_field(update.get("core_memory", update.get("core", "")))
-            if self.write_core_body(core):
+            if _has_memory_update_content(core, "Core Memory") and self.write_core_body(core):
                 changed.append("core")
 
         if "preference_memory" in update or "preferences" in update:
             preferences = _clean_model_field(
                 update.get("preference_memory", update.get("preferences", ""))
             )
-            if self.write_preference_body(preferences):
+            if _has_preference_update_content(preferences) and self.write_preference_body(preferences):
                 changed.append("preferences")
 
         return {"changed": changed}
@@ -292,7 +292,7 @@ class MemoryStore:
             return ""
 
     def _write_memory_file(self, path, title, body, max_chars):
-        body = _clean_model_field(body)
+        body = _memory_text(_clean_model_field(body), title)
         header = f"# {title}\n"
         allowance = max(0, max_chars - len(header) - 1)
         body = _truncate(body, allowance).strip()
@@ -334,9 +334,37 @@ def parse_memory_update_response(text):
 def _memory_text(content, title):
     content = _strip_comments(content).strip()
     lines = content.splitlines()
-    if lines and lines[0].strip().lower() == f"# {title}".lower():
-        lines = lines[1:]
+    while lines:
+        first_line = lines[0].strip()
+        if not first_line:
+            lines = lines[1:]
+            continue
+        if _is_memory_title_line(first_line, title):
+            lines = lines[1:]
+            continue
+        break
     return "\n".join(lines).strip()
+
+
+def _has_memory_update_content(content, title):
+    return bool(_memory_text(_clean_model_field(content), title).strip())
+
+
+def _has_preference_update_content(content):
+    body = _memory_text(_clean_model_field(content), "Preference Memory")
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped and not re.fullmatch(r"##\s+.+", stripped):
+            return True
+    return False
+
+
+def _is_memory_title_line(line, title):
+    line = str(line or "").strip()
+    if line.lower() == str(title or "").strip().lower():
+        return True
+    match = re.fullmatch(r"#{1,6}\s+(.+)", line)
+    return bool(match and match.group(1).strip().lower() == title.lower())
 
 
 def _ensure_memory_title(content, title):
@@ -351,7 +379,7 @@ def _ensure_memory_title(content, title):
 
 
 def _normalize_preference_body(body):
-    body = _clean_model_field(body)
+    body = _memory_text(_clean_model_field(body), "Preference Memory")
     existing = _preference_sections(body)
     stray_lines = []
     for line in body.splitlines():
@@ -515,7 +543,7 @@ def _limit_episodic_entry(
         if not text:
             continue
         bullets.append(f"- {_shorten_inline(text, max_bullet_chars)}")
-        if len(bullets) >= max_bullets:
+        if max_bullets is not None and len(bullets) >= max_bullets:
             break
 
     return "\n".join([heading, *bullets]).strip()
