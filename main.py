@@ -208,7 +208,7 @@ def main():
             response = chat.send_message(user_input, stream_print_thinking, stream_print_response)
             handle_response(response, chat.model, chat.stream_mode and not chat.agent_mode, chat.thinking_mode)
             if response and not response.get("agent_stopped"):
-                chat.write_first_episodic_memory_if_needed()
+                chat.update_session_episodic_memory()
 
         except KeyboardInterrupt:
             console.print()

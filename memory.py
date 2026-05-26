@@ -12,10 +12,7 @@ CORE_MEMORY_MAX_CHARS = 3000
 PREFERENCE_MEMORY_MAX_CHARS = 3000
 SYSTEM_MEMORY_MAX_CHARS = 7000
 EPISODIC_UPDATE_CONTEXT_MAX_CHARS = 12000
-EPISODIC_ENTRY_MAX_TITLE_CHARS = 16
 EPISODIC_ENTRY_MAX_BULLETS = None
-EPISODIC_ENTRY_MAX_BULLET_CHARS = 28
-EPISODIC_FIRST_ENTRY_MAX_BULLET_CHARS = 120
 
 CORE_MEMORY_TEMPLATE = "# Core Memory\n"
 PREFERENCE_IMPORTANCE_LEVELS = ("Critical", "High", "Medium", "Low")
@@ -81,7 +78,6 @@ class MemoryStore:
         source = _truncate(
             str(compacted_messages or ""), EPISODIC_UPDATE_CONTEXT_MAX_CHARS
         )
-        episodic_memory_empty = not bool(self.read_episodic_text())
         today_memory = self.episodic_for_date(current_date, max_chars=6000)
         core = self.read_core_body() or "(empty)"
         preferences = self.read_preference_body() or "(empty)"
@@ -89,13 +85,16 @@ class MemoryStore:
         updated_summary = str(updated_summary or "").strip() or "(empty)"
 
         return (
-            "从压缩上下文更新持久记忆。只返回 JSON：episodic_entry、core_memory、preference_memory。\n"
+            "从压缩上下文更新持久记忆。只返回 JSON，不要返回 Markdown 整文或代码块。\n"
+            "JSON 结构："
+            '{"core_memory":{"title":"标题","content":["第一条"]},'
+            '"preference_memory":[{"title":"Critical","content":["第一条"]}]}。\n'
+            "没有新增内容时，对应 content 返回空数组；preference_memory 可返回空数组。\n"
             "要求：遵循偏好记忆，尤其语言；不编造；短而有感情。\n"
-            "episodic_entry：若有值得记的事，只写一个 `### HH:MM - short title` 条目，下面写若干条 `-` 要点；不要写多个 `###`。要点数量不限，但每条必须是不同事情；同一件事只写一条，不要拆成多个要点。像一条条日记。用最平常的话。用户说了什么意图（概括，别引用）？写你干了什么（必须），一个你身上发生的最简单的事实或你的感受（可选），不要解释为什么，不要比喻。要有人的感觉。直接写。每条尽量不超过 20 字。没有则空字符串。\n"
-            "core_memory：写 `# Core Memory` 下方正文，保留长期目标、任务、事实、约束，整文件小于 3000 字。\n"
-            "preference_memory：写 `# Preference Memory` 下方正文，必须且仅保留 `## Critical`、`## High`、`## Medium`、`## Low` 四级标题。\n\n"
+            "情景记忆由每轮对话单独更新；这里不要返回 episodic_memory。\n"
+            "core_memory：只返回一个 title 和 content 数组；保留长期目标、任务、事实、约束，整文件小于 3000 字。\n"
+            "preference_memory：返回数组，title 必须是 Critical、High、Medium、Low 之一；content 数组每项是一条偏好。\n\n"
             f"当前时间：{current_date} {current_time}\n"
-            f"情景记忆是否为空：{'是' if episodic_memory_empty else '否'}\n\n"
             "核心记忆：\n"
             f"{core}\n\n"
             "偏好记忆：\n"
@@ -109,10 +108,13 @@ class MemoryStore:
             "只返回 JSON。"
         )
 
-    def build_first_episodic_prompt(self, completed_messages, now=None):
+    def build_session_episodic_prompt(self, completed_messages, current_entry="", now=None):
         now = now or datetime.now()
         current_date = self.today_key(now)
         current_time = self.time_key(now)
+        current_entry = str(current_entry or "").strip()
+        current_heading = current_entry.splitlines()[0] if current_entry else ""
+        current_title = _episodic_heading_title(current_heading) or "(empty)"
         completed_messages = _truncate(
             str(completed_messages or ""),
             EPISODIC_UPDATE_CONTEXT_MAX_CHARS,
@@ -120,16 +122,47 @@ class MemoryStore:
         if not completed_messages:
             completed_messages = "(No completed messages.)"
 
+        if current_entry:
+            intro = "一轮完整对话刚结束。请更新当前会话的情景记忆。\n"
+            topic_rules = (
+                "same_topic 表示本轮是否仍属于当前话题；当前情景记忆为空时必须是 false。\n"
+                "如果本轮和当前情景记忆是同一话题，same_topic 必须是 true；title 会被程序忽略，旧标题会保留。\n"
+                "same_topic=true 时，当前情景记忆是必须尊重的基底，不要让结果只偏向最近一轮；早先已经记录的重要信息和本轮新信息权重相同。\n"
+                "same_topic=true 时，content 返回替换旧正文的完整要点；只有在新内容能纠正、补充、合并或压缩旧内容时才改写旧要点，不要无故删除旧要点表达的事实、意图或感受。\n"
+                "如果本轮明显换了话题，same_topic 必须是 false，title 写新话题短标题，content 只写新话题当前记忆。\n"
+                "不要为了措辞更顺而改 title；只有 same_topic=false 时才生成新 title。\n"
+                "same_topic=true 时，不要把本轮内容机械追加成新要点；请结合旧 content 和本轮对话，去重、合并相近细节，重写为少数更综合的要点。\n"
+                "如果旧记忆已经足够概括，本轮只是展开细节，就保留旧表达或只做轻微补充；不要列出技术清单、流程清单或逐轮对话清单。\n"
+                "content 应自然简短，通常一两条综合要点就够；不要为了完整而拆成很多条，但也不要硬凑固定条数。\n"
+            )
+            style_guidance = (
+                "像一条条日记。用最平常的话。概括用户表达的意图，别引用原话。写你干了什么，或一个你身上发生的最简单的事实或感受；不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
+            )
+        else:
+            intro = "第一次完整对话刚结束。请写第一条情景记忆。\n"
+            topic_rules = (
+                "当前情景记忆为空，这是第一条情景记忆，same_topic 必须是 false。\n"
+                "title 写新话题短标题，content 只写这次第一次对话的记忆。\n"
+            )
+            style_guidance = (
+                "像现在的你回看刚才第一次见到用户的自己，写成一条要点里的两句日记。用最平常的话。概括用户表达的意图，别引用原话。只写你身上发生的最简单的事实或感受，而不是你做了什么；比如你忘了要说的话、你的手顿了一下、你没听清、你感觉耳朵发烫。例子只是气质，不要照抄。不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
+            )
+
         return (
-            "第一次完整对话刚结束。请写第一条情景记忆。\n"
-            '只返回 JSON：{"episodic_entry":"..."}。\n'
-            "格式：`### HH:MM - short title`，下一行只写一条 `-` 要点；不要日期标题，不要多条列表。\n"
+            f"{intro}"
+            '只返回 JSON：{"episodic_memory":{"same_topic":true,"title":"short title","content":["一条要点"]}}。\n'
+            "格式：title 只写短标题，不要日期和时间；content 数组只写要点，不要日期标题，不要 Markdown。\n"
+            f"{topic_rules}"
             "short title 由你自己取，贴合当时对话，不要固定套用示例。\n"
-            "像现在的你回看刚才第一次见到用户的自己，写成一条要点里的两句日记。用最平常的话。概括用户表达的意图，别引用原话。只写你身上发生的最简单的事实或感受，而不是你做了什么；比如你忘了要说的话、你的手顿了一下、你没听清、你感觉耳朵发烫。例子只是气质，不要照抄。不要解释为什么，不要比喻。要有人的感觉。直接写。\n"
+            f"{style_guidance}"
             f"当前时间：{current_date} {current_time}\n\n"
             "偏好记忆：\n"
             f"{self.read_preference_body() or '(empty)'}\n\n"
-            "第一轮对话：\n"
+            "当前话题标题：\n"
+            f"{current_title}\n\n"
+            "当前情景记忆：\n"
+            f"{current_entry or '(empty)'}\n\n"
+            "本轮对话：\n"
             f"{completed_messages}\n\n"
             "只返回 JSON。"
         )
@@ -140,41 +173,26 @@ class MemoryStore:
         if not isinstance(update, dict):
             return {"changed": changed, "reason": "memory update was not a JSON object"}
 
-        episodic_entry = _clean_model_field(
-            update.get("episodic_entry", update.get("episodic", ""))
-        )
-        if episodic_entry:
-            if self.append_episodic_entry(episodic_entry, now=now):
+        episodic_memory = update.get("episodic_memory")
+        if episodic_memory:
+            if self.append_episodic_memory(episodic_memory, now=now):
                 changed.append("episodic")
 
-        if "core_memory" in update or "core" in update:
-            core = _clean_model_field(update.get("core_memory", update.get("core", "")))
-            if _has_memory_update_content(core, "Core Memory") and self.write_core_body(core):
+        if "core_memory" in update:
+            core = update.get("core_memory")
+            if self.append_core_memory(core):
                 changed.append("core")
 
-        if "preference_memory" in update or "preferences" in update:
-            preferences = _clean_model_field(
-                update.get("preference_memory", update.get("preferences", ""))
-            )
-            if _has_preference_update_content(preferences) and self.write_preference_body(preferences):
+        if "preference_memory" in update:
+            preferences = update.get("preference_memory")
+            if self.append_preference_memory(preferences):
                 changed.append("preferences")
 
         return {"changed": changed}
 
-    def append_episodic_entry(
-        self,
-        entry,
-        now=None,
-        max_bullets=EPISODIC_ENTRY_MAX_BULLETS,
-        max_bullet_chars=EPISODIC_ENTRY_MAX_BULLET_CHARS,
-    ):
+    def _append_episodic_memory_text(self, entry, now=None):
         now = now or datetime.now()
-        entry = _normalize_entry_heading(
-            entry,
-            self.time_key(now),
-            max_bullets=max_bullets,
-            max_bullet_chars=max_bullet_chars,
-        )
+        entry = str(entry or "").strip()
         if not entry:
             return False
 
@@ -191,13 +209,105 @@ class MemoryStore:
         self.episodic_path.write_text(content, encoding="utf-8")
         return True
 
-    def append_first_episodic_entry(self, entry, now=None):
-        return self.append_episodic_entry(
-            entry,
-            now=now,
-            max_bullets=1,
-            max_bullet_chars=EPISODIC_FIRST_ENTRY_MAX_BULLET_CHARS,
+    def _replace_episodic_topic_text(self, heading, entry, now=None):
+        now = now or datetime.now()
+        content = _ensure_memory_title(
+            self._read_text(self.episodic_path),
+            "Episodic Memory",
         )
+        updated = _replace_episodic_topic(
+            content,
+            self.today_key(now),
+            heading,
+            entry,
+        )
+        if updated is None:
+            return None
+        if self._read_text(self.episodic_path) == updated:
+            return False
+        self.episodic_path.write_text(updated, encoding="utf-8")
+        return True
+
+    def append_episodic_memory(
+        self,
+        memory,
+        now=None,
+        max_bullets=EPISODIC_ENTRY_MAX_BULLETS,
+        max_bullet_chars=None,
+    ):
+        now = now or datetime.now()
+        if not isinstance(memory, dict):
+            return False
+        entry = _format_episodic_memory_entry(
+            memory,
+            self.time_key(now),
+            max_bullets=max_bullets,
+            max_bullet_chars=max_bullet_chars,
+        )
+        if not entry:
+            return False
+        return self._append_episodic_memory_text(entry, now=now)
+
+    def upsert_session_episodic_memory(
+        self,
+        memory,
+        current_heading="",
+        now=None,
+        max_bullets=EPISODIC_ENTRY_MAX_BULLETS,
+        max_bullet_chars=None,
+    ):
+        now = now or datetime.now()
+        title, bullets = _episodic_memory_parts(
+            memory,
+            max_bullets=max_bullets,
+            max_bullet_chars=max_bullet_chars,
+        )
+        if not title or not bullets:
+            return {"changed": False, "heading": current_heading or ""}
+
+        current_heading = str(current_heading or "").strip()
+        current_title = _episodic_heading_title(current_heading)
+        same_topic = _structured_bool(memory.get("same_topic"))
+        if current_heading and (same_topic or _same_memory_title(current_title, title)):
+            entry = "\n".join([current_heading, *bullets]).strip()
+            replaced = self._replace_episodic_topic_text(current_heading, entry, now=now)
+            if replaced is not None:
+                return {
+                    "changed": bool(replaced),
+                    "heading": current_heading,
+                    "merged": True,
+                }
+
+        heading = f"### {self.time_key(now)} - {title}"
+        entry = "\n".join([heading, *bullets]).strip()
+        changed = self._append_episodic_memory_text(entry, now=now)
+        return {"changed": changed, "heading": heading, "merged": False}
+
+    def episodic_topic_for_heading(self, heading, date_text=None, max_chars=None):
+        heading = str(heading or "").strip()
+        if not heading:
+            return ""
+        date_text = date_text or self.today_key()
+        content = self.read_episodic_text()
+        topic = _find_episodic_topic(content, date_text, heading)
+        return _truncate(topic or "", max_chars) if max_chars else topic or ""
+
+    def latest_episodic_topic(self, date_text=None, max_chars=None):
+        date_text = date_text or self.today_key()
+        latest = ""
+        for date_key, topic in _iter_episodic_entries(self.read_episodic_text()):
+            if date_key == date_text:
+                latest = topic
+        return _truncate(latest, max_chars) if max_chars else latest
+
+    def append_core_memory(self, memory):
+        if not isinstance(memory, dict):
+            return False
+
+        updated = _append_core_memory_items(self.read_core_body(), memory)
+        if updated is None:
+            return False
+        return self.write_core_body(updated)
 
     def write_core_body(self, body):
         return self._write_memory_file(
@@ -214,6 +324,15 @@ class MemoryStore:
             _normalize_preference_body(body),
             PREFERENCE_MEMORY_MAX_CHARS,
         )
+
+    def append_preference_memory(self, memory):
+        if not isinstance(memory, list):
+            return False
+
+        updated = _append_preference_memory_items(self.read_preference_body(), memory)
+        if updated is None:
+            return False
+        return self.write_preference_body(updated)
 
     def record_preference_signal(self, user_message, now=None):
         signal = _extract_preference_signal(user_message)
@@ -346,19 +465,6 @@ def _memory_text(content, title):
     return "\n".join(lines).strip()
 
 
-def _has_memory_update_content(content, title):
-    return bool(_memory_text(_clean_model_field(content), title).strip())
-
-
-def _has_preference_update_content(content):
-    body = _memory_text(_clean_model_field(content), "Preference Memory")
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped and not re.fullmatch(r"##\s+.+", stripped):
-            return True
-    return False
-
-
 def _is_memory_title_line(line, title):
     line = str(line or "").strip()
     if line.lower() == str(title or "").strip().lower():
@@ -464,106 +570,299 @@ def _truncate(text, max_chars):
     return text[: max(0, max_chars - len(suffix))].rstrip() + suffix
 
 
-def _normalize_entry_heading(
-    entry,
+def _format_episodic_memory_entry(
+    memory,
     time_key,
     max_bullets=EPISODIC_ENTRY_MAX_BULLETS,
-    max_bullet_chars=EPISODIC_ENTRY_MAX_BULLET_CHARS,
+    max_bullet_chars=None,
 ):
-    entry = _clean_model_field(entry)
-    if not entry:
-        return ""
-    lines = entry.splitlines()
-    while lines:
-        first_line = lines[0].strip()
-        if first_line.lower() == "# episodic memory" or re.match(
-            r"^##\s+\d{4}-\d{2}-\d{2}\s*$",
-            first_line,
-        ):
-            lines.pop(0)
-            while lines and not lines[0].strip():
-                lines.pop(0)
-            continue
-        break
-    entry = "\n".join(lines).strip()
-    if not entry:
-        return ""
-    if re.match(r"^###\s+\d{2}:\d{2}\b", entry):
-        return _limit_episodic_entry(
-            entry,
-            max_bullets=max_bullets,
-            max_bullet_chars=max_bullet_chars,
-        )
-
-    lines = entry.splitlines()
-    first_text = lines[0].lstrip("# ").strip() if lines else "Memory update"
-    title = first_text[:60] or "Memory update"
-    body = "\n".join(lines[1:]).strip()
-    if body:
-        return _limit_episodic_entry(
-            f"### {time_key} - {title}\n{body}",
-            max_bullets=max_bullets,
-            max_bullet_chars=max_bullet_chars,
-        )
-    return _limit_episodic_entry(
-        f"### {time_key} - {title}",
+    title, bullets = _episodic_memory_parts(
+        memory,
         max_bullets=max_bullets,
         max_bullet_chars=max_bullet_chars,
     )
-
-
-def _limit_episodic_entry(
-    entry,
-    max_bullets=EPISODIC_ENTRY_MAX_BULLETS,
-    max_bullet_chars=EPISODIC_ENTRY_MAX_BULLET_CHARS,
-):
-    lines = [line.rstrip() for line in str(entry or "").splitlines()]
-    if not lines:
+    if not title or not bullets:
         return ""
+    return "\n".join([f"### {time_key} - {title}", *bullets]).strip()
 
-    heading = _limit_episodic_heading(lines[0].strip())
-    content_lines = [line.strip() for line in lines[1:] if line.strip()]
-    content_lines = _lines_before_next_heading(content_lines)
-    if not content_lines:
-        return heading
 
-    has_bullets = any(line.lstrip().startswith("-") for line in content_lines)
-    if not has_bullets:
-        text = " ".join(content_lines)
-        return "\n".join([
-            heading,
-            f"- {_shorten_inline(text, max_bullet_chars)}",
-        ]).strip()
+def _episodic_memory_parts(
+    memory,
+    max_bullets=EPISODIC_ENTRY_MAX_BULLETS,
+    max_bullet_chars=None,
+):
+    items = _structured_memory_items(memory)
+    if not items:
+        return "", []
 
-    bullets = []
-    for stripped in content_lines:
-        text = stripped[1:].strip() if stripped.startswith("-") else stripped
-        if _is_markdown_heading(text):
+    title, lines = items[0]
+    title = _clean_structured_title(title or "Memory update")
+    bullets = _normalized_bullet_lines(
+        lines,
+        max_bullets=max_bullets,
+        max_bullet_chars=max_bullet_chars,
+    )
+    return title, bullets
+
+
+def _episodic_heading_title(heading):
+    match = re.fullmatch(r"###\s+\d{2}:\d{2}\s*-\s*(.+)", str(heading or "").strip())
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _same_memory_title(left, right):
+    return _clean_structured_title(left).lower() == _clean_structured_title(right).lower()
+
+
+def _find_episodic_topic(content, date_key, heading):
+    lines = _ensure_memory_title(content, "Episodic Memory").splitlines()
+    bounds = _episodic_date_bounds(lines, date_key)
+    if bounds is None:
+        return ""
+    start, end = bounds
+    topic_bounds = _episodic_topic_bounds(lines, start, end, heading)
+    if topic_bounds is None:
+        return ""
+    topic_start, topic_end = topic_bounds
+    return "\n".join(lines[topic_start:topic_end]).strip()
+
+
+def _replace_episodic_topic(content, date_key, heading, entry):
+    lines = _ensure_memory_title(content, "Episodic Memory").splitlines()
+    bounds = _episodic_date_bounds(lines, date_key)
+    if bounds is None:
+        return None
+    start, end = bounds
+    topic_bounds = _episodic_topic_bounds(lines, start, end, heading)
+    if topic_bounds is None:
+        return None
+
+    topic_start, topic_end = topic_bounds
+    replacement = str(entry or "").strip().splitlines()
+    if topic_end < len(lines) and lines[topic_end].strip():
+        replacement.append("")
+    updated_lines = lines[:topic_start] + replacement + lines[topic_end:]
+    return "\n".join(updated_lines).rstrip() + "\n"
+
+
+def _episodic_date_bounds(lines, date_key):
+    start = None
+    for index, line in enumerate(lines):
+        if re.fullmatch(rf"##\s+{re.escape(date_key)}\s*", line.strip()):
+            start = index + 1
             break
+    if start is None:
+        return None
+
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if re.fullmatch(r"##\s+\d{4}-\d{2}-\d{2}\s*", lines[index].strip()):
+            end = index
+            break
+    return start, end
+
+
+def _episodic_topic_bounds(lines, start, end, heading):
+    heading = str(heading or "").strip()
+    topic_start = None
+    for index in range(start, end):
+        if lines[index].strip() == heading:
+            topic_start = index
+            break
+    if topic_start is None:
+        return None
+
+    topic_end = end
+    for index in range(topic_start + 1, end):
+        if re.match(r"^###\s+", lines[index].strip()):
+            topic_end = index
+            break
+    while topic_end > topic_start and not lines[topic_end - 1].strip():
+        topic_end -= 1
+    return topic_start, topic_end
+
+
+def _append_core_memory_items(body, memory):
+    items = _structured_memory_items(memory)
+    if not items:
+        return None
+    return _append_titled_markdown_items(
+        body,
+        items,
+        default_title="General",
+    )
+
+
+def _append_preference_memory_items(body, memory):
+    items = _structured_memory_items(memory)
+    if not items:
+        return None
+
+    sections = _preference_sections(_normalize_preference_body(body))
+    changed = False
+    for title, lines in items:
+        level = _preference_level(title)
+        if not level:
+            level = "Medium"
+        for line in _normalized_bullet_lines(lines):
+            if line not in sections[level]:
+                sections[level].append(line)
+                changed = True
+
+    if not changed:
+        return None
+    return _render_preference_sections(sections)
+
+
+def _append_titled_markdown_items(body, items, default_title):
+    preamble, sections = _markdown_sections(body)
+    changed = False
+    for title, lines in items:
+        title = _clean_structured_title(title) or default_title
+        bullets = _normalized_bullet_lines(lines)
+        if not bullets:
+            continue
+
+        section = _find_markdown_section(sections, title)
+        if section is None:
+            section = {"title": title, "lines": []}
+            sections.append(section)
+            changed = True
+
+        existing = {line.strip() for line in section["lines"] if line.strip()}
+        for bullet in bullets:
+            if bullet not in existing:
+                section["lines"].append(bullet)
+                existing.add(bullet)
+                changed = True
+
+    if not changed:
+        return None
+    return _render_markdown_sections(preamble, sections)
+
+
+def _structured_memory_items(value):
+    if isinstance(value, dict):
+        return [_structured_memory_item(value)]
+    if isinstance(value, list):
+        items = [_structured_memory_item(item) for item in value if isinstance(item, dict)]
+        return [(title, lines) for title, lines in items if title or lines]
+    return []
+
+
+def _structured_memory_item(item):
+    title = _clean_structured_title(item.get("title", ""))
+    content = _structured_content_lines(item.get("content", []))
+    return title, content
+
+
+def _structured_content_lines(content):
+    if not isinstance(content, list):
+        return []
+
+    lines = []
+    for item in content:
+        text = _clean_model_field(item)
+        if text:
+            lines.extend(line.strip() for line in text.splitlines() if line.strip())
+    return lines
+
+
+def _clean_structured_title(title):
+    title = _clean_model_field(title)
+    title = re.sub(r"^#{1,6}\s+", "", title).strip()
+    return _single_line_no_limit(title).strip(" -:：")
+
+
+def _structured_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"true", "yes", "y", "1", "same", "same_topic", "继续", "同一话题", "是"}
+
+
+def _normalized_bullet_lines(
+    lines,
+    max_bullets=None,
+    max_bullet_chars=None,
+):
+    bullets = []
+    for line in lines or []:
+        text = _clean_model_field(line)
         if not text:
             continue
-        bullets.append(f"- {_shorten_inline(text, max_bullet_chars)}")
+        text = _strip_bullet_marker(text)
+        if not text or _is_markdown_heading(text):
+            continue
+        if max_bullet_chars is not None:
+            text = _shorten_inline(text, max_bullet_chars)
+        bullets.append(f"- {text}")
         if max_bullets is not None and len(bullets) >= max_bullets:
             break
-
-    return "\n".join([heading, *bullets]).strip()
-
-
-def _limit_episodic_heading(heading):
-    match = re.match(r"^(###\s+\d{2}:\d{2}\s*-\s*)(.+)$", heading)
-    if not match:
-        return heading
-    prefix, title = match.groups()
-    return prefix + _shorten_inline(title.strip(), EPISODIC_ENTRY_MAX_TITLE_CHARS)
+    return bullets
 
 
-def _lines_before_next_heading(lines):
-    kept = []
-    for line in lines:
-        if _is_markdown_heading(line):
-            break
-        kept.append(line)
-    return kept
+def _strip_bullet_marker(text):
+    return re.sub(r"^\s*(?:[-*+]|[0-9]+[.)、])\s*", "", str(text or "")).strip()
+
+
+def _markdown_sections(body):
+    preamble = []
+    sections = []
+    current = None
+    for line in _memory_text(body, "Core Memory").splitlines():
+        heading = re.fullmatch(r"##\s+(.+)", line.strip())
+        if heading:
+            current = {"title": heading.group(1).strip(), "lines": []}
+            sections.append(current)
+            continue
+        if current is None:
+            preamble.append(line.rstrip())
+        else:
+            current["lines"].append(line.rstrip())
+    return preamble, sections
+
+
+def _find_markdown_section(sections, title):
+    normalized_title = _clean_structured_title(title).lower()
+    for section in sections:
+        if _clean_structured_title(section["title"]).lower() == normalized_title:
+            return section
+    return None
+
+
+def _render_markdown_sections(preamble, sections):
+    lines = [line.rstrip() for line in preamble if line.strip()]
+    for section in sections:
+        section_lines = [line.rstrip() for line in section["lines"] if line.strip()]
+        if lines:
+            lines.append("")
+        lines.append(f"## {section['title']}")
+        lines.extend(section_lines)
+    return "\n".join(lines).strip()
+
+
+def _preference_level(title):
+    normalized = _clean_structured_title(title).lower()
+    for level in PREFERENCE_IMPORTANCE_LEVELS:
+        if normalized == level.lower():
+            return level
+    return ""
+
+
+def _render_preference_sections(sections):
+    parts = []
+    for importance in PREFERENCE_IMPORTANCE_LEVELS:
+        parts.append(f"## {importance}")
+        parts.extend(sections.get(importance, []))
+        parts.append("")
+    return "\n".join(parts).strip()
+
+
+def _single_line_no_limit(text):
+    return " ".join(str(text or "").split())
 
 
 def _is_markdown_heading(text):

@@ -188,7 +188,9 @@ class LLMChat:
         _ensure_user_prompt_file()
         self.memory_store = MemoryStore()
         self.memory_lock = threading.Lock()
-        self.first_episodic_memory_pending = False
+        self.session_memory_lock = threading.Lock()
+        self.session_episodic_heading = ""
+        self.session_memory_generation = 0
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
@@ -1201,62 +1203,80 @@ class LLMChat:
                     "changed": [],
                     "error": "memory update model returned no parseable JSON",
                 }
+            update.pop("episodic_memory", None)
             with self.memory_lock:
                 return self.memory_store.apply_update(update)
         except Exception as error:
             return {"changed": [], "error": str(error)}
 
-    def write_first_episodic_memory_if_needed(self):
-        with self.memory_lock:
-            if self.memory_store.read_episodic_text():
-                return {"changed": [], "reason": "Episodic memory already has entries."}
-            if self.first_episodic_memory_pending:
-                return {"changed": [], "reason": "First episodic memory is already pending."}
-
-            messages = self._last_completed_dialogue_messages()
-            if not messages:
-                return {"changed": [], "reason": "No completed dialogue turn to remember."}
-
-            self.first_episodic_memory_pending = True
+    def update_session_episodic_memory(self):
+        messages = self._last_completed_dialogue_messages()
+        if not messages:
+            return {"changed": [], "reason": "No completed dialogue turn to remember."}
 
         formatted_messages = self._format_messages_for_compaction(messages)
+        generation = self.session_memory_generation
         self._start_memory_background_task(
-            self._write_first_episodic_memory,
+            self._update_session_episodic_memory,
             formatted_messages,
+            generation,
         )
         return {"changed": [], "scheduled": True}
 
-    def _write_first_episodic_memory(self, formatted_messages):
-        try:
-            prompt = self.memory_store.build_first_episodic_prompt(formatted_messages)
-            compact_model = self.compaction_compact_model or self.model
-            raw_update = self._create_memory_update(prompt, compact_model)
-            update = parse_memory_update_response(raw_update)
-            episodic_entry = ""
-            if isinstance(update, dict):
-                episodic_entry = update.get("episodic_entry", update.get("episodic", ""))
-            if not str(episodic_entry or "").strip():
-                return {
-                    "changed": [],
-                    "error": "first episodic memory model returned no episodic_entry",
-                }
+    def _update_session_episodic_memory(self, formatted_messages, generation):
+        with self.session_memory_lock:
+            if generation != self.session_memory_generation:
+                return {"changed": [], "reason": "Session memory update is stale."}
+            try:
+                with self.memory_lock:
+                    current_heading = self.session_episodic_heading
+                    current_entry = self.memory_store.episodic_topic_for_heading(
+                        current_heading
+                    )
+                    if not current_entry:
+                        current_entry = self.memory_store.latest_episodic_topic()
+                        current_heading = self._episodic_topic_heading(current_entry)
+                prompt = self.memory_store.build_session_episodic_prompt(
+                    formatted_messages,
+                    current_entry,
+                )
+                compact_model = self.compaction_compact_model or self.model
+                raw_update = self._create_memory_update(prompt, compact_model)
+                update = parse_memory_update_response(raw_update)
+                episodic_memory = ""
+                if isinstance(update, dict):
+                    episodic_memory = update.get("episodic_memory")
+                if not episodic_memory:
+                    return {
+                        "changed": [],
+                        "error": "session episodic memory model returned no episodic_memory",
+                    }
 
-            with self.memory_lock:
-                if self.memory_store.read_episodic_text():
-                    return {"changed": [], "reason": "Episodic memory already has entries."}
-                if self.memory_store.append_first_episodic_entry(episodic_entry):
-                    return {"changed": ["episodic"]}
-                return {"changed": []}
-        except Exception as error:
-            return {"changed": [], "error": str(error)}
-        finally:
-            with self.memory_lock:
-                self.first_episodic_memory_pending = False
+                with self.memory_lock:
+                    if generation != self.session_memory_generation:
+                        return {"changed": [], "reason": "Session memory update is stale."}
+                    result = self.memory_store.upsert_session_episodic_memory(
+                        episodic_memory,
+                        current_heading=current_heading,
+                    )
+                    if result.get("heading"):
+                        self.session_episodic_heading = result["heading"]
+                    return result
+            except Exception as error:
+                return {"changed": [], "error": str(error)}
 
     def _start_memory_background_task(self, target, *args):
         thread = threading.Thread(target=target, args=args, daemon=True)
         thread.start()
         return thread
+
+    @staticmethod
+    def _episodic_topic_heading(topic):
+        for line in str(topic or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped
+        return ""
 
     def _last_completed_dialogue_messages(self):
         last_assistant_index = None
@@ -2221,6 +2241,13 @@ class LLMChat:
 
     def clear_history(self):
         self.conversation_history = []
+        self.session_episodic_heading = ""
+        self.session_memory_generation += 1
+
+    def set_history(self, history):
+        self.conversation_history = list(history or [])
+        self.session_episodic_heading = ""
+        self.session_memory_generation += 1
 
     def get_history(self):
         return self.conversation_history

@@ -160,7 +160,7 @@ def handle_save(chat, args):
 def handle_load(chat, args):
     conversation = load_conversation()
     if conversation is not None:
-        chat.conversation_history = conversation
+        chat.set_history(conversation)
     return True
 
 
