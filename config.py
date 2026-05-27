@@ -3,6 +3,16 @@ import json
 from dataclasses import dataclass
 
 from ui import print_error, print_success, print_warn, print_info, get_user_input
+from search import (
+    DEFAULT_WEB_SEARCH_DEPTH,
+    DEFAULT_WEB_SEARCH_ENABLE,
+    DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    DEFAULT_WEB_SEARCH_PROVIDER,
+    DEFAULT_WEB_SEARCH_TOPIC,
+    TAVILY_SEARCH_DEPTHS,
+    TAVILY_TOPICS,
+    WEB_SEARCH_PROVIDERS,
+)
 
 CONFIG_FILE = "config.json"
 API_TYPE_GLM = "glm"
@@ -59,6 +69,12 @@ class AppConfig:
     compaction_max_chars: int = DEFAULT_COMPACTION_MAX_CHARS
     compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
+    web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
+    web_search_provider: str = DEFAULT_WEB_SEARCH_PROVIDER
+    web_search_api_key: str = ""
+    web_search_max_results: int = DEFAULT_WEB_SEARCH_MAX_RESULTS
+    web_search_depth: str = DEFAULT_WEB_SEARCH_DEPTH
+    web_search_topic: str = DEFAULT_WEB_SEARCH_TOPIC
 
     def to_flat_dict(self):
         return {
@@ -80,6 +96,12 @@ class AppConfig:
             "compaction_max_chars": self.compaction_max_chars,
             "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
             "compaction_compact_model": self.compaction_compact_model,
+            "web_search_enable": self.web_search_enable,
+            "web_search_provider": self.web_search_provider,
+            "web_search_api_key": self.web_search_api_key,
+            "web_search_max_results": self.web_search_max_results,
+            "web_search_depth": self.web_search_depth,
+            "web_search_topic": self.web_search_topic,
         }
 
     def to_dict(self):
@@ -105,6 +127,14 @@ class AppConfig:
                 "max_chars": self.compaction_max_chars,
                 "keep_recent_messages": self.compaction_keep_recent_messages,
                 "compact_model": self.compaction_compact_model,
+            },
+            "web_search": {
+                "enable": self.web_search_enable,
+                "provider": self.web_search_provider,
+                "api_key": self.web_search_api_key,
+                "max_results": self.web_search_max_results,
+                "search_depth": self.web_search_depth,
+                "topic": self.web_search_topic,
             },
         }
 
@@ -145,6 +175,14 @@ def _default_config():
             "keep_recent_messages": DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
             "compact_model": DEFAULT_COMPACTION_COMPACT_MODEL,
         },
+        "web_search": {
+            "enable": DEFAULT_WEB_SEARCH_ENABLE,
+            "provider": DEFAULT_WEB_SEARCH_PROVIDER,
+            "api_key": "",
+            "max_results": DEFAULT_WEB_SEARCH_MAX_RESULTS,
+            "search_depth": DEFAULT_WEB_SEARCH_DEPTH,
+            "topic": DEFAULT_WEB_SEARCH_TOPIC,
+        },
     }
 
 
@@ -177,6 +215,34 @@ def parse_compaction_max_chars(value):
 
 def parse_compaction_keep_recent_messages(value):
     return _parse_positive_integer(value, "Auto compact keep recent messages")
+
+
+def parse_web_search_max_results(value):
+    parsed = _parse_positive_integer(value, "Web search max results")
+    if parsed > 20:
+        raise ValueError("Web search max results must be between 1 and 20.")
+    return parsed
+
+
+def parse_web_search_provider(value):
+    provider = str(value or DEFAULT_WEB_SEARCH_PROVIDER).strip().lower()
+    if provider not in WEB_SEARCH_PROVIDERS:
+        raise ValueError("Web search provider must be tavily.")
+    return provider
+
+
+def parse_web_search_depth(value):
+    depth = str(value or DEFAULT_WEB_SEARCH_DEPTH).strip().lower()
+    if depth not in TAVILY_SEARCH_DEPTHS:
+        raise ValueError("Web search depth must be basic, fast, ultra-fast, or advanced.")
+    return depth
+
+
+def parse_web_search_topic(value):
+    topic = str(value or DEFAULT_WEB_SEARCH_TOPIC).strip().lower()
+    if topic not in TAVILY_TOPICS:
+        raise ValueError("Web search topic must be general, news, or finance.")
+    return topic
 
 
 def parse_agent_approval_mode(value):
@@ -306,9 +372,45 @@ def _extract_compaction_config(config):
     return compaction_config
 
 
+def _extract_web_search_config(config):
+    raw_web_search_config = config.get("web_search", {})
+    if isinstance(raw_web_search_config, dict):
+        web_search_config = dict(raw_web_search_config)
+    else:
+        web_search_config = {"enable": raw_web_search_config}
+
+    aliases = {
+        "enabled": "enable",
+        "apiKey": "api_key",
+        "key": "api_key",
+        "max": "max_results",
+        "results": "max_results",
+        "depth": "search_depth",
+        "searchDepth": "search_depth",
+    }
+    for source, target in aliases.items():
+        if target not in web_search_config and source in web_search_config:
+            web_search_config[target] = web_search_config[source]
+
+    flat_aliases = {
+        "web_search_enable": "enable",
+        "web_search_provider": "provider",
+        "web_search_api_key": "api_key",
+        "web_search_max_results": "max_results",
+        "web_search_depth": "search_depth",
+        "web_search_topic": "topic",
+    }
+    for source, target in flat_aliases.items():
+        if target not in web_search_config and source in config:
+            web_search_config[target] = config[source]
+
+    return web_search_config
+
+
 def _sanitize_config(config):
     agent_config = _extract_agent_config(config)
     compaction_config = _extract_compaction_config(config)
+    web_search_config = _extract_web_search_config(config)
 
     config["api_type"] = normalize_api_type(config.get("api_type"))
     if config["api_type"] not in SUPPORTED_API_TYPES:
@@ -410,6 +512,52 @@ def _sanitize_config(config):
     config["compaction_compact_model"] = str(
         compaction_config.get("compact_model", DEFAULT_COMPACTION_COMPACT_MODEL) or ""
     ).strip()
+
+    config["web_search_enable"] = _parse_bool(
+        web_search_config.get("enable"),
+        DEFAULT_WEB_SEARCH_ENABLE,
+    )
+    try:
+        config["web_search_provider"] = parse_web_search_provider(
+            web_search_config.get("provider", DEFAULT_WEB_SEARCH_PROVIDER)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid web_search.provider in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_WEB_SEARCH_PROVIDER}."
+        )
+        config["web_search_provider"] = DEFAULT_WEB_SEARCH_PROVIDER
+    config["web_search_api_key"] = str(web_search_config.get("api_key") or "").strip()
+    try:
+        config["web_search_max_results"] = parse_web_search_max_results(
+            web_search_config.get("max_results", DEFAULT_WEB_SEARCH_MAX_RESULTS)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid web_search.max_results in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_WEB_SEARCH_MAX_RESULTS}."
+        )
+        config["web_search_max_results"] = DEFAULT_WEB_SEARCH_MAX_RESULTS
+    try:
+        config["web_search_depth"] = parse_web_search_depth(
+            web_search_config.get("search_depth", DEFAULT_WEB_SEARCH_DEPTH)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid web_search.search_depth in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_WEB_SEARCH_DEPTH}."
+        )
+        config["web_search_depth"] = DEFAULT_WEB_SEARCH_DEPTH
+    try:
+        config["web_search_topic"] = parse_web_search_topic(
+            web_search_config.get("topic", DEFAULT_WEB_SEARCH_TOPIC)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid web_search.topic in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_WEB_SEARCH_TOPIC}."
+        )
+        config["web_search_topic"] = DEFAULT_WEB_SEARCH_TOPIC
 
     return AppConfig(**{key: config[key] for key in AppConfig().to_flat_dict()})
 
@@ -549,6 +697,12 @@ def load_config():
         compaction_max_chars=DEFAULT_COMPACTION_MAX_CHARS,
         compaction_keep_recent_messages=DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
         compaction_compact_model=DEFAULT_COMPACTION_COMPACT_MODEL,
+        web_search_enable=DEFAULT_WEB_SEARCH_ENABLE,
+        web_search_provider=DEFAULT_WEB_SEARCH_PROVIDER,
+        web_search_api_key="",
+        web_search_max_results=DEFAULT_WEB_SEARCH_MAX_RESULTS,
+        web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
+        web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
     )
     _save_config(config)
 
@@ -669,6 +823,12 @@ def update_config():
         compaction_max_chars=config.compaction_max_chars,
         compaction_keep_recent_messages=config.compaction_keep_recent_messages,
         compaction_compact_model=new_compaction_compact_model,
+        web_search_enable=config.web_search_enable,
+        web_search_provider=config.web_search_provider,
+        web_search_api_key=config.web_search_api_key,
+        web_search_max_results=config.web_search_max_results,
+        web_search_depth=config.web_search_depth,
+        web_search_topic=config.web_search_topic,
     )
     _save_config(new_config)
     return new_config

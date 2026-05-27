@@ -6,6 +6,10 @@ from config import (
     parse_agent_tool_calls,
     parse_max_tokens,
     parse_temperature,
+    parse_web_search_depth,
+    parse_web_search_max_results,
+    parse_web_search_provider,
+    parse_web_search_topic,
     requires_api_key,
     reload_config,
     save_config_field,
@@ -27,6 +31,7 @@ COMMANDS = {
     "/think": "Toggle thinking mode on/off (Example: /think on).",
     "/comp": "Compact the current conversation context immediately.",
     "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
+    "/search": "Search the web with Tavily, or configure web search (Example: /search Python 3.14).",
     "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
 }
 
@@ -110,6 +115,14 @@ def _apply_config(chat, config):
             config.compaction_max_chars,
             config.compaction_keep_recent_messages,
             config.compaction_compact_model,
+        )
+        chat.set_web_search_config(
+            config.web_search_enable,
+            config.web_search_provider,
+            config.web_search_api_key,
+            config.web_search_max_results,
+            config.web_search_depth,
+            config.web_search_topic,
         )
 
         if config.agent_mode and not chat.get_agent_status().get("workspace_dir"):
@@ -232,6 +245,135 @@ def handle_comp(chat, args):
     else:
         print_info(reason)
     return True
+
+
+def handle_search(chat, args):
+    if args is None or not args.strip():
+        _print_search_status(chat)
+        return True
+
+    parts = args.strip().split(maxsplit=1)
+    action = parts[0].lower()
+    value = parts[1].strip() if len(parts) > 1 else ""
+
+    if action in {"status", "config"}:
+        _print_search_status(chat)
+        return True
+
+    if action in {"query", "web"}:
+        if not value:
+            print_error("Usage: /search query <query>")
+            return True
+        return _run_web_search(chat, value)
+
+    if action == "on" and not value:
+        chat.set_web_search_config(enabled=True)
+        save_config_field("web_search_enable", True)
+        print_success("Web search enabled.")
+        return True
+
+    if action == "off" and not value:
+        chat.set_web_search_config(enabled=False)
+        save_config_field("web_search_enable", False)
+        print_success("Web search disabled.")
+        return True
+
+    if action == "key":
+        if not value:
+            print_error("Usage: /search key <tavily-api-key>")
+            return True
+        if not value.startswith("tvly-"):
+            print_error("Tavily API keys usually start with tvly-. Use /search query <query> to search.")
+            return True
+        chat.set_web_search_config(api_key=value)
+        save_config_field("web_search_api_key", value)
+        print_success("Tavily API key saved to config.json.")
+        return True
+
+    if action == "provider":
+        if not value:
+            print_error("Usage: /search provider tavily")
+            return True
+        try:
+            provider = parse_web_search_provider(value)
+        except ValueError as error:
+            print_error(str(error))
+            return True
+        chat.set_web_search_config(provider=provider)
+        save_config_field("web_search_provider", provider)
+        print_success(f"Web search provider set to {provider}.")
+        return True
+
+    if action in {"max", "results", "max-results"}:
+        if not value:
+            print_error("Usage: /search max <1-20>")
+            return True
+        try:
+            max_results = parse_web_search_max_results(value)
+        except ValueError as error:
+            print_error(str(error))
+            return True
+        chat.set_web_search_config(max_results=max_results)
+        save_config_field("web_search_max_results", max_results)
+        print_success(f"Web search max results set to {max_results}.")
+        return True
+
+    if action in {"depth", "search-depth"}:
+        if not value:
+            print_error("Usage: /search depth basic|fast|ultra-fast|advanced")
+            return True
+        try:
+            depth = parse_web_search_depth(value)
+        except ValueError as error:
+            print_error(str(error))
+            return True
+        chat.set_web_search_config(search_depth=depth)
+        save_config_field("web_search_depth", depth)
+        print_success(f"Web search depth set to {depth}.")
+        return True
+
+    if action == "topic":
+        if not value:
+            print_error("Usage: /search topic general|news|finance")
+            return True
+        try:
+            topic = parse_web_search_topic(value)
+        except ValueError as error:
+            print_error(str(error))
+            return True
+        chat.set_web_search_config(topic=topic)
+        save_config_field("web_search_topic", topic)
+        print_success(f"Web search topic set to {topic}.")
+        return True
+
+    return _run_web_search(chat, args)
+
+
+def _run_web_search(chat, query):
+    try:
+        result = chat.web_search(query)
+    except Exception as error:
+        print_error(f"Web search failed: {error}")
+        return True
+    print_info(result)
+    return True
+
+
+def _print_search_status(chat):
+    status = chat.get_web_search_status()
+    current = "on" if status.get("enabled") else "off"
+    available = "available" if status.get("available") else "missing key"
+    print_info(
+        f"Web search: {current} ({available}).\n"
+        f"Provider: {status.get('provider')}.\n"
+        f"Max results: {status.get('max_results')}.\n"
+        f"Depth: {status.get('search_depth')}.\n"
+        f"Topic: {status.get('topic')}.\n"
+        "Usage: /search <query> | /search query <query> | /search key <tavily-api-key> | "
+        "/search on|off | /search max <1-20> | "
+        "/search depth basic|fast|ultra-fast|advanced | "
+        "/search topic general|news|finance"
+    )
 
 
 def handle_memory(chat, args):
@@ -502,6 +644,7 @@ COMMAND_HANDLERS = {
     "/think": handle_think,
     "/comp": handle_comp,
     "/memory": handle_memory,
+    "/search": handle_search,
     "/agent": handle_agent,
     "/token": handle_token,
     "/temp": handle_temp,

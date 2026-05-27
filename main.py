@@ -179,6 +179,12 @@ def main():
             compaction_max_chars=config.compaction_max_chars,
             compaction_keep_recent_messages=config.compaction_keep_recent_messages,
             compaction_compact_model=config.compaction_compact_model,
+            web_search_enabled=config.web_search_enable,
+            web_search_provider=config.web_search_provider,
+            web_search_api_key=config.web_search_api_key,
+            web_search_max_results=config.web_search_max_results,
+            web_search_depth=config.web_search_depth,
+            web_search_topic=config.web_search_topic,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")

@@ -184,6 +184,12 @@ class LLMChat:
         compaction_max_chars=60000,
         compaction_keep_recent_messages=12,
         compaction_compact_model="",
+        web_search_enabled=True,
+        web_search_provider="tavily",
+        web_search_api_key="",
+        web_search_max_results=5,
+        web_search_depth="basic",
+        web_search_topic="general",
     ):
         _ensure_user_prompt_file()
         self.memory_store = MemoryStore()
@@ -204,6 +210,12 @@ class LLMChat:
             workspace_dir,
             approval_mode=agent_approval_mode,
             visible_output_callback=self._before_agent_visible_output,
+            web_search_enabled=web_search_enabled,
+            web_search_provider=web_search_provider,
+            web_search_api_key=web_search_api_key,
+            web_search_max_results=web_search_max_results,
+            web_search_depth=web_search_depth,
+            web_search_topic=web_search_topic,
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
         self.agent_show_thinking = parse_agent_show_thinking(agent_show_thinking)
@@ -325,6 +337,30 @@ class LLMChat:
 
     def set_agent_summary_model(self, model):
         self.agent_summary_model = str(model or "").strip()
+
+    def set_web_search_config(
+        self,
+        enabled=None,
+        provider=None,
+        api_key=None,
+        max_results=None,
+        search_depth=None,
+        topic=None,
+    ):
+        self.agent_tools.set_web_search_config(
+            enabled,
+            provider,
+            api_key,
+            max_results,
+            search_depth,
+            topic,
+        )
+
+    def get_web_search_status(self):
+        return self.agent_tools.web_search_status()
+
+    def web_search(self, query, **kwargs):
+        return self.agent_tools.search_web(query, **kwargs)
 
     def set_compaction_config(
         self,
@@ -623,7 +659,7 @@ class LLMChat:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
                     messages=self._ollama_agent_messages(),
-                    tools=ollama_tool_schemas(),
+                    tools=ollama_tool_schemas(self.agent_tools.web_search_available),
                 )
             )
 
@@ -677,7 +713,7 @@ class LLMChat:
             temperature=self.temperature,
             messages=self._anthropic_messages(),
             system=self._agent_system_prompt(),
-            tools=anthropic_tool_schemas(),
+            tools=anthropic_tool_schemas(self.agent_tools.web_search_available),
             stream=True,
         )
 
@@ -2078,9 +2114,13 @@ class LLMChat:
         )
 
     def _agent_system_prompt(self):
-        return _with_user_custom_prompt(
-            _with_persistent_memory(AGENT_SYSTEM_PROMPT, self.memory_store)
-        )
+        prompt = AGENT_SYSTEM_PROMPT
+        if self.agent_tools.web_search_available:
+            prompt += (
+                "\n- Use web_search for recent, unstable, or external facts when local files "
+                "are insufficient. Cite source URLs from search results in the final answer."
+            )
+        return _with_user_custom_prompt(_with_persistent_memory(prompt, self.memory_store))
 
     def _chat_completion_kwargs(
         self,
@@ -2135,9 +2175,10 @@ class LLMChat:
         return kwargs
 
     def _chat_tool_schemas(self):
+        include_web_search = self.agent_tools.web_search_available
         if self.api_type == API_TYPE_OPENAI:
-            return openai_tool_schemas()
-        return glm_tool_schemas()
+            return openai_tool_schemas(include_web_search)
+        return glm_tool_schemas(include_web_search)
 
     def _chat_tool_result_message(self, tool_call_id, name, content):
         message = {

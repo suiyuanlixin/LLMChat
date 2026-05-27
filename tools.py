@@ -7,6 +7,18 @@ import subprocess
 from pathlib import Path
 
 from ui import get_agent_diff_confirmation, get_user_input
+from search import (
+    DEFAULT_WEB_SEARCH_DEPTH,
+    DEFAULT_WEB_SEARCH_ENABLE,
+    DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    DEFAULT_WEB_SEARCH_PROVIDER,
+    DEFAULT_WEB_SEARCH_TOPIC,
+    is_web_search_configured,
+    normalize_tavily_search_depth,
+    normalize_tavily_topic,
+    normalize_web_search_provider,
+    search_tavily,
+)
 
 
 MAX_READ_CHARS = 60000
@@ -248,11 +260,78 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def anthropic_tool_schemas():
-    return TOOL_DEFINITIONS
+WEB_SEARCH_TOOL_DEFINITION = {
+    "name": "web_search",
+    "description": (
+        "Search the public web with Tavily for current or external information. "
+        "Use it for recent facts, releases, prices, laws, schedules, and source-backed answers."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The web search query.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of search results to return. Defaults to the app setting.",
+            },
+            "search_depth": {
+                "type": "string",
+                "enum": ["basic", "fast", "ultra-fast", "advanced"],
+                "description": "Tavily search depth. basic/fast/ultra-fast cost 1 credit; advanced costs 2.",
+            },
+            "topic": {
+                "type": "string",
+                "enum": ["general", "news", "finance"],
+                "description": "Search topic. Use news for current events and finance for market-related queries.",
+            },
+            "time_range": {
+                "type": "string",
+                "enum": ["day", "week", "month", "year", "d", "w", "m", "y"],
+                "description": "Optional recency filter.",
+            },
+            "include_answer": {
+                "type": "boolean",
+                "description": "Whether Tavily should include its generated answer. Defaults to false.",
+            },
+            "include_raw_content": {
+                "type": "boolean",
+                "description": "Whether Tavily should include parsed page content. Use sparingly.",
+            },
+            "include_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional domains to include.",
+            },
+            "exclude_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional domains to exclude.",
+            },
+            "country": {
+                "type": "string",
+                "description": "Optional country boost for general search, such as united states or china.",
+            },
+        },
+        "required": ["query"],
+    },
+}
 
 
-def glm_tool_schemas():
+def tool_definitions(include_web_search=False):
+    definitions = list(TOOL_DEFINITIONS)
+    if include_web_search:
+        definitions.append(WEB_SEARCH_TOOL_DEFINITION)
+    return definitions
+
+
+def anthropic_tool_schemas(include_web_search=False):
+    return tool_definitions(include_web_search)
+
+
+def glm_tool_schemas(include_web_search=False):
     return [
         {
             "type": "function",
@@ -262,16 +341,16 @@ def glm_tool_schemas():
                 "parameters": tool["input_schema"],
             },
         }
-        for tool in TOOL_DEFINITIONS
+        for tool in tool_definitions(include_web_search)
     ]
 
 
-def openai_tool_schemas():
-    return glm_tool_schemas()
+def openai_tool_schemas(include_web_search=False):
+    return glm_tool_schemas(include_web_search)
 
 
-def ollama_tool_schemas():
-    return glm_tool_schemas()
+def ollama_tool_schemas(include_web_search=False):
+    return glm_tool_schemas(include_web_search)
 
 
 class AgentToolError(Exception):
@@ -284,10 +363,24 @@ class AgentTools:
         workspace_dir=None,
         approval_mode=AGENT_APPROVAL_CONFIRM,
         visible_output_callback=None,
+        web_search_enabled=DEFAULT_WEB_SEARCH_ENABLE,
+        web_search_provider=DEFAULT_WEB_SEARCH_PROVIDER,
+        web_search_api_key="",
+        web_search_max_results=DEFAULT_WEB_SEARCH_MAX_RESULTS,
+        web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
+        web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
         self.set_approval_mode(approval_mode)
+        self.set_web_search_config(
+            web_search_enabled,
+            web_search_provider,
+            web_search_api_key,
+            web_search_max_results,
+            web_search_depth,
+            web_search_topic,
+        )
         self.begin_agent_session()
 
     @property
@@ -305,6 +398,67 @@ class AgentTools:
 
     def set_visible_output_callback(self, callback):
         self.visible_output_callback = callback
+
+    def set_web_search_config(
+        self,
+        enabled=None,
+        provider=None,
+        api_key=None,
+        max_results=None,
+        search_depth=None,
+        topic=None,
+    ):
+        if enabled is not None:
+            self.web_search_enabled = bool(enabled)
+        elif not hasattr(self, "web_search_enabled"):
+            self.web_search_enabled = DEFAULT_WEB_SEARCH_ENABLE
+        if provider is not None:
+            self.web_search_provider = normalize_web_search_provider(provider)
+        elif not hasattr(self, "web_search_provider"):
+            self.web_search_provider = DEFAULT_WEB_SEARCH_PROVIDER
+        if api_key is not None:
+            self.web_search_api_key = str(api_key or "").strip()
+        elif not hasattr(self, "web_search_api_key"):
+            self.web_search_api_key = ""
+        if max_results is not None:
+            self.web_search_max_results = _bounded_int(
+                max_results,
+                DEFAULT_WEB_SEARCH_MAX_RESULTS,
+                1,
+                20,
+                "web_search_max_results",
+            )
+        elif not hasattr(self, "web_search_max_results"):
+            self.web_search_max_results = DEFAULT_WEB_SEARCH_MAX_RESULTS
+        if search_depth is not None:
+            self.web_search_depth = normalize_tavily_search_depth(search_depth)
+        elif not hasattr(self, "web_search_depth"):
+            self.web_search_depth = DEFAULT_WEB_SEARCH_DEPTH
+        if topic is not None:
+            self.web_search_topic = normalize_tavily_topic(topic)
+        elif not hasattr(self, "web_search_topic"):
+            self.web_search_topic = DEFAULT_WEB_SEARCH_TOPIC
+
+    @property
+    def web_search_available(self):
+        return self.web_search_enabled and is_web_search_configured(
+            self.web_search_provider,
+            self.web_search_api_key,
+        )
+
+    def web_search_status(self):
+        return {
+            "enabled": self.web_search_enabled,
+            "available": self.web_search_available,
+            "provider": self.web_search_provider,
+            "max_results": self.web_search_max_results,
+            "search_depth": self.web_search_depth,
+            "topic": self.web_search_topic,
+        }
+
+    def search_web(self, query, **kwargs):
+        payload = {"query": query, **kwargs}
+        return self._web_search(payload)
 
     def begin_agent_session(self):
         self.session_changed_files = []
@@ -393,6 +547,7 @@ class AgentTools:
                 "git_diff": self._git_diff,
                 "grep": self._grep,
                 "glob": self._glob,
+                "web_search": self._web_search,
             }
             handler = handlers.get(name)
             if handler is None:
@@ -723,6 +878,34 @@ class AgentTools:
         suffix = "\n[truncated]" if len(safe_matches) >= MAX_GLOB_MATCHES else ""
         return "\n".join(safe_matches) + suffix
 
+    def _web_search(self, tool_input):
+        if not self.web_search_enabled:
+            raise AgentToolError("Web search is disabled. Use /search on to enable it.")
+        if self.web_search_provider != DEFAULT_WEB_SEARCH_PROVIDER:
+            raise AgentToolError(f"Unsupported web search provider: {self.web_search_provider}")
+
+        query = _required_string(tool_input, "query")
+        max_results = _optional_positive_int(tool_input, "max_results") or self.web_search_max_results
+        search_depth = str(tool_input.get("search_depth") or self.web_search_depth)
+        topic = str(tool_input.get("topic") or self.web_search_topic)
+        time_range = str(tool_input.get("time_range") or "")
+        include_answer = _optional_bool(tool_input, "include_answer", False)
+        include_raw_content = _optional_bool(tool_input, "include_raw_content", False)
+
+        return search_tavily(
+            query,
+            api_key=self.web_search_api_key,
+            max_results=max_results,
+            search_depth=search_depth,
+            topic=topic,
+            time_range=time_range,
+            include_answer=include_answer,
+            include_raw_content=include_raw_content,
+            include_domains=tool_input.get("include_domains"),
+            exclude_domains=tool_input.get("exclude_domains"),
+            country=tool_input.get("country", ""),
+        )
+
     def _iter_files(self, root):
         if not root.exists():
             raise AgentToolError(f"Path does not exist: {self._display_path(root)}")
@@ -969,6 +1152,15 @@ def _optional_positive_int(data, key):
     value = _coerce_int(value, key)
     if value < 1:
         raise AgentToolError(f"{key} must be greater than 0.")
+    return value
+
+
+def _bounded_int(value, default, minimum, maximum, key):
+    if value is None:
+        return default
+    value = _coerce_int(value, key)
+    if value < minimum or value > maximum:
+        raise AgentToolError(f"{key} must be between {minimum} and {maximum}.")
     return value
 
 
