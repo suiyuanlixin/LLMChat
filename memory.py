@@ -7,35 +7,44 @@ from pathlib import Path
 MEMORY_DIR = Path(__file__).resolve().parent / "memory"
 CORE_MEMORY_FILE = "core.md"
 PREFERENCE_MEMORY_FILE = "preferences.md"
-EPISODIC_MEMORY_FILE = "episodic.md"
+EPISODIC_DIR_NAME = "episodes"
+LEGACY_EPISODIC_FILE = "episodic.md"
+LEGACY_EPISODIC_MIGRATED_FILE = "episodic.migrated.md"
+HISTORY_FILE = "history.jsonl"
+MEMORY_UPDATE_DIAGNOSTICS_FILE = "memory_update_diagnostics.jsonl"
 CORE_MEMORY_MAX_CHARS = 3000
 PREFERENCE_MEMORY_MAX_CHARS = 3000
 SYSTEM_MEMORY_MAX_CHARS = 7000
 EPISODIC_UPDATE_CONTEXT_MAX_CHARS = 12000
 EPISODIC_ENTRY_MAX_BULLETS = None
 
-CORE_MEMORY_TEMPLATE = "# Core Memory\n"
+CORE_MEMORY_TEMPLATE = ""
 PREFERENCE_IMPORTANCE_LEVELS = ("Critical", "High", "Medium", "Low")
 PREFERENCE_MEMORY_TEMPLATE = (
-    "# Preference Memory\n\n## Critical\n\n## High\n\n## Medium\n\n## Low\n"
+    "# Critical\n\n# High\n\n# Medium\n\n# Low\n"
 )
-EPISODIC_MEMORY_TEMPLATE = "# Episodic Memory\n"
-
 
 class MemoryStore:
     def __init__(self, memory_dir=None):
         self.memory_dir = Path(memory_dir) if memory_dir is not None else MEMORY_DIR
         self.core_path = self.memory_dir / CORE_MEMORY_FILE
         self.preference_path = self.memory_dir / PREFERENCE_MEMORY_FILE
-        self.episodic_path = self.memory_dir / EPISODIC_MEMORY_FILE
+        self.episodic_dir = self.memory_dir / EPISODIC_DIR_NAME
+        self.legacy_episodic_path = self.memory_dir / LEGACY_EPISODIC_FILE
+        self.legacy_episodic_migrated_path = self.memory_dir / LEGACY_EPISODIC_MIGRATED_FILE
+        self.history_path = self.memory_dir / HISTORY_FILE
+        self.update_diagnostics_path = self.memory_dir / MEMORY_UPDATE_DIAGNOSTICS_FILE
         self.ensure_files()
 
     def ensure_files(self):
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self.episodic_dir.mkdir(parents=True, exist_ok=True)
         self._create_if_missing(self.core_path, CORE_MEMORY_TEMPLATE)
         self._create_if_missing(self.preference_path, PREFERENCE_MEMORY_TEMPLATE)
+        self._create_if_missing(self.history_path, "")
+        self.write_core_body(self.read_core_body())
         self.write_preference_body(self.read_preference_body())
-        self._ensure_episodic_file()
+        self._ensure_episodic_files()
         self._enforce_core_limit()
 
     def system_prompt_block(self):
@@ -52,18 +61,76 @@ class MemoryStore:
         block = (
             "持久记忆（memory/）：\n" + "\n\n".join(parts) + "\n\n"
             "把这些记忆当作长期上下文，优先遵循偏好记忆。"
-            "情景记忆在 memory/episodic.md；需要回忆具体日期时先检索它。"
+            "情景记忆在 memory/episodes/YYYY-MM-DD.md；需要回忆具体日期时先检索它。"
         )
         return _truncate(block, SYSTEM_MEMORY_MAX_CHARS)
 
     def read_core_body(self):
-        return _memory_text(self._read_text(self.core_path), "Core Memory")
+        return _clean_memory_body(self._read_text(self.core_path))
 
     def read_preference_body(self):
-        return _memory_text(self._read_text(self.preference_path), "Preference Memory")
+        return _clean_memory_body(self._read_text(self.preference_path))
 
     def read_episodic_text(self):
-        return _memory_text(self._read_text(self.episodic_path), "Episodic Memory")
+        blocks = []
+        for path in self._episode_files():
+            date_key = path.stem
+            body = self._episode_body(path)
+            if body:
+                blocks.append(f"## {date_key}\n\n{body}")
+        return "\n\n".join(blocks).strip()
+
+    def episode_path(self, date_text=None, now=None):
+        date_text = date_text or self.today_key(now)
+        if not _valid_date_key(date_text):
+            return None
+        return self.episodic_dir / f"{date_text}.md"
+
+    def append_history(self, role, content, extra=None, now=None):
+        now = now or datetime.now()
+        row = {
+            "ts": now.isoformat(timespec="seconds"),
+            "role": str(role or ""),
+            "content": _json_safe(content),
+        }
+        if isinstance(extra, dict):
+            for key, value in _json_safe(extra).items():
+                if key not in row:
+                    row[key] = value
+        try:
+            with self.history_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+            return True
+        except OSError:
+            return False
+
+    def history_tail(self, limit=20):
+        limit = max(1, int(limit or 20))
+        rows = []
+        try:
+            lines = self.history_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return rows
+        for line in lines[-limit:]:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        return rows
+
+    def history_stats(self):
+        rows = 0
+        try:
+            with self.history_path.open("r", encoding="utf-8") as file:
+                for line in file:
+                    if line.strip():
+                        rows += 1
+        except OSError:
+            rows = 0
+        size = self.history_path.stat().st_size if self.history_path.exists() else 0
+        return {"path": str(self.history_path), "rows": rows, "bytes": size}
 
     def today_key(self, now=None):
         return (now or datetime.now()).strftime("%Y-%m-%d")
@@ -197,35 +264,28 @@ class MemoryStore:
             return False
 
         date_key = self.today_key(now)
-        content = _ensure_memory_title(
-            self._read_text(self.episodic_path),
-            "Episodic Memory",
-        ).rstrip()
-        if not _has_daily_heading(content, date_key):
-            content += f"\n\n## {date_key}\n\n"
-        else:
-            content += "\n\n"
-        content += entry.rstrip() + "\n"
-        self.episodic_path.write_text(content, encoding="utf-8")
+        path = self.episode_path(date_key)
+        if path is None:
+            return False
+        content = self._episode_body(path).rstrip()
+        content = (content + "\n\n" if content else "") + entry.rstrip() + "\n"
+        self._write_text(path, content)
         return True
 
     def _replace_episodic_topic_text(self, heading, entry, now=None):
         now = now or datetime.now()
-        content = _ensure_memory_title(
-            self._read_text(self.episodic_path),
-            "Episodic Memory",
-        )
-        updated = _replace_episodic_topic(
-            content,
-            self.today_key(now),
-            heading,
-            entry,
-        )
+        date_key = self.today_key(now)
+        path = self.episode_path(date_key)
+        if path is None:
+            return None
+        body = self._episode_body(path)
+        updated = _replace_episodic_topic(body, heading, entry)
         if updated is None:
             return None
-        if self._read_text(self.episodic_path) == updated:
+        updated_daily = updated.strip() + "\n"
+        if self._read_text(path) == updated_daily:
             return False
-        self.episodic_path.write_text(updated, encoding="utf-8")
+        self._write_text(path, updated_daily)
         return True
 
     def append_episodic_memory(
@@ -278,7 +338,7 @@ class MemoryStore:
                     "merged": True,
                 }
 
-        heading = f"### {self.time_key(now)} - {title}"
+        heading = f"# {self.time_key(now)} - {title}"
         entry = "\n".join([heading, *bullets]).strip()
         changed = self._append_episodic_memory_text(entry, now=now)
         return {"changed": changed, "heading": heading, "merged": False}
@@ -288,15 +348,16 @@ class MemoryStore:
         if not heading:
             return ""
         date_text = date_text or self.today_key()
-        content = self.read_episodic_text()
-        topic = _find_episodic_topic(content, date_text, heading)
+        path = self.episode_path(date_text)
+        topic = _find_episodic_topic(self._episode_body(path) if path else "", heading)
         return _truncate(topic or "", max_chars) if max_chars else topic or ""
 
     def latest_episodic_topic(self, date_text=None, max_chars=None):
         date_text = date_text or self.today_key()
         latest = ""
-        for date_key, topic in _iter_episodic_entries(self.read_episodic_text()):
-            if date_key == date_text:
+        path = self.episode_path(date_text)
+        if path:
+            for topic in _iter_episode_topics(self._episode_body(path)):
                 latest = topic
         return _truncate(latest, max_chars) if max_chars else latest
 
@@ -312,17 +373,17 @@ class MemoryStore:
     def write_core_body(self, body):
         return self._write_memory_file(
             self.core_path,
-            "Core Memory",
-            body,
+            _normalize_core_body(body),
             CORE_MEMORY_MAX_CHARS,
+            "core",
         )
 
     def write_preference_body(self, body):
         return self._write_memory_file(
             self.preference_path,
-            "Preference Memory",
             _normalize_preference_body(body),
             PREFERENCE_MEMORY_MAX_CHARS,
+            "preferences",
         )
 
     def append_preference_memory(self, memory):
@@ -353,56 +414,179 @@ class MemoryStore:
         self.write_preference_body(updated)
         return True
 
+    def tidy_preference_memory(self):
+        before = self.read_preference_body()
+        after = _normalize_preference_body(before)
+        changed = self.write_preference_body(after)
+        return {"changed": changed, "removed_duplicates": _preference_duplicate_count(before)}
+
+    def remove_preference(self, query):
+        query_key = _preference_match_key(query)
+        if not query_key:
+            return {"changed": False, "removed": []}
+        sections = _preference_sections(self.read_preference_body())
+        removed = []
+        for level, lines in sections.items():
+            kept = []
+            for line in lines:
+                if query_key in _preference_match_key(line):
+                    removed.append(f"{level}: {line}")
+                else:
+                    kept.append(line)
+            sections[level] = kept
+        if not removed:
+            return {"changed": False, "removed": []}
+        return {
+            "changed": self.write_preference_body(_render_preference_sections(sections)),
+            "removed": removed,
+        }
+
+    def set_preference_level(self, query, level):
+        level = _preference_level(level)
+        query_key = _preference_match_key(query)
+        if not level or not query_key:
+            return {"changed": False, "moved": []}
+        sections = _preference_sections(self.read_preference_body())
+        moved = []
+        for current_level, lines in sections.items():
+            kept = []
+            for line in lines:
+                if query_key in _preference_match_key(line):
+                    moved.append(f"{current_level}: {line}")
+                    if current_level == level:
+                        kept.append(line)
+                    elif line not in sections[level]:
+                        sections[level].append(line)
+                else:
+                    kept.append(line)
+            sections[current_level] = kept
+        if not moved:
+            return {"changed": False, "moved": []}
+        return {
+            "changed": self.write_preference_body(_render_preference_sections(sections)),
+            "moved": moved,
+            "level": level,
+        }
+
     def episodic_for_date(self, date_text=None, max_chars=12000):
         date_text = date_text or self.today_key()
-        content = self.read_episodic_text()
-        if not content:
+        if not _valid_date_key(date_text):
             return ""
-
-        pattern = re.compile(
-            rf"(?ms)^##\s+{re.escape(date_text)}\s*$.*?(?=^##\s+\d{{4}}-\d{{2}}-\d{{2}}\s*$|\Z)"
-        )
-        match = pattern.search(content)
-        if not match:
-            return ""
-        return _truncate(match.group(0).strip(), max_chars)
+        path = self.episode_path(date_text)
+        if path and path.exists():
+            body = self._episode_body(path)
+            if not body:
+                return ""
+            return _truncate(body.strip(), max_chars)
+        return ""
 
     def search_episodic(self, query, max_results=8, max_chars=12000):
         query = str(query or "").strip()
         if not query:
             return ""
 
-        lowered_query = query.lower()
         matches = []
-        for date_key, entry in _iter_episodic_entries(self.read_episodic_text()):
-            block = f"## {date_key}\n\n{entry}".strip()
-            if lowered_query in block.lower():
-                matches.append(block)
-            if len(matches) >= max_results:
-                break
+        for order, (date_key, entry) in enumerate(_iter_episodic_entries(self.read_episodic_text())):
+            score, snippet = _episodic_search_score(query, date_key, entry)
+            if score <= 0:
+                continue
+            matches.append(
+                {
+                    "score": score,
+                    "date": date_key,
+                    "entry": entry,
+                    "snippet": snippet,
+                    "order": order,
+                }
+            )
 
-        return _truncate("\n\n".join(matches), max_chars)
+        matches.sort(
+            key=lambda item: (
+                item["score"],
+                _date_sort_key(item["date"]),
+                item["order"],
+            ),
+            reverse=True,
+        )
+
+        rendered = []
+        for item in matches[:max_results]:
+            block = f"## {item['date']}\n\n{item['entry']}".strip()
+            if item["snippet"]:
+                block += f"\n\nMatch: {item['snippet']}"
+            block += f"\n\nScore: {item['score']}"
+            rendered.append(block)
+
+        return _truncate("\n\n".join(rendered), max_chars)
 
     def paths_summary(self):
         return (
             f"memory directory: {self.memory_dir}\n"
             f"core: {self.core_path}\n"
             f"preferences: {self.preference_path}\n"
-            f"episodic: {self.episodic_path}"
+            f"episodes: {self.episodic_dir}\n"
+            f"history: {self.history_path}\n"
+            f"diagnostics: {self.update_diagnostics_path}"
         )
 
     def _create_if_missing(self, path, content):
         if not path.exists():
             path.write_text(content, encoding="utf-8")
 
-    def _ensure_episodic_file(self):
-        if not self.episodic_path.exists():
-            self.episodic_path.write_text(EPISODIC_MEMORY_TEMPLATE, encoding="utf-8")
+    def _episode_files(self):
+        if not self.episodic_dir.exists():
+            return []
+        return sorted(
+            path
+            for path in self.episodic_dir.glob("*.md")
+            if _valid_date_key(path.stem)
+        )
+
+    def _episode_body(self, path):
+        return _normalize_episode_body(self._read_text(path))
+
+    def _ensure_episodic_files(self):
+        self.episodic_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_episodic_file()
+        self._delete_legacy_episodic_migrated_file()
+        for path in self._episode_files():
+            raw = self._read_text(path)
+            normalized = _normalize_episode_body(raw)
+            normalized_file = normalized + ("\n" if normalized else "")
+            if raw != normalized_file:
+                self._write_text(path, normalized_file)
+
+    def _migrate_legacy_episodic_file(self):
+        if not self.legacy_episodic_path.exists():
             return
 
-        content = self._read_text(self.episodic_path).strip()
-        if not content:
-            self.episodic_path.write_text(EPISODIC_MEMORY_TEMPLATE, encoding="utf-8")
+        legacy_text = self._read_text(self.legacy_episodic_path)
+        migrated = False
+        for date_key, body in _iter_legacy_episodic_date_blocks(legacy_text):
+            normalized = _normalize_episode_body(body)
+            if not normalized:
+                continue
+            path = self.episode_path(date_key)
+            if path is None:
+                continue
+            existing = _normalize_episode_body(self._read_text(path))
+            merged = _merge_episode_bodies(existing, normalized)
+            self._write_text(path, merged + ("\n" if merged else ""))
+            migrated = True
+
+        if migrated or not legacy_text.strip():
+            try:
+                self.legacy_episodic_path.unlink()
+            except OSError:
+                pass
+
+    def _delete_legacy_episodic_migrated_file(self):
+        if not self.legacy_episodic_migrated_path.exists():
+            return
+        try:
+            self.legacy_episodic_migrated_path.unlink()
+        except OSError:
+            pass
 
     def _read_text(self, path):
         try:
@@ -410,25 +594,56 @@ class MemoryStore:
         except OSError:
             return ""
 
-    def _write_memory_file(self, path, title, body, max_chars):
-        body = _memory_text(_clean_model_field(body), title)
-        header = f"# {title}\n"
-        allowance = max(0, max_chars - len(header) - 1)
+    def _write_text(self, path, content):
+        path = Path(path)
+        existing = self._read_text(path)
+        if existing == content:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return True
+
+    def _write_memory_file(self, path, body, max_chars, reason_name):
+        body = _clean_memory_body(_clean_model_field(body))
+        allowance = max(0, max_chars - 1)
         body = _truncate(body, allowance).strip()
-        updated = header + ("\n" + body + "\n" if body else "")
+        updated = body + ("\n" if body else "")
         if len(updated) >= max_chars:
-            body = body[: max(0, max_chars - len(header) - 1)].rstrip()
-            updated = header + ("\n" + body + "\n" if body else "")
+            body = body[: max(0, max_chars - 1)].rstrip()
+            updated = body + ("\n" if body else "")
         if self._read_text(path) == updated:
             return False
-        path.write_text(updated, encoding="utf-8")
-        return True
+        return self._write_text(path, updated)
 
     def _enforce_core_limit(self):
         content = self._read_text(self.core_path)
         if len(content) < CORE_MEMORY_MAX_CHARS:
             return
         self.write_core_body(self.read_core_body())
+
+    def record_update_diagnostic(
+        self,
+        source,
+        raw_response,
+        error,
+        repair_response=None,
+        now=None,
+    ):
+        now = now or datetime.now()
+        payload = {
+            "ts": now.isoformat(timespec="seconds"),
+            "source": str(source or ""),
+            "error": str(error or ""),
+            "raw_response": _truncate(str(raw_response or ""), 4000),
+        }
+        if repair_response is not None:
+            payload["repair_response"] = _truncate(str(repair_response or ""), 4000)
+        try:
+            with self.update_diagnostics_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            return True
+        except OSError:
+            return False
 
 
 def parse_memory_update_response(text):
@@ -450,62 +665,57 @@ def parse_memory_update_response(text):
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _memory_text(content, title):
-    content = _strip_comments(content).strip()
-    lines = content.splitlines()
-    while lines:
-        first_line = lines[0].strip()
-        if not first_line:
-            lines = lines[1:]
-            continue
-        if _is_memory_title_line(first_line, title):
-            lines = lines[1:]
-            continue
-        break
-    return "\n".join(lines).strip()
+def _clean_memory_body(content):
+    lines = _strip_comments(content).strip().splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and _is_memory_wrapper_heading(lines[0]):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(line.rstrip() for line in lines).strip()
 
 
-def _is_memory_title_line(line, title):
-    line = str(line or "").strip()
-    if line.lower() == str(title or "").strip().lower():
+def _is_memory_wrapper_heading(line):
+    heading = _heading_text(line).lower()
+    if heading in {"core memory", "preference memory", "episodic memory"}:
         return True
-    match = re.fullmatch(r"#{1,6}\s+(.+)", line)
-    return bool(match and match.group(1).strip().lower() == title.lower())
+    return re.fullmatch(r"\d{4}-\d{2}-\d{2}\s+episodic memory", heading) is not None
 
 
-def _ensure_memory_title(content, title):
-    content = str(content or "").strip()
-    header = f"# {title}"
-    if not content:
-        return header
-    lines = content.splitlines()
-    if lines and lines[0].strip().lower() == header.lower():
-        return content
-    return f"{header}\n\n{content}"
+def _heading_text(line):
+    match = re.fullmatch(r"#{1,6}\s+(.+)", str(line or "").strip())
+    return match.group(1).strip() if match else ""
 
 
 def _normalize_preference_body(body):
-    body = _memory_text(_clean_model_field(body), "Preference Memory")
+    body = _clean_memory_body(_clean_model_field(body))
     existing = _preference_sections(body)
-    stray_lines = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("## "):
-            continue
-        if any(stripped in lines for lines in existing.values()):
-            continue
-        stray_lines.append(stripped)
 
     sections = []
+    seen = set()
     for level in PREFERENCE_IMPORTANCE_LEVELS:
-        lines = list(existing.get(level, []))
-        if level == "Medium" and stray_lines:
-            lines.extend(stray_lines)
-        sections.append(f"## {level}")
+        lines = []
+        for line in existing.get(level, []):
+            key = _preference_match_key(line)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            lines.append(line)
+        sections.append(f"# {level}")
         if lines:
             sections.extend(lines)
         sections.append("")
     return "\n".join(sections).strip()
+
+
+def _normalize_core_body(body):
+    body = _clean_memory_body(_clean_model_field(body))
+    preamble, sections = _markdown_sections(body)
+    if not sections:
+        return "\n".join(line.rstrip() for line in preamble).strip()
+    return _render_markdown_sections(preamble, sections)
 
 
 def _preference_sections(body):
@@ -513,9 +723,9 @@ def _preference_sections(body):
     current_level = None
     for line in str(body or "").splitlines():
         stripped = line.strip()
-        heading = re.fullmatch(r"##\s+(.+)", stripped)
-        if heading:
-            candidate = heading.group(1).strip()
+        if re.match(r"^#{1,6}\s+", stripped):
+            heading = re.fullmatch(r"#{1,6}\s+(.+)", stripped)
+            candidate = heading.group(1).strip() if heading else ""
             current_level = candidate if candidate in sections else None
             continue
         if current_level and stripped:
@@ -531,7 +741,7 @@ def _append_preference_signal(body, line, level="Medium"):
 
     parts = []
     for importance in PREFERENCE_IMPORTANCE_LEVELS:
-        parts.append(f"## {importance}")
+        parts.append(f"# {importance}")
         parts.extend(sections.get(importance, []))
         parts.append("")
     return "\n".join(parts).strip()
@@ -583,7 +793,7 @@ def _format_episodic_memory_entry(
     )
     if not title or not bullets:
         return ""
-    return "\n".join([f"### {time_key} - {title}", *bullets]).strip()
+    return "\n".join([f"# {time_key} - {title}", *bullets]).strip()
 
 
 def _episodic_memory_parts(
@@ -605,8 +815,61 @@ def _episodic_memory_parts(
     return title, bullets
 
 
+def _normalize_episode_body(body):
+    lines = []
+    for line in _clean_memory_body(body).splitlines():
+        stripped = line.strip()
+        if _legacy_episodic_date_key(stripped):
+            continue
+        topic = re.fullmatch(r"#{1,6}\s+(\d{2}:\d{2}\s*-\s*.+)", stripped)
+        if topic:
+            lines.append(f"# {topic.group(1).strip()}")
+        else:
+            lines.append(line.rstrip())
+    return "\n".join(lines).strip()
+
+
+def _merge_episode_bodies(existing, incoming):
+    existing = _normalize_episode_body(existing)
+    incoming = _normalize_episode_body(incoming)
+    if not existing:
+        return incoming
+    if not incoming or incoming in existing:
+        return existing
+    return f"{existing.rstrip()}\n\n{incoming.strip()}"
+
+
+def _iter_legacy_episodic_date_blocks(content):
+    current_date = None
+    current_lines = []
+    for line in _clean_memory_body(content).splitlines():
+        date_key = _legacy_episodic_date_key(line)
+        if date_key:
+            if current_date:
+                yield current_date, "\n".join(current_lines).strip()
+            current_date = date_key
+            current_lines = []
+            continue
+        if current_date:
+            current_lines.append(line.rstrip())
+    if current_date:
+        yield current_date, "\n".join(current_lines).strip()
+
+
+def _legacy_episodic_date_key(line):
+    match = re.fullmatch(
+        r"#{1,6}\s+(\d{4}-\d{2}-\d{2})(?:\s+Episodic Memory)?\s*",
+        str(line or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    date_key = match.group(1)
+    return date_key if _valid_date_key(date_key) else ""
+
+
 def _episodic_heading_title(heading):
-    match = re.fullmatch(r"###\s+\d{2}:\d{2}\s*-\s*(.+)", str(heading or "").strip())
+    match = re.fullmatch(r"#{1,6}\s+\d{2}:\d{2}\s*-\s*(.+)", str(heading or "").strip())
     if not match:
         return ""
     return match.group(1).strip()
@@ -616,26 +879,18 @@ def _same_memory_title(left, right):
     return _clean_structured_title(left).lower() == _clean_structured_title(right).lower()
 
 
-def _find_episodic_topic(content, date_key, heading):
-    lines = _ensure_memory_title(content, "Episodic Memory").splitlines()
-    bounds = _episodic_date_bounds(lines, date_key)
-    if bounds is None:
-        return ""
-    start, end = bounds
-    topic_bounds = _episodic_topic_bounds(lines, start, end, heading)
+def _find_episodic_topic(content, heading):
+    lines = _normalize_episode_body(content).splitlines()
+    topic_bounds = _episodic_topic_bounds(lines, 0, len(lines), heading)
     if topic_bounds is None:
         return ""
     topic_start, topic_end = topic_bounds
     return "\n".join(lines[topic_start:topic_end]).strip()
 
 
-def _replace_episodic_topic(content, date_key, heading, entry):
-    lines = _ensure_memory_title(content, "Episodic Memory").splitlines()
-    bounds = _episodic_date_bounds(lines, date_key)
-    if bounds is None:
-        return None
-    start, end = bounds
-    topic_bounds = _episodic_topic_bounds(lines, start, end, heading)
+def _replace_episodic_topic(content, heading, entry):
+    lines = _normalize_episode_body(content).splitlines()
+    topic_bounds = _episodic_topic_bounds(lines, 0, len(lines), heading)
     if topic_bounds is None:
         return None
 
@@ -645,23 +900,6 @@ def _replace_episodic_topic(content, date_key, heading, entry):
         replacement.append("")
     updated_lines = lines[:topic_start] + replacement + lines[topic_end:]
     return "\n".join(updated_lines).rstrip() + "\n"
-
-
-def _episodic_date_bounds(lines, date_key):
-    start = None
-    for index, line in enumerate(lines):
-        if re.fullmatch(rf"##\s+{re.escape(date_key)}\s*", line.strip()):
-            start = index + 1
-            break
-    if start is None:
-        return None
-
-    end = len(lines)
-    for index in range(start, len(lines)):
-        if re.fullmatch(r"##\s+\d{4}-\d{2}-\d{2}\s*", lines[index].strip()):
-            end = index
-            break
-    return start, end
 
 
 def _episodic_topic_bounds(lines, start, end, heading):
@@ -676,7 +914,7 @@ def _episodic_topic_bounds(lines, start, end, heading):
 
     topic_end = end
     for index in range(topic_start + 1, end):
-        if re.match(r"^###\s+", lines[index].strip()):
+        if re.match(r"^#{1,6}\s+", lines[index].strip()):
             topic_end = index
             break
     while topic_end > topic_start and not lines[topic_end - 1].strip():
@@ -812,11 +1050,15 @@ def _markdown_sections(body):
     preamble = []
     sections = []
     current = None
-    for line in _memory_text(body, "Core Memory").splitlines():
-        heading = re.fullmatch(r"##\s+(.+)", line.strip())
-        if heading:
-            current = {"title": heading.group(1).strip(), "lines": []}
-            sections.append(current)
+    for line in _clean_memory_body(body).splitlines():
+        stripped = line.strip()
+        if re.match(r"^#{1,6}\s+", stripped):
+            heading = re.fullmatch(r"#{1,6}\s+(.+)", stripped)
+            if heading:
+                current = {"title": heading.group(1).strip(), "lines": []}
+                sections.append(current)
+            else:
+                current = None
             continue
         if current is None:
             preamble.append(line.rstrip())
@@ -839,7 +1081,7 @@ def _render_markdown_sections(preamble, sections):
         section_lines = [line.rstrip() for line in section["lines"] if line.strip()]
         if lines:
             lines.append("")
-        lines.append(f"## {section['title']}")
+        lines.append(f"# {section['title']}")
         lines.extend(section_lines)
     return "\n".join(lines).strip()
 
@@ -855,7 +1097,7 @@ def _preference_level(title):
 def _render_preference_sections(sections):
     parts = []
     for importance in PREFERENCE_IMPORTANCE_LEVELS:
-        parts.append(f"## {importance}")
+        parts.append(f"# {importance}")
         parts.extend(sections.get(importance, []))
         parts.append("")
     return "\n".join(parts).strip()
@@ -876,8 +1118,148 @@ def _shorten_inline(text, max_chars):
     return text[:max_chars].rstrip("，。,.；;、 ") + "..."
 
 
-def _has_daily_heading(content, date_key):
-    return re.search(rf"(?m)^##\s+{re.escape(date_key)}\s*$", content or "") is not None
+def _valid_date_key(value):
+    return re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value or "").strip()) is not None
+
+
+def _is_episodic_topic_heading(line):
+    return re.match(r"^#{1,6}\s+\d{2}:\d{2}\s*-\s+", str(line or "").strip()) is not None
+
+
+def _json_safe(value):
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if hasattr(value, "model_dump"):
+        return _json_safe(value.model_dump())
+    if hasattr(value, "__dict__"):
+        return {
+            str(key): _json_safe(item)
+            for key, item in value.__dict__.items()
+            if not str(key).startswith("_")
+        }
+    return str(value)
+
+
+def _preference_match_key(text):
+    text = _strip_bullet_marker(str(text or ""))
+    text = re.sub(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _preference_duplicate_count(body):
+    seen = set()
+    duplicates = 0
+    for lines in _preference_sections(body).values():
+        for line in lines:
+            key = _preference_match_key(line)
+            if not key:
+                continue
+            if key in seen:
+                duplicates += 1
+            else:
+                seen.add(key)
+    return duplicates
+
+
+def _episodic_search_score(query, date_key, entry):
+    lowered_query = query.lower()
+    lowered_entry = entry.lower()
+    heading = entry.splitlines()[0] if entry else ""
+    title = _episodic_heading_title(heading) or heading
+    lowered_title = title.lower()
+    terms = _search_terms(query)
+    score = 0
+
+    if lowered_query and lowered_query in lowered_title:
+        score += 14
+    if lowered_query and lowered_query in lowered_entry:
+        score += 8
+    if lowered_query and lowered_query in date_key:
+        score += 10
+
+    entry_terms = _search_terms(entry)
+    title_terms = _search_terms(title)
+    for term in terms:
+        if term in title_terms:
+            score += 5
+        if term in entry_terms:
+            score += 2
+        elif len(term) >= 2 and term in lowered_entry:
+            score += 1
+
+    if score <= 0:
+        return 0, ""
+    score += min(3, max(0, _date_sort_key(date_key) - 730000) // 365)
+    return score, _search_snippet(entry, [lowered_query, *terms])
+
+
+def _search_terms(text):
+    text = str(text or "").lower()
+    terms = set(re.findall(r"[a-z0-9_+-]{2,}", text))
+    for chunk in re.findall(r"[\u4e00-\u9fff]+", text):
+        if len(chunk) <= 4:
+            terms.add(chunk)
+        for size in (2, 3):
+            if len(chunk) >= size:
+                for index in range(0, len(chunk) - size + 1):
+                    terms.add(chunk[index : index + size])
+    return {term for term in terms if term.strip()}
+
+
+def _search_snippet(text, terms, radius=80):
+    text = str(text or "").strip()
+    lowered = text.lower()
+    best_index = -1
+    best_term = ""
+    for term in terms:
+        term = str(term or "").lower().strip()
+        if not term:
+            continue
+        index = lowered.find(term)
+        if index >= 0 and (best_index < 0 or index < best_index):
+            best_index = index
+            best_term = term
+    if best_index < 0:
+        return ""
+    start = max(0, best_index - radius)
+    end = min(len(text), best_index + len(best_term) + radius)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + " ".join(text[start:end].split()) + suffix
+
+
+def _date_sort_key(date_key):
+    try:
+        return datetime.strptime(str(date_key), "%Y-%m-%d").toordinal()
+    except ValueError:
+        return 0
+
+
+def _iter_episode_topics(content):
+    current_entry = []
+    for line in str(content or "").splitlines():
+        if _is_episodic_topic_heading(line):
+            if current_entry:
+                yield "\n".join(current_entry).strip()
+            current_entry = [line]
+            continue
+        if re.match(r"^#{1,6}\s+", line.strip()):
+            if current_entry:
+                yield "\n".join(current_entry).strip()
+            current_entry = []
+            continue
+        if current_entry:
+            current_entry.append(line)
+    if current_entry:
+        yield "\n".join(current_entry).strip()
 
 
 def _extract_preference_signal(user_message):
@@ -919,10 +1301,16 @@ def _iter_episodic_entries(content):
             current_entry = []
             continue
 
-        if current_date and re.match(r"^###\s+", line):
+        if current_date and _is_episodic_topic_heading(line):
             if current_entry:
                 yield current_date, "\n".join(current_entry).strip()
             current_entry = [line]
+            continue
+
+        if current_date and re.match(r"^#{1,6}\s+", line.strip()):
+            if current_entry:
+                yield current_date, "\n".join(current_entry).strip()
+            current_entry = []
             continue
 
         if current_date and current_entry:

@@ -413,6 +413,8 @@ class LLMChat:
                 self._restore_history(original_history)
             elif self.agent_mode:
                 self._compact_agent_history(user_message_index, response)
+            if response and not response.get("agent_stopped"):
+                self._record_hot_history(user_message, response)
             return response
 
         except KeyboardInterrupt:
@@ -1197,7 +1199,13 @@ class LLMChat:
         try:
             prompt = self.memory_store.build_update_prompt(compacted_messages, summary)
             raw_update = self._create_memory_update(prompt, compact_model)
-            update = parse_memory_update_response(raw_update)
+            update = self._parse_memory_update_with_repair(
+                raw_update,
+                prompt,
+                compact_model,
+                source="compaction",
+                expected="core_memory/preference_memory",
+            )
             if not update:
                 return {
                     "changed": [],
@@ -1242,7 +1250,13 @@ class LLMChat:
                 )
                 compact_model = self.compaction_compact_model or self.model
                 raw_update = self._create_memory_update(prompt, compact_model)
-                update = parse_memory_update_response(raw_update)
+                update = self._parse_memory_update_with_repair(
+                    raw_update,
+                    prompt,
+                    compact_model,
+                    source="session_episodic",
+                    expected="episodic_memory",
+                )
                 episodic_memory = ""
                 if isinstance(update, dict):
                     episodic_memory = update.get("episodic_memory")
@@ -1296,6 +1310,56 @@ class LLMChat:
             return []
 
         return self.conversation_history[start_index : last_assistant_index + 1]
+
+    def _parse_memory_update_with_repair(
+        self,
+        raw_update,
+        original_prompt,
+        compact_model,
+        source,
+        expected,
+    ):
+        update = parse_memory_update_response(raw_update)
+        if update:
+            return update
+
+        repair_prompt = (
+            "The previous memory update response was not valid JSON. "
+            "Return only one valid JSON object. Do not include Markdown fences, comments, or explanation.\n"
+            f"Expected top-level content: {expected}.\n\n"
+            "Original instructions:\n"
+            f"{str(original_prompt or '')[:8000]}\n\n"
+            "Invalid response:\n"
+            f"{str(raw_update or '')[:12000]}"
+        )
+        repair_response = ""
+        try:
+            repair_response = self._create_memory_update(repair_prompt, compact_model)
+            repaired = parse_memory_update_response(repair_response)
+            if repaired:
+                self.memory_store.record_update_diagnostic(
+                    source,
+                    raw_update,
+                    "repaired invalid JSON response",
+                    repair_response=repair_response,
+                )
+                return repaired
+        except Exception as error:
+            self.memory_store.record_update_diagnostic(
+                source,
+                raw_update,
+                f"repair failed: {error}",
+                repair_response=repair_response,
+            )
+            return {}
+
+        self.memory_store.record_update_diagnostic(
+            source,
+            raw_update,
+            "memory update model returned no parseable JSON",
+            repair_response=repair_response,
+        )
+        return {}
 
     def _create_memory_update(self, prompt, compact_model):
         system_prompt = _with_persistent_memory(
@@ -1357,6 +1421,22 @@ class LLMChat:
             self.memory_store.record_preference_signal(user_message)
         except Exception as error:
             print_warn(f"Failed to record preference memory: {error}")
+
+    def _record_hot_history(self, user_message, response):
+        try:
+            extra = {
+                "model": self.model,
+                "api_type": self.api_type,
+                "agent_mode": self.agent_mode,
+            }
+            self.memory_store.append_history("user", user_message, extra=extra)
+            self.memory_store.append_history(
+                "assistant",
+                response.get("response", "") if isinstance(response, dict) else "",
+                extra=extra,
+            )
+        except Exception as error:
+            print_warn(f"Failed to record hot history: {error}")
 
     def _compaction_prompt(self, existing_summary, source_messages):
         existing_summary = str(existing_summary or "").strip()

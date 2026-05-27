@@ -252,7 +252,8 @@ def handle_memory(chat, args):
             "Persistent memory files:\n"
             f"{store.paths_summary()}\n\n"
             "Usage: /memory core | /memory prefs | /memory today | "
-            "/memory date YYYY-MM-DD | /memory search <query>"
+            "/memory date YYYY-MM-DD | /memory search <query> | "
+            "/memory history"
         )
         _print_memory_section("Core memory", store.read_core_body())
         _print_memory_section("Preference memory", store.read_preference_body())
@@ -266,6 +267,8 @@ def handle_memory(chat, args):
         return True
 
     if action in {"prefs", "preferences", "preference"}:
+        if value:
+            return _handle_preference_memory_command(store, value)
         _print_memory_section("Preference memory", store.read_preference_body())
         return True
 
@@ -287,13 +290,81 @@ def handle_memory(chat, args):
         _print_memory_section(f"Episodic memory search: {value}", store.search_episodic(value))
         return True
 
+    if action == "history":
+        stats = store.history_stats()
+        rows = store.history_tail(limit=10)
+        lines = [
+            f"path: {stats.get('path')}",
+            f"rows: {stats.get('rows')}",
+            f"bytes: {stats.get('bytes')}",
+        ]
+        for row in rows:
+            role = row.get("role", "")
+            ts = row.get("ts", "")
+            content = str(row.get("content", "")).replace("\n", " ")
+            if len(content) > 160:
+                content = content[:157].rstrip() + "..."
+            lines.append(f"- {ts} {role}: {content}")
+        _print_memory_section("Hot history", "\n".join(lines))
+        return True
+
     if action in {"path", "paths"}:
         print_info(store.paths_summary())
         return True
 
     print_error(
         "Usage: /memory core | /memory prefs | /memory today | "
-        "/memory date YYYY-MM-DD | /memory search <query> | /memory path"
+        "/memory date YYYY-MM-DD | /memory search <query> | "
+        "/memory history | /memory path"
+    )
+    return True
+
+
+def _handle_preference_memory_command(store, value):
+    parts = value.strip().split(maxsplit=2)
+    action = parts[0].lower() if parts else ""
+
+    if action in {"tidy", "clean", "dedupe"} and len(parts) == 1:
+        result = store.tidy_preference_memory()
+        if result.get("changed"):
+            print_success(
+                "Preference memory tidied"
+                f" ({result.get('removed_duplicates', 0)} duplicate candidates found)."
+            )
+        else:
+            print_info("Preference memory already looks tidy.")
+        return True
+
+    if action in {"remove", "delete"}:
+        if len(parts) < 2:
+            print_error("Usage: /memory prefs remove <text>")
+            return True
+        query = value.split(maxsplit=1)[1]
+        result = store.remove_preference(query)
+        removed = result.get("removed") or []
+        if removed:
+            print_success("Removed preference lines:\n" + "\n".join(removed))
+        else:
+            print_info("No matching preference lines found.")
+        return True
+
+    if action in {"level", "move", "set-level"}:
+        if len(parts) != 3:
+            print_error("Usage: /memory prefs level Critical|High|Medium|Low <text>")
+            return True
+        level = parts[1]
+        query = parts[2]
+        result = store.set_preference_level(query, level)
+        moved = result.get("moved") or []
+        if moved:
+            print_success(f"Moved preference to {result.get('level')}:\n" + "\n".join(moved))
+        else:
+            print_info("No matching preference lines found, or the level was invalid.")
+        return True
+
+    print_error(
+        "Usage: /memory prefs | /memory prefs tidy | "
+        "/memory prefs remove <text> | /memory prefs level Critical|High|Medium|Low <text>"
     )
     return True
 
