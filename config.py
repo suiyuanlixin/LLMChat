@@ -154,36 +154,7 @@ def _normalize_base_url(api_type, base_url):
 
 
 def _default_config():
-    return {
-        "api_type": DEFAULT_API_TYPE,
-        "base_url": DEFAULT_BASE_URL,
-        "model": DEFAULT_MODEL,
-        "api_key": "",
-        "max_tokens": DEFAULT_MAX_TOKENS,
-        "temperature": DEFAULT_TEMPERATURE,
-        "stream_mode": DEFAULT_STREAM_MODE,
-        "thinking_mode": DEFAULT_THINKING_MODE,
-        "agent_mode": DEFAULT_AGENT_MODE,
-        "max_agent_rounds": DEFAULT_MAX_AGENT_ROUNDS,
-        "max_agent_tool_calls": DEFAULT_MAX_AGENT_TOOL_CALLS,
-        "agent_approval_mode": DEFAULT_AGENT_APPROVAL_MODE,
-        "agent_show_thinking": DEFAULT_AGENT_SHOW_THINKING,
-        "agent_summary_model": DEFAULT_AGENT_SUMMARY_MODEL,
-        "auto_compact": {
-            "enable": DEFAULT_COMPACTION_ENABLE,
-            "max_chars": DEFAULT_COMPACTION_MAX_CHARS,
-            "keep_recent_messages": DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
-            "compact_model": DEFAULT_COMPACTION_COMPACT_MODEL,
-        },
-        "web_search": {
-            "enable": DEFAULT_WEB_SEARCH_ENABLE,
-            "provider": DEFAULT_WEB_SEARCH_PROVIDER,
-            "api_key": "",
-            "max_results": DEFAULT_WEB_SEARCH_MAX_RESULTS,
-            "search_depth": DEFAULT_WEB_SEARCH_DEPTH,
-            "topic": DEFAULT_WEB_SEARCH_TOPIC,
-        },
-    }
+    return AppConfig().to_dict()
 
 
 def _parse_positive_integer(value, label):
@@ -304,107 +275,18 @@ def _parse_bool(value, default):
 
 
 def _extract_agent_config(config):
-    raw_agent_config = config.get("agent_mode", DEFAULT_AGENT_MODE)
-    if isinstance(raw_agent_config, dict):
-        agent_config = dict(raw_agent_config)
-    else:
-        agent_config = {"enable": raw_agent_config}
-
-    aliases = {
-        "enabled": "enable",
-        "max_agent_rounds": "max_rounds",
-        "max_agent_tool_calls": "max_tool_calls",
-        "agent_approval_mode": "approve",
-        "approval_mode": "approve",
-        "approval": "approve",
-        "agent_show_thinking": "show_thinking",
-        "agent_summary_model": "summary_model",
-        "thinking_summary_model": "summary_model",
-    }
-    for source, target in aliases.items():
-        if target not in agent_config and source in agent_config:
-            agent_config[target] = agent_config[source]
-
-    flat_aliases = {
-        "max_agent_rounds": "max_rounds",
-        "max_agent_tool_calls": "max_tool_calls",
-        "agent_approval_mode": "approve",
-        "agent_show_thinking": "show_thinking",
-        "agent_summary_model": "summary_model",
-        "thinking_summary_model": "summary_model",
-    }
-    for source, target in flat_aliases.items():
-        if target not in agent_config and source in config:
-            agent_config[target] = config[source]
-
-    return agent_config
+    raw_agent_config = config.get("agent_mode", {})
+    return dict(raw_agent_config) if isinstance(raw_agent_config, dict) else {}
 
 
 def _extract_compaction_config(config):
     raw_compaction_config = config.get("auto_compact", {})
-    if isinstance(raw_compaction_config, dict):
-        compaction_config = dict(raw_compaction_config)
-    else:
-        compaction_config = {"enable": raw_compaction_config}
-
-    aliases = {
-        "enabled": "enable",
-        "max_context_chars": "max_chars",
-        "context_max_chars": "max_chars",
-        "keep_recent": "keep_recent_messages",
-        "recent_messages": "keep_recent_messages",
-        "auto_compact_model": "compact_model",
-    }
-    for source, target in aliases.items():
-        if target not in compaction_config and source in compaction_config:
-            compaction_config[target] = compaction_config[source]
-
-    flat_aliases = {
-        "auto_compact_enable": "enable",
-        "auto_compact_max_chars": "max_chars",
-        "auto_compact_keep_recent_messages": "keep_recent_messages",
-        "auto_compact_compact_model": "compact_model",
-    }
-    for source, target in flat_aliases.items():
-        if target not in compaction_config and source in config:
-            compaction_config[target] = config[source]
-
-    return compaction_config
+    return dict(raw_compaction_config) if isinstance(raw_compaction_config, dict) else {}
 
 
 def _extract_web_search_config(config):
     raw_web_search_config = config.get("web_search", {})
-    if isinstance(raw_web_search_config, dict):
-        web_search_config = dict(raw_web_search_config)
-    else:
-        web_search_config = {"enable": raw_web_search_config}
-
-    aliases = {
-        "enabled": "enable",
-        "apiKey": "api_key",
-        "key": "api_key",
-        "max": "max_results",
-        "results": "max_results",
-        "depth": "search_depth",
-        "searchDepth": "search_depth",
-    }
-    for source, target in aliases.items():
-        if target not in web_search_config and source in web_search_config:
-            web_search_config[target] = web_search_config[source]
-
-    flat_aliases = {
-        "web_search_enable": "enable",
-        "web_search_provider": "provider",
-        "web_search_api_key": "api_key",
-        "web_search_max_results": "max_results",
-        "web_search_depth": "search_depth",
-        "web_search_topic": "topic",
-    }
-    for source, target in flat_aliases.items():
-        if target not in web_search_config and source in config:
-            web_search_config[target] = config[source]
-
-    return web_search_config
+    return dict(raw_web_search_config) if isinstance(raw_web_search_config, dict) else {}
 
 
 def _sanitize_config(config):
@@ -731,12 +613,13 @@ def save_config_field(key, value):
 
 
 def save_config_fields(fields):
-    config = _load_existing_config().to_flat_dict()
+    config = _load_existing_config()
+    values = config.to_flat_dict()
     for key in fields:
-        if key not in config:
+        if key not in values:
             raise ValueError(f"Unknown config key: {key}")
-    config.update(fields)
-    _persist_config(_sanitize_config(config))
+    values.update(fields)
+    _persist_config(_sanitize_config(AppConfig(**values).to_dict()))
 
 
 def _load_existing_config():

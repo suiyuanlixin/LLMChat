@@ -190,18 +190,33 @@ class MemoryStore:
             completed_messages = "(No completed messages.)"
 
         if current_entry:
-            intro = "一轮完整对话刚结束。请更新当前会话的情景记忆。\n"
-            topic_rules = (
-                "same_topic 表示本轮是否仍属于当前话题；当前情景记忆为空时必须是 false。\n"
-                "如果本轮和当前情景记忆是同一话题，same_topic 必须是 true；title 会被程序忽略，旧标题会保留。\n"
-                "same_topic=true 时，当前情景记忆是必须尊重的基底，不要让结果只偏向最近一轮；早先已经记录的重要信息和本轮新信息权重相同。\n"
-                "same_topic=true 时，content 返回替换旧正文的完整要点；只有在新内容能纠正、补充、合并或压缩旧内容时才改写旧要点，不要无故删除旧要点表达的事实、意图或感受。\n"
-                "如果本轮明显换了话题，same_topic 必须是 false，title 写新话题短标题，content 只写新话题当前记忆。\n"
-                "不要为了措辞更顺而改 title；只有 same_topic=false 时才生成新 title。\n"
-                "same_topic=true 时，不要把本轮内容机械追加成新要点；请结合旧 content 和本轮对话，去重、合并相近细节，重写为少数更综合的要点。\n"
-                "如果旧记忆已经足够概括，本轮只是展开细节，就保留旧表达或只做轻微补充；不要列出技术清单、流程清单或逐轮对话清单。\n"
-                "content 应自然简短，通常一两条综合要点就够；不要为了完整而拆成很多条，但也不要硬凑固定条数。\n"
+            initial_entry_locked = self._is_initial_episodic_heading(
+                current_heading,
+                now=now,
             )
+            intro = "一轮完整对话刚结束。请更新当前会话的情景记忆。\n"
+            if initial_entry_locked:
+                topic_rules = (
+                    "same_topic 表示本轮是否仍属于当前话题；当前情景记忆为空时必须是 false。\n"
+                    "当前情景记忆是第一次见面的初始记忆，不能修改、重写、合并、复述或删除。\n"
+                    "如果本轮和初始记忆是同一话题，same_topic 必须是 true；title 会被程序忽略，旧标题会保留。\n"
+                    "same_topic=true 时，content 只写本轮需要新增的记忆；程序会在同标题下新开条目，不会覆盖初始记忆。\n"
+                    "如果本轮明显换了话题，same_topic 必须是 false，title 写新话题短标题，content 只写新话题当前记忆。\n"
+                    "不要为了措辞更顺而改 title；只有 same_topic=false 时才生成新 title。\n"
+                    "content 应自然简短，通常一条要点就够；不要为了完整而拆成很多条，但也不要硬凑固定条数。\n"
+                )
+            else:
+                topic_rules = (
+                    "same_topic 表示本轮是否仍属于当前话题；当前情景记忆为空时必须是 false。\n"
+                    "如果本轮和当前情景记忆是同一话题，same_topic 必须是 true；title 会被程序忽略，旧标题会保留。\n"
+                    "same_topic=true 时，当前情景记忆是必须尊重的基底，不要让结果只偏向最近一轮；早先已经记录的重要信息和本轮新信息权重相同。\n"
+                    "same_topic=true 时，content 返回替换旧正文的完整要点；只有在新内容能纠正、补充、合并或压缩旧内容时才改写旧要点，不要无故删除旧要点表达的事实、意图或感受。\n"
+                    "如果本轮明显换了话题，same_topic 必须是 false，title 写新话题短标题，content 只写新话题当前记忆。\n"
+                    "不要为了措辞更顺而改 title；只有 same_topic=false 时才生成新 title。\n"
+                    "same_topic=true 时，不要把本轮内容机械追加成新要点；请结合旧 content 和本轮对话，去重、合并相近细节，重写为少数更综合的要点。\n"
+                    "如果旧记忆已经足够概括，本轮只是展开细节，就保留旧表达或只做轻微补充；不要列出技术清单、流程清单或逐轮对话清单。\n"
+                    "content 应自然简短，通常一两条综合要点就够；不要为了完整而拆成很多条，但也不要硬凑固定条数。\n"
+                )
             style_guidance = (
                 "像一条条日记。用最平常的话。概括用户表达的意图，别引用原话。写你干了什么，或一个你身上发生的最简单的事实或感受；不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
             )
@@ -329,19 +344,61 @@ class MemoryStore:
         current_title = _episodic_heading_title(current_heading)
         same_topic = _structured_bool(memory.get("same_topic"))
         if current_heading and (same_topic or _same_memory_title(current_title, title)):
-            entry = "\n".join([current_heading, *bullets]).strip()
-            replaced = self._replace_episodic_topic_text(current_heading, entry, now=now)
-            if replaced is not None:
-                return {
-                    "changed": bool(replaced),
-                    "heading": current_heading,
-                    "merged": True,
-                }
+            if self._is_initial_episodic_heading(current_heading, now=now):
+                title = current_title or title
+            else:
+                entry = "\n".join([current_heading, *bullets]).strip()
+                replaced = self._replace_episodic_topic_text(current_heading, entry, now=now)
+                if replaced is not None:
+                    return {
+                        "changed": bool(replaced),
+                        "heading": current_heading,
+                        "merged": True,
+                    }
 
-        heading = f"# {self.time_key(now)} - {title}"
+        heading = self._unique_episodic_heading(title, now=now)
         entry = "\n".join([heading, *bullets]).strip()
         changed = self._append_episodic_memory_text(entry, now=now)
         return {"changed": changed, "heading": heading, "merged": False}
+
+    def _initial_episodic_topic_info(self):
+        for path in self._episode_files():
+            for entry in _iter_episode_topics(self._episode_body(path)):
+                heading = _episodic_entry_heading(entry)
+                if heading:
+                    return {"date": path.stem, "heading": heading, "entry": entry}
+        return {}
+
+    def _is_initial_episodic_heading(self, heading, now=None):
+        heading = str(heading or "").strip()
+        if not heading:
+            return False
+        initial = self._initial_episodic_topic_info()
+        return (
+            bool(initial)
+            and initial.get("date") == self.today_key(now)
+            and initial.get("heading") == heading
+        )
+
+    def _unique_episodic_heading(self, title, now=None):
+        now = now or datetime.now()
+        title = str(title or "").strip()
+        path = self.episode_path(self.today_key(now))
+        body = self._episode_body(path) if path else ""
+        candidates = [
+            f"# {self.time_key(now)} - {title}",
+            f"# {now.strftime('%H:%M:%S')} - {title}",
+        ]
+        for heading in candidates:
+            if not _find_episodic_topic(body, heading):
+                return heading
+
+        index = 2
+        while True:
+            heading = f"# {now.strftime('%H:%M:%S')} - {title} ({index})"
+            if not _find_episodic_topic(body, heading):
+                return heading
+            index += 1
 
     def episodic_topic_for_heading(self, heading, date_text=None, max_chars=None):
         heading = str(heading or "").strip()
@@ -821,7 +878,7 @@ def _normalize_episode_body(body):
         stripped = line.strip()
         if _legacy_episodic_date_key(stripped):
             continue
-        topic = re.fullmatch(r"#{1,6}\s+(\d{2}:\d{2}\s*-\s*.+)", stripped)
+        topic = re.fullmatch(r"#{1,6}\s+(\d{2}:\d{2}(?::\d{2})?\s*-\s*.+)", stripped)
         if topic:
             lines.append(f"# {topic.group(1).strip()}")
         else:
@@ -868,8 +925,19 @@ def _legacy_episodic_date_key(line):
     return date_key if _valid_date_key(date_key) else ""
 
 
+def _episodic_entry_heading(entry):
+    for line in str(entry or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
 def _episodic_heading_title(heading):
-    match = re.fullmatch(r"#{1,6}\s+\d{2}:\d{2}\s*-\s*(.+)", str(heading or "").strip())
+    match = re.fullmatch(
+        r"#{1,6}\s+\d{2}:\d{2}(?::\d{2})?\s*-\s*(.+)",
+        str(heading or "").strip(),
+    )
     if not match:
         return ""
     return match.group(1).strip()
@@ -1123,7 +1191,13 @@ def _valid_date_key(value):
 
 
 def _is_episodic_topic_heading(line):
-    return re.match(r"^#{1,6}\s+\d{2}:\d{2}\s*-\s+", str(line or "").strip()) is not None
+    return (
+        re.match(
+            r"^#{1,6}\s+\d{2}:\d{2}(?::\d{2})?\s*-\s+",
+            str(line or "").strip(),
+        )
+        is not None
+    )
 
 
 def _json_safe(value):
