@@ -32,7 +32,8 @@ DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
 DEFAULT_AGENT_SUMMARY_MODEL = ""
 DEFAULT_COMPACTION_ENABLE = True
-DEFAULT_COMPACTION_MAX_CHARS = 60000
+DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
+DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75
 DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
 DEFAULT_COMPACTION_COMPACT_MODEL = ""
 AGENT_THINKING_OFF = "off"
@@ -59,6 +60,7 @@ class AppConfig:
     temperature: float = DEFAULT_TEMPERATURE
     stream_mode: bool = DEFAULT_STREAM_MODE
     thinking_mode: bool = DEFAULT_THINKING_MODE
+    context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     agent_mode: bool = DEFAULT_AGENT_MODE
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
@@ -66,7 +68,7 @@ class AppConfig:
     agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
     agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
     compaction_enable: bool = DEFAULT_COMPACTION_ENABLE
-    compaction_max_chars: int = DEFAULT_COMPACTION_MAX_CHARS
+    compaction_trigger_ratio: float = DEFAULT_COMPACTION_TRIGGER_RATIO
     compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
     web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
@@ -86,6 +88,7 @@ class AppConfig:
             "temperature": self.temperature,
             "stream_mode": self.stream_mode,
             "thinking_mode": self.thinking_mode,
+            "context_window_tokens": self.context_window_tokens,
             "agent_mode": self.agent_mode,
             "max_agent_rounds": self.max_agent_rounds,
             "max_agent_tool_calls": self.max_agent_tool_calls,
@@ -93,7 +96,7 @@ class AppConfig:
             "agent_show_thinking": self.agent_show_thinking,
             "agent_summary_model": self.agent_summary_model,
             "compaction_enable": self.compaction_enable,
-            "compaction_max_chars": self.compaction_max_chars,
+            "compaction_trigger_ratio": self.compaction_trigger_ratio,
             "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
             "compaction_compact_model": self.compaction_compact_model,
             "web_search_enable": self.web_search_enable,
@@ -114,6 +117,7 @@ class AppConfig:
             "temperature": self.temperature,
             "stream_mode": self.stream_mode,
             "thinking_mode": self.thinking_mode,
+            "context_window_tokens": self.context_window_tokens,
             "agent_mode": {
                 "enable": self.agent_mode,
                 "max_rounds": self.max_agent_rounds,
@@ -124,7 +128,7 @@ class AppConfig:
             },
             "auto_compact": {
                 "enable": self.compaction_enable,
-                "max_chars": self.compaction_max_chars,
+                "trigger_ratio": self.compaction_trigger_ratio,
                 "keep_recent_messages": self.compaction_keep_recent_messages,
                 "compact_model": self.compaction_compact_model,
             },
@@ -172,6 +176,10 @@ def parse_max_tokens(value):
     return _parse_positive_integer(value, "Max tokens")
 
 
+def parse_context_window_tokens(value):
+    return _parse_positive_integer(value, "Model context window tokens")
+
+
 def parse_agent_rounds(value):
     return _parse_positive_integer(value, "Agent max rounds")
 
@@ -180,8 +188,15 @@ def parse_agent_tool_calls(value):
     return _parse_positive_integer(value, "Agent max tool calls")
 
 
-def parse_compaction_max_chars(value):
-    return _parse_positive_integer(value, "Auto compact max chars")
+def parse_compaction_trigger_ratio(value):
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError) as error:
+        raise ValueError("Auto compact trigger ratio must be a number.") from error
+
+    if parsed <= 0 or parsed > 1:
+        raise ValueError("Auto compact trigger ratio must be greater than 0 and at most 1.")
+    return parsed
 
 
 def parse_compaction_keep_recent_messages(value):
@@ -317,6 +332,17 @@ def _sanitize_config(config):
 
     config["stream_mode"] = _parse_bool(config.get("stream_mode"), DEFAULT_STREAM_MODE)
     config["thinking_mode"] = _parse_bool(config.get("thinking_mode"), DEFAULT_THINKING_MODE)
+
+    context_window_tokens = config.pop("context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS)
+    try:
+        config["context_window_tokens"] = parse_context_window_tokens(context_window_tokens)
+    except ValueError as error:
+        print_warn(
+            f"Invalid context_window_tokens in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_CONTEXT_WINDOW_TOKENS}."
+        )
+        config["context_window_tokens"] = DEFAULT_CONTEXT_WINDOW_TOKENS
+
     config["agent_mode"] = _parse_bool(agent_config.get("enable"), DEFAULT_AGENT_MODE)
     config["agent_summary_model"] = str(
         agent_config.get("summary_model", DEFAULT_AGENT_SUMMARY_MODEL) or ""
@@ -369,15 +395,15 @@ def _sanitize_config(config):
         DEFAULT_COMPACTION_ENABLE,
     )
     try:
-        config["compaction_max_chars"] = parse_compaction_max_chars(
-            compaction_config.get("max_chars", DEFAULT_COMPACTION_MAX_CHARS)
+        config["compaction_trigger_ratio"] = parse_compaction_trigger_ratio(
+            compaction_config.get("trigger_ratio", DEFAULT_COMPACTION_TRIGGER_RATIO)
         )
     except ValueError as error:
         print_warn(
-            f"Invalid auto_compact.max_chars in {CONFIG_FILE}: {error} "
-            f"Fallback to {DEFAULT_COMPACTION_MAX_CHARS}."
+            f"Invalid auto_compact.trigger_ratio in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_COMPACTION_TRIGGER_RATIO}."
         )
-        config["compaction_max_chars"] = DEFAULT_COMPACTION_MAX_CHARS
+        config["compaction_trigger_ratio"] = DEFAULT_COMPACTION_TRIGGER_RATIO
     try:
         config["compaction_keep_recent_messages"] = parse_compaction_keep_recent_messages(
             compaction_config.get(
@@ -484,6 +510,18 @@ def _prompt_max_tokens(prompt, default_value):
             print_error(str(error))
 
 
+def _prompt_context_window_tokens(prompt, default_value):
+    while True:
+        value = get_user_input(prompt).strip()
+        if not value:
+            return default_value
+
+        try:
+            return parse_context_window_tokens(value)
+        except ValueError as error:
+            print_error(str(error))
+
+
 def _prompt_agent_rounds(prompt, default_value):
     while True:
         value = get_user_input(prompt).strip()
@@ -532,6 +570,18 @@ def _prompt_temperature(prompt, default_value):
             print_error(str(error))
 
 
+def _prompt_compaction_trigger_ratio(prompt, default_value):
+    while True:
+        value = get_user_input(prompt).strip()
+        if not value:
+            return default_value
+
+        try:
+            return parse_compaction_trigger_ratio(value)
+        except ValueError as error:
+            print_error(str(error))
+
+
 def load_config():
     config = _load_existing_config()
     if config.api_key or not requires_api_key(config.api_type):
@@ -555,6 +605,11 @@ def load_config():
         f"Please enter the maximum tokens (Default: {DEFAULT_MAX_TOKENS}): ",
         DEFAULT_MAX_TOKENS,
     )
+    context_window_tokens = _prompt_context_window_tokens(
+        "Please enter the model context window tokens "
+        f"(Default: {DEFAULT_CONTEXT_WINDOW_TOKENS}): ",
+        DEFAULT_CONTEXT_WINDOW_TOKENS,
+    )
     temperature = _prompt_temperature(
         f"Please enter the temperature (Default: {DEFAULT_TEMPERATURE}): ",
         DEFAULT_TEMPERATURE,
@@ -569,6 +624,7 @@ def load_config():
         temperature=temperature,
         stream_mode=DEFAULT_STREAM_MODE,
         thinking_mode=DEFAULT_THINKING_MODE,
+        context_window_tokens=context_window_tokens,
         agent_mode=DEFAULT_AGENT_MODE,
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
@@ -576,7 +632,7 @@ def load_config():
         agent_show_thinking=DEFAULT_AGENT_SHOW_THINKING,
         agent_summary_model=DEFAULT_AGENT_SUMMARY_MODEL,
         compaction_enable=DEFAULT_COMPACTION_ENABLE,
-        compaction_max_chars=DEFAULT_COMPACTION_MAX_CHARS,
+        compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
         compaction_compact_model=DEFAULT_COMPACTION_COMPACT_MODEL,
         web_search_enable=DEFAULT_WEB_SEARCH_ENABLE,
@@ -658,6 +714,10 @@ def update_config():
         f"Max tokens (Current: {config.max_tokens}): ",
         config.max_tokens,
     )
+    new_context_window_tokens = _prompt_context_window_tokens(
+        f"Model context window tokens (Current: {config.context_window_tokens}): ",
+        config.context_window_tokens,
+    )
     new_temperature = _prompt_temperature(
         f"Temperature (Current: {config.temperature}): ",
         config.temperature,
@@ -686,6 +746,10 @@ def update_config():
         ).strip()
         or config.compaction_compact_model
     )
+    new_compaction_trigger_ratio = _prompt_compaction_trigger_ratio(
+        f"Auto compact trigger ratio (Current: {config.compaction_trigger_ratio}): ",
+        config.compaction_trigger_ratio,
+    )
 
     new_config = AppConfig(
         api_type=new_api_type,
@@ -696,6 +760,7 @@ def update_config():
         temperature=new_temperature,
         stream_mode=config.stream_mode,
         thinking_mode=config.thinking_mode,
+        context_window_tokens=new_context_window_tokens,
         agent_mode=config.agent_mode,
         max_agent_rounds=new_max_agent_rounds,
         max_agent_tool_calls=new_max_agent_tool_calls,
@@ -703,7 +768,7 @@ def update_config():
         agent_show_thinking=config.agent_show_thinking,
         agent_summary_model=new_agent_summary_model,
         compaction_enable=config.compaction_enable,
-        compaction_max_chars=config.compaction_max_chars,
+        compaction_trigger_ratio=new_compaction_trigger_ratio,
         compaction_keep_recent_messages=config.compaction_keep_recent_messages,
         compaction_compact_model=new_compaction_compact_model,
         web_search_enable=config.web_search_enable,

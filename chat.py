@@ -26,6 +26,8 @@ from config import (
     API_TYPE_OPENAI,
     AGENT_THINKING_FULL,
     AGENT_THINKING_SUMMARY,
+    DEFAULT_COMPACTION_TRIGGER_RATIO,
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
     DEFAULT_MAX_AGENT_ROUNDS,
     DEFAULT_MAX_AGENT_TOOL_CALLS,
     normalize_api_type,
@@ -172,6 +174,7 @@ class LLMChat:
         api_type=API_TYPE_GLM,
         base_url="",
         max_tokens=4096,
+        context_window_tokens=DEFAULT_CONTEXT_WINDOW_TOKENS,
         temperature=0.7,
         stream_mode=False,
         thinking_mode=False,
@@ -183,7 +186,7 @@ class LLMChat:
         agent_show_thinking=True,
         agent_summary_model="",
         compaction_enable=True,
-        compaction_max_chars=60000,
+        compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=12,
         compaction_compact_model="",
         web_search_enabled=True,
@@ -202,11 +205,14 @@ class LLMChat:
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
+        self.last_context_input_tokens = 0
+        self.last_context_usage_source = ""
+        self.set_context_window_tokens(context_window_tokens)
         self.set_compaction_config(
             compaction_enable,
-            compaction_max_chars,
             compaction_keep_recent_messages,
             compaction_compact_model,
+            compaction_trigger_ratio,
         )
         self.agent_tools = AgentTools(
             workspace_dir,
@@ -261,6 +267,7 @@ class LLMChat:
         self.model = model
         self.api_key = api_key
         self.client = client
+        self._clear_context_usage()
         if max_tokens is not None:
             self.max_tokens = max_tokens
         if temperature is not None:
@@ -316,6 +323,10 @@ class LLMChat:
     def set_max_tokens(self, max_tokens):
         self.max_tokens = max_tokens
 
+    def set_context_window_tokens(self, context_window_tokens):
+        self.context_window_tokens = max(1, int(context_window_tokens))
+        self._clear_context_usage()
+
     def set_temperature(self, temperature):
         self.temperature = temperature
 
@@ -370,18 +381,21 @@ class LLMChat:
     def set_compaction_config(
         self,
         enabled=None,
-        max_chars=None,
         keep_recent_messages=None,
         compact_model=None,
+        trigger_ratio=None,
     ):
         if enabled is not None:
             self.compaction_enable = bool(enabled)
-        if max_chars is not None:
-            self.compaction_max_chars = max(1, int(max_chars))
         if keep_recent_messages is not None:
             self.compaction_keep_recent_messages = max(1, int(keep_recent_messages))
         if compact_model is not None:
             self.compaction_compact_model = str(compact_model or "").strip()
+        if trigger_ratio is not None:
+            ratio = float(trigger_ratio)
+            if ratio <= 0 or ratio > 1:
+                raise ValueError("Auto compact trigger ratio must be greater than 0 and at most 1.")
+            self.compaction_trigger_ratio = ratio
 
     def set_workspace_dir(self, workspace_dir):
         self.agent_tools.set_workspace_dir(workspace_dir)
@@ -461,6 +475,7 @@ class LLMChat:
                 self._compact_agent_history(user_message_index, response)
             if response and not response.get("agent_stopped"):
                 self._record_hot_history(user_message, response)
+                self._auto_compact_context()
             return response
 
         except KeyboardInterrupt:
@@ -611,6 +626,7 @@ class LLMChat:
                     tools=self._chat_tool_schemas(),
                 )
             )
+            self._record_context_usage(response)
 
             message = response.choices[0].message
             assistant_message, thinking_content, text, tool_calls = self._chat_message_parts(message)
@@ -692,6 +708,7 @@ class LLMChat:
                     tools=self._normal_web_search_tool_schemas(),
                 )
             )
+            self._record_context_usage(response)
             message = response.choices[0].message
             assistant_message, thinking_content, text, tool_calls = self._chat_message_parts(message)
             self.conversation_history.append(assistant_message)
@@ -730,6 +747,7 @@ class LLMChat:
                     tools=self._normal_web_search_tool_schemas(),
                 )
             )
+            self._record_context_usage(response)
             message = self._get_field(response, "message", {})
             assistant_message, thinking_content, text, tool_calls = self._ollama_message_parts(message)
             self.conversation_history.append(assistant_message)
@@ -770,6 +788,7 @@ class LLMChat:
                 messages=self._anthropic_messages(),
                 tools=self._normal_web_search_tool_schemas(),
             )
+            self._record_context_usage(response)
             blocks = self._anthropic_content_blocks(self._get_field(response, "content", []))
             self.conversation_history.append({"role": "assistant", "content": blocks})
             thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
@@ -905,6 +924,7 @@ class LLMChat:
                     tools=ollama_tool_schemas(self.agent_tools.web_search_available),
                 )
             )
+            self._record_context_usage(response)
 
             message = self._get_field(response, "message", {})
             assistant_message, thinking_content, text, tool_calls = self._ollama_message_parts(message)
@@ -960,7 +980,11 @@ class LLMChat:
             stream=True,
         )
 
+        usage_input_tokens = None
         for chunk in response:
+            chunk_input_tokens = _response_input_tokens(chunk)
+            if chunk_input_tokens is not None:
+                usage_input_tokens = chunk_input_tokens
             chunk_type = self._get_field(chunk, "type", "")
 
             if chunk_type == "content_block_start":
@@ -1018,6 +1042,10 @@ class LLMChat:
 
         for block in blocks:
             block.pop("_input_json", None)
+        if usage_input_tokens is not None:
+            self._set_context_input_tokens(usage_input_tokens, "api_usage")
+        else:
+            self._record_context_usage(None)
         return blocks
 
     def _agent_should_stop(self):
@@ -1314,28 +1342,78 @@ class LLMChat:
         if not self.compaction_enable:
             return {"compacted": False, "reason": "Context compaction is disabled."}
 
+        input_tokens, usage_source = self._context_tokens_for_compaction()
+        token_threshold = self._compaction_token_threshold()
         estimated_chars = _estimate_history_chars(self.conversation_history)
-        if estimated_chars < self.compaction_max_chars:
+        if input_tokens < token_threshold:
             return {
                 "compacted": False,
-                "reason": "Context is below the compaction threshold.",
+                "reason": "Context is below the compaction token threshold.",
                 "before_chars": estimated_chars,
+                "input_tokens": input_tokens,
+                "usage_source": usage_source,
+                "token_threshold": token_threshold,
+                "context_window_tokens": self.context_window_tokens,
             }
 
         result = self.compact_context(manual=False)
         if result.get("compacted"):
             print_info(
                 "Context compacted automatically: "
-                f"{result.get('before_messages')} -> {result.get('after_messages')} messages."
+                f"{result.get('before_messages')} -> {result.get('after_messages')} messages, "
+                f"{result.get('before_input_tokens')} input tokens "
+                f"(threshold {result.get('token_threshold')})."
             )
             self._print_memory_update_result(result.get("memory_update"))
         elif result.get("error"):
             print_warn(result.get("reason", "Automatic context compaction failed."))
         return result
 
+    def _context_tokens_for_compaction(self):
+        estimated_tokens = self._estimate_current_context_tokens()
+        if self.last_context_input_tokens > 0:
+            if estimated_tokens > self.last_context_input_tokens:
+                return estimated_tokens, f"{self.last_context_usage_source or 'api_usage'}+estimated"
+            return self.last_context_input_tokens, self.last_context_usage_source or "api_usage"
+        return estimated_tokens, "estimated"
+
+    def _compaction_token_threshold(self):
+        return max(1, int(self.context_window_tokens * self.compaction_trigger_ratio))
+
+    def _record_context_usage(self, response=None, *, source="api_usage"):
+        input_tokens = _response_input_tokens(response)
+        if input_tokens is not None:
+            self._set_context_input_tokens(input_tokens, source)
+            return
+        self._set_context_input_tokens(self._estimate_current_context_tokens(), "estimated")
+
+    def _set_context_input_tokens(self, input_tokens, source):
+        try:
+            input_tokens = int(input_tokens or 0)
+        except (TypeError, ValueError):
+            input_tokens = 0
+        if input_tokens <= 0:
+            return
+        self.last_context_input_tokens = input_tokens
+        self.last_context_usage_source = str(source or "api_usage")
+
+    def _clear_context_usage(self):
+        self.last_context_input_tokens = 0
+        self.last_context_usage_source = ""
+
+    def _estimate_current_context_tokens(self):
+        if self.agent_running or self.agent_mode:
+            messages = [{"role": "system", "content": self._agent_system_prompt()}]
+        else:
+            messages = [{"role": "system", "content": self._normal_system_prompt()}]
+        messages += self.conversation_history
+        return _estimate_history_tokens(messages)
+
     def compact_context(self, manual=False):
         before_messages = len(self.conversation_history)
         before_chars = _estimate_history_chars(self.conversation_history)
+        before_input_tokens, usage_source = self._context_tokens_for_compaction()
+        token_threshold = self._compaction_token_threshold()
         keep_recent = max(1, int(self.compaction_keep_recent_messages))
         compact_model = self.compaction_compact_model or self.model
 
@@ -1348,6 +1426,10 @@ class LLMChat:
                 ),
                 "before_messages": before_messages,
                 "before_chars": before_chars,
+                "before_input_tokens": before_input_tokens,
+                "usage_source": usage_source,
+                "token_threshold": token_threshold,
+                "context_window_tokens": self.context_window_tokens,
                 "model": compact_model,
             }
 
@@ -1364,6 +1446,10 @@ class LLMChat:
                 "reason": "Context compaction cancelled: no messages older than the recent window.",
                 "before_messages": before_messages,
                 "before_chars": before_chars,
+                "before_input_tokens": before_input_tokens,
+                "usage_source": usage_source,
+                "token_threshold": token_threshold,
+                "context_window_tokens": self.context_window_tokens,
                 "model": compact_model,
             }
 
@@ -1380,6 +1466,10 @@ class LLMChat:
                 "reason": f"Context compaction failed: {error}",
                 "before_messages": before_messages,
                 "before_chars": before_chars,
+                "before_input_tokens": before_input_tokens,
+                "usage_source": usage_source,
+                "token_threshold": token_threshold,
+                "context_window_tokens": self.context_window_tokens,
                 "model": compact_model,
             }
 
@@ -1391,6 +1481,10 @@ class LLMChat:
                 "reason": "Context compaction failed: compact model returned an empty summary.",
                 "before_messages": before_messages,
                 "before_chars": before_chars,
+                "before_input_tokens": before_input_tokens,
+                "usage_source": usage_source,
+                "token_threshold": token_threshold,
+                "context_window_tokens": self.context_window_tokens,
                 "model": compact_model,
             }
 
@@ -1405,6 +1499,8 @@ class LLMChat:
         ]
         removed_tool_results = self._sanitize_orphan_tool_results_in_history()
         after_chars = _estimate_history_chars(self.conversation_history)
+        after_input_tokens = self._estimate_current_context_tokens()
+        self._set_context_input_tokens(after_input_tokens, "estimated_after_compaction")
         return {
             "compacted": True,
             "manual": manual,
@@ -1412,6 +1508,11 @@ class LLMChat:
             "after_messages": len(self.conversation_history),
             "before_chars": before_chars,
             "after_chars": after_chars,
+            "before_input_tokens": before_input_tokens,
+            "after_input_tokens": after_input_tokens,
+            "usage_source": usage_source,
+            "token_threshold": token_threshold,
+            "context_window_tokens": self.context_window_tokens,
             "model": compact_model,
             "removed_orphan_tool_results": removed_tool_results,
             "memory_update": memory_update,
@@ -1944,12 +2045,18 @@ class LLMChat:
             return self._stream_ollama_response(callback_thinking, callback_response, model_name)
 
         try:
-            response = self.client.chat.completions.create(
-                **self._chat_completion_kwargs(
-                    messages=self.conversation_history,
-                    stream=True,
-                )
+            kwargs = self._chat_completion_kwargs(
+                messages=self.conversation_history,
+                stream=True,
             )
+            kwargs["stream_options"] = {"include_usage": True}
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+            except Exception as error:
+                if not _stream_usage_unsupported(error):
+                    raise
+                kwargs.pop("stream_options", None)
+                response = self.client.chat.completions.create(**kwargs)
 
             if self.thinking_mode:
                 print_stream_thinking("")
@@ -1958,8 +2065,14 @@ class LLMChat:
             full_response = ""
             raw_response = ""
             thinking_ended = False
+            usage_input_tokens = None
 
             for chunk in response:
+                chunk_input_tokens = _response_input_tokens(chunk)
+                if chunk_input_tokens is not None:
+                    usage_input_tokens = chunk_input_tokens
+                if not getattr(chunk, "choices", None):
+                    continue
                 delta = chunk.choices[0].delta
                 reasoning, full_thinking, raw_thinking = self._stream_reasoning_delta(
                     delta,
@@ -1987,6 +2100,10 @@ class LLMChat:
             self.conversation_history.append(
                 self._chat_stream_assistant_message(full_response, full_thinking)
             )
+            if usage_input_tokens is not None:
+                self._set_context_input_tokens(usage_input_tokens, "api_usage")
+            else:
+                self._record_context_usage(None)
             return {"thinking": full_thinking, "response": full_response}
 
         except Exception as error:
@@ -2007,8 +2124,12 @@ class LLMChat:
             full_thinking = ""
             full_response = ""
             response_started = False
+            usage_input_tokens = None
 
             for chunk in response:
+                chunk_input_tokens = _response_input_tokens(chunk)
+                if chunk_input_tokens is not None:
+                    usage_input_tokens = chunk_input_tokens
                 message = self._get_field(chunk, "message", {})
                 thinking = self._get_field(message, "thinking", "") or ""
                 if thinking:
@@ -2030,6 +2151,10 @@ class LLMChat:
             self.conversation_history.append(
                 self._ollama_assistant_message(full_response, full_thinking)
             )
+            if usage_input_tokens is not None:
+                self._set_context_input_tokens(usage_input_tokens, "api_usage")
+            else:
+                self._record_context_usage(None)
             return {
                 "thinking": _clean_reasoning_text(full_thinking),
                 "response": full_response,
@@ -2055,8 +2180,12 @@ class LLMChat:
             full_thinking = ""
             full_response = ""
             response_started = False
+            usage_input_tokens = None
 
             for chunk in response:
+                chunk_input_tokens = _response_input_tokens(chunk)
+                if chunk_input_tokens is not None:
+                    usage_input_tokens = chunk_input_tokens
                 chunk_type = self._get_field(chunk, "type", "")
 
                 if chunk_type == "content_block_start":
@@ -2093,6 +2222,10 @@ class LLMChat:
                             callback_response(text)
 
             self.conversation_history.append({"role": "assistant", "content": full_response})
+            if usage_input_tokens is not None:
+                self._set_context_input_tokens(usage_input_tokens, "api_usage")
+            else:
+                self._record_context_usage(None)
             return {"thinking": full_thinking, "response": full_response}
 
         except Exception as error:
@@ -2101,6 +2234,7 @@ class LLMChat:
 
     def _parse_response(self, response):
         try:
+            self._record_context_usage(response)
             message = response.choices[0].message
             assistant_message, thinking_content, text, _ = self._chat_message_parts(message)
 
@@ -2112,6 +2246,7 @@ class LLMChat:
 
     def _parse_ollama_response(self, response):
         try:
+            self._record_context_usage(response)
             message = self._get_field(response, "message", {})
             assistant_message, thinking_content, text, _ = self._ollama_message_parts(message)
 
@@ -2123,6 +2258,7 @@ class LLMChat:
 
     def _parse_anthropic_response(self, response):
         try:
+            self._record_context_usage(response)
             full_thinking, full_response = self._anthropic_response_parts(response)
 
             self.conversation_history.append({"role": "assistant", "content": full_response})
@@ -2626,11 +2762,13 @@ class LLMChat:
         self.conversation_history = []
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
+        self._clear_context_usage()
 
     def set_history(self, history):
         self.conversation_history = list(history or [])
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
+        self._clear_context_usage()
 
     def get_history(self):
         return self.conversation_history
@@ -2670,6 +2808,79 @@ def _compact_tool_result_for_context(tool_result):
     )
 
 
+def _response_input_tokens(response):
+    usage = _usage_field(response, "usage")
+    usage_tokens = _usage_input_tokens(usage)
+    if usage_tokens is not None:
+        return usage_tokens
+
+    direct_tokens = _usage_int(response, "prompt_eval_count")
+    if direct_tokens:
+        return direct_tokens
+    return None
+
+
+def _usage_input_tokens(usage):
+    if usage is None:
+        return None
+
+    prompt_tokens = _usage_int(usage, "prompt_tokens")
+    if prompt_tokens:
+        return prompt_tokens
+
+    input_tokens = (
+        _usage_int(usage, "input_tokens")
+        or _usage_int(usage, "input")
+        or _usage_int(usage, "inputTokens")
+    )
+    cache_read = (
+        _usage_int(usage, "cache_read_input_tokens")
+        or _usage_int(usage, "cache_read")
+        or _usage_int(usage, "cached_tokens")
+    )
+    cache_create = (
+        _usage_int(usage, "cache_creation_input_tokens")
+        or _usage_int(usage, "cache_creation_tokens")
+        or _usage_int(usage, "cache_create")
+    )
+
+    total = input_tokens + cache_read + cache_create
+    return total if total > 0 else None
+
+
+def _usage_field(value, key, default=None):
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(key, default)
+    direct = getattr(value, key, default)
+    if direct is not default:
+        return direct
+    extra = getattr(value, "model_extra", None)
+    if isinstance(extra, dict) and key in extra:
+        return extra.get(key, default)
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            return dumped.get(key, default)
+    return default
+
+
+def _usage_int(value, key):
+    try:
+        return int(_usage_field(value, key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stream_usage_unsupported(error):
+    text = str(error or "").lower()
+    return "stream_options" in text or "include_usage" in text
+
+
 def _estimate_history_chars(history):
     total = 0
     for message in history:
@@ -2678,6 +2889,30 @@ def _estimate_history_chars(history):
         except TypeError:
             total += len(str(message))
     return total
+
+
+def _estimate_history_tokens(history):
+    total = 0
+    for message in history:
+        try:
+            serialized = json.dumps(message, ensure_ascii=False, default=str)
+        except TypeError:
+            serialized = str(message)
+        total += _estimate_text_tokens(serialized) + 4
+    return total
+
+
+def _estimate_text_tokens(text):
+    ascii_chars = 0
+    non_ascii_tokens = 0
+    for character in str(text or ""):
+        if character.isspace():
+            continue
+        if ord(character) <= 0x7F:
+            ascii_chars += 1
+        else:
+            non_ascii_tokens += 1
+    return ((ascii_chars + 3) // 4) + non_ascii_tokens
 
 
 def _clean_reasoning_text(content):

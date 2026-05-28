@@ -106,15 +106,16 @@ def _apply_config(chat, config):
             config.stream_mode,
             config.thinking_mode,
         )
+        chat.set_context_window_tokens(config.context_window_tokens)
         chat.set_agent_limits(config.max_agent_rounds, config.max_agent_tool_calls)
         chat.set_agent_approval_mode(config.agent_approval_mode)
         chat.set_agent_show_thinking(config.agent_show_thinking)
         chat.set_agent_summary_model(config.agent_summary_model)
         chat.set_compaction_config(
             config.compaction_enable,
-            config.compaction_max_chars,
             config.compaction_keep_recent_messages,
             config.compaction_compact_model,
+            config.compaction_trigger_ratio,
         )
         chat.set_web_search_config(
             config.web_search_enable,
@@ -234,7 +235,9 @@ def handle_comp(chat, args):
         print_success(
             "Context compacted: "
             f"{result.get('before_messages')} -> {result.get('after_messages')} messages, "
-            f"{result.get('before_chars')} -> {result.get('after_chars')} chars."
+            f"{result.get('before_chars')} -> {result.get('after_chars')} chars, "
+            f"{result.get('before_input_tokens')} -> {result.get('after_input_tokens')} input tokens "
+            f"(threshold {result.get('token_threshold')})."
             f"{memory_suffix}"
         )
         return True
