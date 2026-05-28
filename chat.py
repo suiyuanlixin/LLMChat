@@ -34,6 +34,7 @@ from config import (
 from memory import MemoryStore, parse_memory_update_response
 from tools import (
     AgentTools,
+    WEB_SEARCH_TOOL_DEFINITION,
     anthropic_tool_schemas,
     glm_tool_schemas,
     ollama_tool_schemas,
@@ -47,6 +48,7 @@ AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS = 0.006
 AGENT_RESPONSE_CHAR_DELAY_SECONDS = 0.003
 AGENT_SUMMARY_MAX_TOKENS = 96
 AGENT_SUMMARY_PREFIX_CHARS = len("[*] Thinking: ")
+NORMAL_WEB_SEARCH_MAX_ROUNDS = 3
 COMPACTION_MAX_TOKENS = 2048
 MEMORY_UPDATE_MAX_TOKENS = 4096
 COMPACTION_SUMMARY_PREFIX = "[Compressed conversation summary for continuity]"
@@ -362,6 +364,9 @@ class LLMChat:
     def web_search(self, query, **kwargs):
         return self.agent_tools.search_web(query, **kwargs)
 
+    def _normal_web_search_available(self):
+        return bool(self.agent_tools.web_search_available)
+
     def set_compaction_config(
         self,
         enabled=None,
@@ -421,6 +426,11 @@ class LLMChat:
 
             if self.agent_mode:
                 response = self._agent_response()
+            elif self._normal_web_search_available():
+                response = self._normal_web_search_response(
+                    stream_callback_thinking,
+                    stream_callback_response,
+                )
             elif self.stream_mode:
                 response = self._stream_response(stream_callback_thinking, stream_callback_response, self.model)
             elif self.api_type == API_TYPE_ANTHROPIC:
@@ -646,6 +656,239 @@ class LLMChat:
         self._separate_after_agent_thinking()
         print_error(message)
         return {"thinking": full_thinking, "response": final_response or message}
+
+    def _normal_web_search_response(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        if self.api_type == API_TYPE_ANTHROPIC:
+            return self._anthropic_normal_web_search_response(
+                stream_callback_thinking,
+                stream_callback_response,
+            )
+        if self.api_type == API_TYPE_OLLAMA:
+            return self._ollama_normal_web_search_response(
+                stream_callback_thinking,
+                stream_callback_response,
+            )
+        return self._chat_completion_normal_web_search_response(
+            stream_callback_thinking,
+            stream_callback_response,
+        )
+
+    def _chat_completion_normal_web_search_response(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        full_thinking = ""
+        final_response = ""
+
+        for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+            response = self.client.chat.completions.create(
+                **self._chat_completion_kwargs(
+                    messages=self.conversation_history,
+                    tools=self._normal_web_search_tool_schemas(),
+                )
+            )
+            message = response.choices[0].message
+            assistant_message, thinking_content, text, tool_calls = self._chat_message_parts(message)
+            self.conversation_history.append(assistant_message)
+            full_thinking += thinking_content
+            final_response += text
+
+            if not tool_calls:
+                return self._finalize_normal_web_search_response(
+                    full_thinking,
+                    final_response,
+                    stream_callback_thinking,
+                    stream_callback_response,
+                )
+
+            self._append_normal_web_search_tool_results(tool_calls, provider="chat")
+
+        return self._normal_web_search_round_limit_response(
+            full_thinking,
+            final_response,
+            stream_callback_thinking,
+            stream_callback_response,
+        )
+
+    def _ollama_normal_web_search_response(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        full_thinking = ""
+        final_response = ""
+
+        for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+            response = self.client.chat(
+                **self._ollama_chat_kwargs(
+                    messages=self.conversation_history,
+                    tools=self._normal_web_search_tool_schemas(),
+                )
+            )
+            message = self._get_field(response, "message", {})
+            assistant_message, thinking_content, text, tool_calls = self._ollama_message_parts(message)
+            self.conversation_history.append(assistant_message)
+            full_thinking += thinking_content
+            final_response += text
+
+            if not tool_calls:
+                return self._finalize_normal_web_search_response(
+                    full_thinking,
+                    final_response,
+                    stream_callback_thinking,
+                    stream_callback_response,
+                )
+
+            self._append_normal_web_search_tool_results(tool_calls, provider="ollama")
+
+        return self._normal_web_search_round_limit_response(
+            full_thinking,
+            final_response,
+            stream_callback_thinking,
+            stream_callback_response,
+        )
+
+    def _anthropic_normal_web_search_response(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        full_thinking = ""
+        final_response = ""
+
+        for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                system=self._normal_system_prompt(),
+                messages=self._anthropic_messages(),
+                tools=self._normal_web_search_tool_schemas(),
+            )
+            blocks = self._anthropic_content_blocks(self._get_field(response, "content", []))
+            self.conversation_history.append({"role": "assistant", "content": blocks})
+            thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
+            full_thinking += thinking
+            final_response += text
+
+            if not tool_uses:
+                return self._finalize_normal_web_search_response(
+                    full_thinking,
+                    final_response,
+                    stream_callback_thinking,
+                    stream_callback_response,
+                )
+
+            tool_results = []
+            for tool_use in tool_uses:
+                tool_result = self._execute_normal_web_search_tool(
+                    tool_use.get("name", ""),
+                    tool_use.get("input", {}),
+                )
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.get("id", ""),
+                        "content": tool_result,
+                        "is_error": tool_result.startswith("ERROR:"),
+                    }
+                )
+            self.conversation_history.append({"role": "user", "content": tool_results})
+
+        return self._normal_web_search_round_limit_response(
+            full_thinking,
+            final_response,
+            stream_callback_thinking,
+            stream_callback_response,
+        )
+
+    def _append_normal_web_search_tool_results(self, tool_calls, provider):
+        for tool_call in tool_calls:
+            tool_result = self._execute_normal_web_search_tool(
+                tool_call.get("name", ""),
+                tool_call.get("arguments", {}),
+            )
+            if provider == "ollama":
+                self.conversation_history.append(
+                    self._ollama_tool_result_message(tool_call.get("name", ""), tool_result)
+                )
+            else:
+                self.conversation_history.append(
+                    self._chat_tool_result_message(
+                        tool_call.get("id", ""),
+                        tool_call.get("name", ""),
+                        tool_result,
+                    )
+                )
+
+    def _execute_normal_web_search_tool(self, name, arguments):
+        if name != "web_search":
+            return _error_text(f"Tool is not available in normal mode: {name}")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        query = str(arguments.get("query") or "").strip()
+        kwargs = {key: value for key, value in arguments.items() if key != "query"}
+        try:
+            return self.agent_tools.search_web(query, **kwargs)
+        except Exception as error:
+            return _error_text(str(error))
+
+    def _finalize_normal_web_search_response(
+        self,
+        thinking,
+        response,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        if self.stream_mode:
+            self._stream_normal_web_search_text(
+                thinking,
+                response,
+                stream_callback_thinking,
+                stream_callback_response,
+            )
+            return {
+                "thinking": thinking,
+                "response": response,
+                "response_streamed": True,
+            }
+        return {"thinking": thinking, "response": response}
+
+    def _stream_normal_web_search_text(
+        self,
+        thinking,
+        response,
+        callback_thinking=None,
+        callback_response=None,
+    ):
+        if thinking and self.thinking_mode and callback_thinking:
+            print_stream_thinking("")
+            callback_thinking(thinking)
+            if not thinking.endswith("\n"):
+                console.print()
+        print_stream_response_start(self.model)
+        if response and callback_response:
+            callback_response(response)
+
+    def _normal_web_search_round_limit_response(
+        self,
+        thinking,
+        response,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        message = "Web search stopped after reaching the normal-mode search round limit."
+        print_error(message)
+        return self._finalize_normal_web_search_response(
+            thinking,
+            response or message,
+            stream_callback_thinking,
+            stream_callback_response,
+        )
 
     def _ollama_agent_response(self):
         full_thinking = ""
@@ -2109,9 +2352,13 @@ class LLMChat:
         )
 
     def _normal_system_prompt(self):
-        return _with_user_custom_prompt(
-            _with_persistent_memory(NORMAL_SYSTEM_PROMPT, self.memory_store)
-        )
+        prompt = NORMAL_SYSTEM_PROMPT
+        if self._normal_web_search_available():
+            prompt += (
+                "\n联网搜索已开启。遇到近期、易变化、外部事实不足或需要来源支撑的问题时，"
+                "使用 web_search；回答中引用搜索结果里的来源 URL。"
+            )
+        return _with_user_custom_prompt(_with_persistent_memory(prompt, self.memory_store))
 
     def _agent_system_prompt(self):
         prompt = AGENT_SYSTEM_PROMPT
@@ -2179,6 +2426,21 @@ class LLMChat:
         if self.api_type == API_TYPE_OPENAI:
             return openai_tool_schemas(include_web_search)
         return glm_tool_schemas(include_web_search)
+
+    def _normal_web_search_tool_schemas(self):
+        if self.api_type == API_TYPE_ANTHROPIC:
+            return [WEB_SEARCH_TOOL_DEFINITION]
+
+        definition = WEB_SEARCH_TOOL_DEFINITION
+        schema = {
+            "type": "function",
+            "function": {
+                "name": definition["name"],
+                "description": definition["description"],
+                "parameters": definition["input_schema"],
+            },
+        }
+        return [schema]
 
     def _chat_tool_result_message(self, tool_call_id, name, content):
         message = {

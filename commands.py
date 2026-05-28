@@ -31,7 +31,7 @@ COMMANDS = {
     "/think": "Toggle thinking mode on/off (Example: /think on).",
     "/comp": "Compact the current conversation context immediately.",
     "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
-    "/search": "Search the web with Tavily, or configure web search (Example: /search Python 3.14).",
+    "/search": "Toggle, inspect or configure web search (Example: /search on).",
     "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
 }
 
@@ -260,12 +260,6 @@ def handle_search(chat, args):
         _print_search_status(chat)
         return True
 
-    if action in {"query", "web"}:
-        if not value:
-            print_error("Usage: /search query <query>")
-            return True
-        return _run_web_search(chat, value)
-
     if action == "on" and not value:
         chat.set_web_search_config(enabled=True)
         save_config_field("web_search_enable", True)
@@ -283,7 +277,7 @@ def handle_search(chat, args):
             print_error("Usage: /search key <tavily-api-key>")
             return True
         if not value.startswith("tvly-"):
-            print_error("Tavily API keys usually start with tvly-. Use /search query <query> to search.")
+            print_error("Tavily API keys usually start with tvly-.")
             return True
         chat.set_web_search_config(api_key=value)
         save_config_field("web_search_api_key", value)
@@ -346,31 +340,33 @@ def handle_search(chat, args):
         print_success(f"Web search topic set to {topic}.")
         return True
 
-    return _run_web_search(chat, args)
-
-
-def _run_web_search(chat, query):
-    try:
-        result = chat.web_search(query)
-    except Exception as error:
-        print_error(f"Web search failed: {error}")
-        return True
-    print_info(result)
+    print_error(
+        "Usage: /search | /search status | /search on|off | "
+        "/search key <tavily-api-key> | /search provider tavily | "
+        "/search max <1-20> | /search depth basic|fast|ultra-fast|advanced | "
+        "/search topic general|news|finance"
+    )
     return True
 
 
 def _print_search_status(chat):
     status = chat.get_web_search_status()
     current = "on" if status.get("enabled") else "off"
-    available = "available" if status.get("available") else "missing key"
+    if not status.get("enabled"):
+        available = "disabled"
+    elif status.get("available"):
+        available = "available"
+    else:
+        available = "missing key"
     print_info(
         f"Web search: {current} ({available}).\n"
+        "Scope: normal chat auto-search and agent web_search tool.\n"
         f"Provider: {status.get('provider')}.\n"
         f"Max results: {status.get('max_results')}.\n"
         f"Depth: {status.get('search_depth')}.\n"
         f"Topic: {status.get('topic')}.\n"
-        "Usage: /search <query> | /search query <query> | /search key <tavily-api-key> | "
-        "/search on|off | /search max <1-20> | "
+        "Usage: /search status | /search on|off | /search key <tavily-api-key> | "
+        "/search provider tavily | /search max <1-20> | "
         "/search depth basic|fast|ultra-fast|advanced | "
         "/search topic general|news|finance"
     )
