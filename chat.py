@@ -21,6 +21,7 @@ from ui import (
 )
 from config import (
     API_TYPE_ANTHROPIC,
+    API_TYPE_GEMINI,
     API_TYPE_GLM,
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
@@ -30,6 +31,8 @@ from config import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     DEFAULT_MAX_AGENT_ROUNDS,
     DEFAULT_MAX_AGENT_TOOL_CALLS,
+    GEMINI_OPENAI_BASE_URL,
+    SUPPORTED_API_TYPES,
     normalize_api_type,
     parse_agent_show_thinking,
 )
@@ -256,10 +259,15 @@ class LLMChat:
         thinking_mode=None,
     ):
         api_type = normalize_api_type(api_type)
-        if api_type not in {API_TYPE_GLM, API_TYPE_ANTHROPIC, API_TYPE_OPENAI, API_TYPE_OLLAMA}:
+        if api_type not in SUPPORTED_API_TYPES:
             raise ValueError(f"Unsupported API type: {api_type}")
 
-        base_url = "" if api_type == API_TYPE_GLM else (base_url or "").strip()
+        if api_type == API_TYPE_GLM:
+            base_url = ""
+        elif api_type == API_TYPE_GEMINI:
+            base_url = (base_url or "").strip() or GEMINI_OPENAI_BASE_URL
+        else:
+            base_url = (base_url or "").strip()
         client = self._create_client(api_type, api_key, base_url)
 
         self.api_type = api_type
@@ -289,7 +297,7 @@ class LLMChat:
                 kwargs["base_url"] = base_url
             return anthropic.Anthropic(**kwargs)
 
-        if api_type == API_TYPE_OPENAI:
+        if api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
             try:
                 from openai import OpenAI
             except ImportError as error:
@@ -2523,6 +2531,17 @@ class LLMChat:
         }
         if self.api_type == API_TYPE_GLM and include_reasoning:
             kwargs["thinking"] = {"type": "enabled"} if self.thinking_mode else {}
+        elif include_reasoning and self._uses_gemini_openai_compat(model):
+            if self.thinking_mode:
+                kwargs["extra_body"] = {
+                    "extra_body": {
+                        "google": {
+                            "thinking_config": {
+                                "include_thoughts": True,
+                            }
+                        }
+                    }
+                }
         elif include_reasoning and self._uses_minimax_openai_compat(model):
             kwargs["extra_body"] = {"reasoning_split": True}
         if stream:
@@ -2559,7 +2578,7 @@ class LLMChat:
 
     def _chat_tool_schemas(self):
         include_web_search = self.agent_tools.web_search_available
-        if self.api_type == API_TYPE_OPENAI:
+        if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
             return openai_tool_schemas(include_web_search)
         return glm_tool_schemas(include_web_search)
 
@@ -2660,6 +2679,19 @@ class LLMChat:
         model_name = str(model or self.model or "").lower()
         return "minimax" in base_url or "minimaxi" in base_url or model_name.startswith("minimax")
 
+    def _uses_gemini_openai_compat(self, model=None):
+        if self.api_type == API_TYPE_GEMINI:
+            return True
+        if self.api_type != API_TYPE_OPENAI:
+            return False
+        base_url = str(self.base_url or "").lower()
+        model_name = str(model or self.model or "").lower()
+        return (
+            "generativelanguage.googleapis.com" in base_url
+            and "/openai" in base_url
+            and model_name.startswith("gemini")
+        )
+
     def _message_reasoning_text(self, message):
         reasoning_content = self._get_field(message, "reasoning_content", "") or ""
         reasoning_details = self._reasoning_details_text(
@@ -2756,7 +2788,14 @@ class LLMChat:
     def _get_field(item, field, default=None):
         if isinstance(item, dict):
             return item.get(field, default)
-        return getattr(item, field, default)
+        missing = object()
+        direct = getattr(item, field, missing)
+        if direct is not missing:
+            return direct
+        extra = getattr(item, "model_extra", None)
+        if isinstance(extra, dict) and field in extra:
+            return extra.get(field, default)
+        return default
 
     def clear_history(self):
         self.conversation_history = []

@@ -18,7 +18,9 @@ CONFIG_FILE = "config.json"
 API_TYPE_GLM = "glm"
 API_TYPE_ANTHROPIC = "anthropic"
 API_TYPE_OPENAI = "openai"
+API_TYPE_GEMINI = "gemini"
 API_TYPE_OLLAMA = "ollama"
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_API_TYPE = API_TYPE_GLM
 DEFAULT_BASE_URL = ""
 DEFAULT_MODEL = "glm-4.7"
@@ -46,6 +48,7 @@ SUPPORTED_API_TYPES = {
     API_TYPE_GLM,
     API_TYPE_ANTHROPIC,
     API_TYPE_OPENAI,
+    API_TYPE_GEMINI,
     API_TYPE_OLLAMA,
 }
 
@@ -152,8 +155,11 @@ def requires_api_key(api_type):
 
 
 def _normalize_base_url(api_type, base_url):
-    if normalize_api_type(api_type) == API_TYPE_GLM:
+    normalized_api_type = normalize_api_type(api_type)
+    if normalized_api_type == API_TYPE_GLM:
         return ""
+    if normalized_api_type == API_TYPE_GEMINI:
+        return str(base_url or "").strip() or GEMINI_OPENAI_BASE_URL
     return str(base_url or "").strip()
 
 
@@ -471,7 +477,10 @@ def _sanitize_config(config):
 
 
 def _prompt_api_type(current_api_type):
-    prompt = f"API type (glm/anthropic/openai/ollama, Current: {current_api_type}): "
+    prompt = (
+        "API type (glm/anthropic/openai/gemini/ollama, "
+        f"Current: {current_api_type}): "
+    )
     value = get_user_input(prompt).strip()
     if not value:
         return current_api_type
