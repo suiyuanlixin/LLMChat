@@ -1,14 +1,15 @@
 import os
 import json
 import sys
+import unicodedata
 
 if os.name == "nt":
     import ctypes
     import msvcrt
+    from ctypes import wintypes
 
 from rich.text import Text
 from rich.color import Color
-from rich.cells import cell_len
 from rich.panel import Panel
 from rich.console import Console
 from rich.table import Table
@@ -27,7 +28,65 @@ THINK_COLOR = ["#7e7d80", "#b4b1b2"]
 STREAM_THINK_COLOR = "#7e7d80"
 STREAM_RESPONSE_COLOR = "#f6f6f6"
 VK_SHIFT = 0x10
-VK_ALT = 0x12
+VK_CONTROL = 0x11
+WINDOWS_NEWLINE_KEYS = (VK_SHIFT, VK_CONTROL)
+WINDOWS_SPECIAL_KEY_PREFIXES = ("\x00", "\xe0")
+
+if os.name == "nt":
+    STD_OUTPUT_HANDLE = -11
+
+    class _COORD(ctypes.Structure):
+        _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+    class _SMALL_RECT(ctypes.Structure):
+        _fields_ = [
+            ("Left", wintypes.SHORT),
+            ("Top", wintypes.SHORT),
+            ("Right", wintypes.SHORT),
+            ("Bottom", wintypes.SHORT),
+        ]
+
+    class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", _COORD),
+            ("dwCursorPosition", _COORD),
+            ("wAttributes", wintypes.WORD),
+            ("srWindow", _SMALL_RECT),
+            ("dwMaximumWindowSize", _COORD),
+        ]
+
+    KERNEL32 = ctypes.windll.kernel32
+    USER32 = ctypes.windll.user32
+
+    KERNEL32.GetStdHandle.argtypes = [wintypes.DWORD]
+    KERNEL32.GetStdHandle.restype = wintypes.HANDLE
+    KERNEL32.GetConsoleScreenBufferInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_CONSOLE_SCREEN_BUFFER_INFO),
+    ]
+    KERNEL32.GetConsoleScreenBufferInfo.restype = wintypes.BOOL
+    KERNEL32.SetConsoleCursorPosition.argtypes = [wintypes.HANDLE, _COORD]
+    KERNEL32.SetConsoleCursorPosition.restype = wintypes.BOOL
+    KERNEL32.FillConsoleOutputCharacterW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_wchar,
+        wintypes.DWORD,
+        _COORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    KERNEL32.FillConsoleOutputCharacterW.restype = wintypes.BOOL
+    KERNEL32.FillConsoleOutputAttribute.argtypes = [
+        wintypes.HANDLE,
+        wintypes.WORD,
+        wintypes.DWORD,
+        _COORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    KERNEL32.FillConsoleOutputAttribute.restype = wintypes.BOOL
+    USER32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    USER32.GetAsyncKeyState.restype = ctypes.c_short
+
+    STDOUT = KERNEL32.GetStdHandle(STD_OUTPUT_HANDLE)
 
 
 def gradient_text(content, start_color, end_color, mid_color=None):
@@ -408,27 +467,201 @@ def _input_prompt(prompt_text):
 
 
 def _key_down(key):
-    return bool(ctypes.windll.user32.GetAsyncKeyState(key) & 0x8000)
+    return bool(USER32.GetAsyncKeyState(key) & 0x8000)
 
 
-def _erase_input_character(character):
-    width = max(1, cell_len(str(character or "")))
-    console.file.write("\b" * width)
-    console.file.write(" " * width)
-    console.file.write("\b" * width)
-    console.file.flush()
+def _windows_console_info():
+    info = _CONSOLE_SCREEN_BUFFER_INFO()
+    if not KERNEL32.GetConsoleScreenBufferInfo(STDOUT, ctypes.byref(info)):
+        raise ctypes.WinError()
+    return info
+
+
+def _windows_set_cursor(position):
+    if not KERNEL32.SetConsoleCursorPosition(STDOUT, position):
+        raise ctypes.WinError()
+
+
+def _windows_fill_spaces(start, cells, attrs):
+    if cells <= 0:
+        return
+
+    written = wintypes.DWORD()
+    KERNEL32.FillConsoleOutputCharacterW(
+        STDOUT, " ", cells, start, ctypes.byref(written)
+    )
+    KERNEL32.FillConsoleOutputAttribute(
+        STDOUT, attrs, cells, start, ctypes.byref(written)
+    )
+
+
+def _input_char_width(character):
+    if unicodedata.combining(character):
+        return 0
+    if unicodedata.east_asian_width(character) in ("F", "W"):
+        return 2
+    return 1
+
+
+def _input_position_after(origin, text, columns):
+    x, y = origin.X, origin.Y
+
+    for character in text:
+        if character == "\n":
+            x = 0
+            y += 1
+            continue
+
+        width = _input_char_width(character)
+        if width <= 0:
+            continue
+        if x + width > columns:
+            x = 0
+            y += 1
+
+        x += width
+        if x >= columns:
+            x = 0
+            y += 1
+
+    return _COORD(x, y)
+
+
+def _input_cell_span(start, end, columns):
+    return max(0, (end.Y - start.Y) * columns + end.X - start.X)
+
+
+class _WindowsInputRenderer:
+    def __init__(self):
+        info = _windows_console_info()
+        self.origin = _COORD(info.dwCursorPosition.X, info.dwCursorPosition.Y)
+        self.last_span = 0
+
+    def redraw(self, chars, cursor):
+        info = _windows_console_info()
+        columns = info.dwSize.X
+
+        _windows_fill_spaces(self.origin, self.last_span, info.wAttributes)
+        _windows_set_cursor(self.origin)
+
+        text = "".join(chars)
+        console.file.write(text)
+        console.file.flush()
+
+        end = _input_position_after(self.origin, text, columns)
+        self.last_span = _input_cell_span(self.origin, end, columns)
+        self.move_cursor(chars, cursor)
+
+    def move_cursor(self, chars, cursor):
+        columns = _windows_console_info().dwSize.X
+        _windows_set_cursor(
+            _input_position_after(self.origin, "".join(chars[:cursor]), columns)
+        )
+
+
+def _input_line_bounds(chars, cursor):
+    start = 0
+    for index in range(cursor - 1, -1, -1):
+        if chars[index] == "\n":
+            start = index + 1
+            break
+
+    end = len(chars)
+    for index in range(cursor, len(chars)):
+        if chars[index] == "\n":
+            end = index
+            break
+
+    return start, end
+
+
+def _input_column_at(chars, start, cursor):
+    return sum(_input_char_width(character) for character in chars[start:cursor])
+
+
+def _input_cursor_at_column(chars, start, end, column):
+    current_column = 0
+    for index in range(start, end):
+        next_column = current_column + _input_char_width(chars[index])
+        if next_column > column:
+            return index
+        current_column = next_column
+
+    return end
+
+
+def _input_move_vertical(chars, cursor, step, column):
+    start, end = _input_line_bounds(chars, cursor)
+
+    if step < 0:
+        if start == 0:
+            return cursor
+        start, end = _input_line_bounds(chars, start - 1)
+    else:
+        if end == len(chars):
+            return cursor
+        start, end = _input_line_bounds(chars, end + 1)
+
+    return _input_cursor_at_column(chars, start, end, column)
 
 
 def _read_windows_multiline_input(prompt):
     chars = []
+    cursor = 0
+    paste_active = False
+    skip_lf = False
+    target_column = None
     console.print(prompt, end="")
+    renderer = _WindowsInputRenderer()
+
+    def render(redraw=False):
+        nonlocal target_column
+        target_column = None
+        if redraw:
+            renderer.redraw(chars, cursor)
+        else:
+            renderer.move_cursor(chars, cursor)
+
+    def insert_newline():
+        nonlocal cursor
+        chars.insert(cursor, "\n")
+        cursor += 1
+        render(redraw=True)
 
     while True:
         ch = msvcrt.getwch()
 
-        if ch in ("\x00", "\xe0"):
-            msvcrt.getwch()
+        if ch in WINDOWS_SPECIAL_KEY_PREFIXES:
+            paste_active = False
+            skip_lf = False
+            key = msvcrt.getwch()
+            if key in ("H", "P"):
+                if target_column is None:
+                    start, _ = _input_line_bounds(chars, cursor)
+                    target_column = _input_column_at(chars, start, cursor)
+                cursor = _input_move_vertical(
+                    chars, cursor, -1 if key == "H" else 1, target_column
+                )
+                renderer.move_cursor(chars, cursor)
+            elif key == "K" and cursor > 0:
+                cursor -= 1
+                render()
+            elif key == "M" and cursor < len(chars):
+                cursor += 1
+                render()
+            elif key == "G":
+                cursor, _ = _input_line_bounds(chars, cursor)
+                render()
+            elif key == "O":
+                _, cursor = _input_line_bounds(chars, cursor)
+                render()
+            elif key == "S" and cursor < len(chars):
+                del chars[cursor]
+                render(redraw=True)
             continue
+
+        queued = msvcrt.kbhit()
+        pasted = paste_active or queued
 
         if ch == "\x03":
             raise KeyboardInterrupt
@@ -436,29 +669,44 @@ def _read_windows_multiline_input(prompt):
             raise EOFError
 
         if ch in ("\r", "\n"):
-            if _key_down(VK_SHIFT) or _key_down(VK_ALT):
-                chars.append("\n")
-                console.file.write("\n")
-                console.file.flush()
+            if ch == "\n" and skip_lf:
+                skip_lf = False
+                paste_active = queued
+                continue
+
+            if any(_key_down(key) for key in WINDOWS_NEWLINE_KEYS) or pasted:
+                insert_newline()
+                paste_active = queued
+                skip_lf = ch == "\r"
                 continue
 
             console.file.write("\n")
             console.file.flush()
             return "".join(chars)
 
+        skip_lf = False
+
         if ch == "\b":
-            if chars and chars[-1] != "\n":
-                _erase_input_character(chars.pop())
+            if cursor > 0:
+                cursor -= 1
+                del chars[cursor]
+                render(redraw=True)
+            paste_active = queued
             continue
 
-        chars.append(ch)
-        console.file.write(ch)
-        console.file.flush()
+        if not ch.isprintable():
+            paste_active = queued
+            continue
+
+        chars.insert(cursor, ch)
+        cursor += 1
+        render(redraw=True)
+        paste_active = queued
 
 
 def get_user_input(prompt_text, multiline=False):
     prompt = _input_prompt(prompt_text)
-    if multiline and os.name == "nt" and sys.stdin.isatty():
+    if multiline and os.name == "nt" and sys.stdin.isatty() and sys.stdout.isatty():
         return _read_windows_multiline_input(prompt).strip()
     return console.input(prompt).strip()
 
