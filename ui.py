@@ -1,7 +1,9 @@
 import os
 import json
+import shutil
 import sys
 import unicodedata
+from io import StringIO
 
 if os.name == "nt":
     import ctypes
@@ -46,6 +48,18 @@ if os.name == "nt":
             ("Bottom", wintypes.SHORT),
         ]
 
+    class _CHAR_UNION(ctypes.Union):
+        _fields_ = [
+            ("UnicodeChar", ctypes.c_wchar),
+            ("AsciiChar", ctypes.c_char),
+        ]
+
+    class _CHAR_INFO(ctypes.Structure):
+        _fields_ = [
+            ("Char", _CHAR_UNION),
+            ("Attributes", wintypes.WORD),
+        ]
+
     class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
         _fields_ = [
             ("dwSize", _COORD),
@@ -60,6 +74,13 @@ if os.name == "nt":
 
     KERNEL32.GetStdHandle.argtypes = [wintypes.DWORD]
     KERNEL32.GetStdHandle.restype = wintypes.HANDLE
+    KERNEL32.GetConsoleMode.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    KERNEL32.GetConsoleMode.restype = wintypes.BOOL
+    KERNEL32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    KERNEL32.SetConsoleMode.restype = wintypes.BOOL
     KERNEL32.GetConsoleScreenBufferInfo.argtypes = [
         wintypes.HANDLE,
         ctypes.POINTER(_CONSOLE_SCREEN_BUFFER_INFO),
@@ -83,6 +104,22 @@ if os.name == "nt":
         ctypes.POINTER(wintypes.DWORD),
     ]
     KERNEL32.FillConsoleOutputAttribute.restype = wintypes.BOOL
+    KERNEL32.ReadConsoleOutputW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_CHAR_INFO),
+        _COORD,
+        _COORD,
+        ctypes.POINTER(_SMALL_RECT),
+    ]
+    KERNEL32.ReadConsoleOutputW.restype = wintypes.BOOL
+    KERNEL32.WriteConsoleOutputW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_CHAR_INFO),
+        _COORD,
+        _COORD,
+        ctypes.POINTER(_SMALL_RECT),
+    ]
+    KERNEL32.WriteConsoleOutputW.restype = wintypes.BOOL
     USER32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     USER32.GetAsyncKeyState.restype = ctypes.c_short
 
@@ -495,6 +532,49 @@ def _windows_fill_spaces(start, cells, attrs):
     )
 
 
+def _windows_read_region(top_row, height, columns):
+    info = _windows_console_info()
+    viewport_left = info.srWindow.Left
+    viewport_top = info.srWindow.Top
+    viewport_right = info.srWindow.Right
+    viewport_bottom = info.srWindow.Bottom
+
+    top = viewport_top + max(1, top_row) - 1
+    bottom = min(top + max(1, height) - 1, viewport_bottom)
+    right = min(viewport_left + max(1, columns) - 1, viewport_right)
+    width = right - viewport_left + 1
+    height = bottom - top + 1
+    if width <= 0 or height <= 0:
+        return None
+
+    buffer = (_CHAR_INFO * (width * height))()
+    rect = _SMALL_RECT(viewport_left, top, right, bottom)
+    buffer_size = _COORD(width, height)
+    buffer_coord = _COORD(0, 0)
+
+    if not KERNEL32.ReadConsoleOutputW(
+        STDOUT, buffer, buffer_size, buffer_coord, ctypes.byref(rect)
+    ):
+        return None
+
+    return buffer, width, height, viewport_left, top, right, bottom
+
+
+def _windows_write_region(saved_region):
+    if not saved_region:
+        return
+
+    buffer, width, height, left, top, right, bottom = saved_region
+    rect = _SMALL_RECT(left, top, right, bottom)
+    KERNEL32.WriteConsoleOutputW(
+        STDOUT,
+        buffer,
+        _COORD(width, height),
+        _COORD(0, 0),
+        ctypes.byref(rect),
+    )
+
+
 def _input_char_width(character):
     if unicodedata.combining(character):
         return 0
@@ -605,6 +685,360 @@ def _input_move_vertical(chars, cursor, step, column):
     return _input_cursor_at_column(chars, start, end, column)
 
 
+BOTTOM_INPUT_BORDER = "\u2500"
+BOTTOM_INPUT_PROMPT = "❯ "
+BOTTOM_INPUT_PLACEHOLDER = "Type a message..."
+ANSI = "\x1b["
+
+
+def _ansi_write(text):
+    console.file.write(text)
+    console.file.flush()
+
+
+def _enable_ansi_input_rendering():
+    if os.name != "nt":
+        return
+
+    mode = wintypes.DWORD()
+    if not KERNEL32.GetConsoleMode(STDOUT, ctypes.byref(mode)):
+        return
+
+    enable_virtual_terminal_processing = 0x0004
+    KERNEL32.SetConsoleMode(
+        STDOUT, mode.value | enable_virtual_terminal_processing
+    )
+
+
+def _bottom_terminal_size():
+    if os.name == "nt":
+        try:
+            info = _windows_console_info()
+            rows = info.srWindow.Bottom - info.srWindow.Top + 1
+            columns = info.srWindow.Right - info.srWindow.Left + 1
+            return max(4, rows), max(10, columns)
+        except OSError:
+            pass
+
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    return max(4, size.lines), max(10, size.columns)
+
+
+def _input_text_width(text):
+    return sum(_input_char_width(character) for character in text)
+
+
+def _input_rich_render(text, style, width):
+    output = StringIO()
+    render_console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        width=max(1, width),
+        legacy_windows=False,
+        highlight=False,
+    )
+    render_console.print(Text(text, style=style), end="", soft_wrap=True)
+    return output.getvalue()
+
+
+def _submitted_prompt(prompt_text):
+    return Text.assemble(
+        "\n",
+        gradient_text("[-]", *INFO_COLOR),
+        gradient_text(f" {prompt_text}", *TEXT_COLOR),
+    )
+
+
+class _BottomInputRenderer:
+    def __init__(self, prompt_text):
+        _enable_ansi_input_rendering()
+        self.prompt_text = str(prompt_text)
+        self.rows, self.columns = _bottom_terminal_size()
+        self.input_height = 0
+        self.output_bottom = self.rows
+        self.saved_region = None
+        info = _windows_console_info()
+        self.output_row = min(
+            max(info.dwCursorPosition.Y - info.srWindow.Top + 1, 1), self.rows
+        )
+        self.output_col = min(
+            max(info.dwCursorPosition.X - info.srWindow.Left + 1, 1), self.columns
+        )
+
+    def render(self, chars, cursor):
+        self._restore_saved_region()
+        self.rows, self.columns = _bottom_terminal_size()
+        self.output_col = min(max(self.output_col, 1), self.columns)
+        lines, cursor_row, cursor_col = self._build_lines(chars, cursor)
+        max_content_height = max(1, self.rows - 3)
+        content_height = min(len(lines), max_content_height)
+        self._set_input_height(content_height + 2)
+
+        input_top = self.rows - self.input_height + 1
+        self._save_input_area(input_top)
+        self._clear_input_area()
+        self._write_border(input_top)
+        self._write_border(self.rows)
+
+        visible_start = max(0, cursor_row - content_height + 1)
+        visible_start = min(visible_start, max(0, len(lines) - content_height))
+        first_content_row = input_top + 1
+
+        visible_lines = lines[visible_start : visible_start + content_height]
+        for offset, line in enumerate(visible_lines):
+            row = first_content_row + offset
+            _ansi_write(f"{ANSI}{row};1H")
+            self._write_input_line(line, visible_start + offset)
+
+        cursor_screen_row = first_content_row + cursor_row - visible_start
+        _ansi_write(f"{ANSI}{cursor_screen_row};{cursor_col}H{ANSI}?25h")
+
+    def submit(self, value):
+        self._restore()
+        self.input_height = 3
+        self.output_bottom = max(1, self.rows - self.input_height)
+        self._scroll_output_if_needed()
+        self._set_output_scroll_region()
+        _ansi_write(f"{ANSI}{self.output_row};{self.output_col}H")
+        console.print(_submitted_prompt(self.prompt_text), end="")
+        console.print(Text(value, style=f"bold {STREAM_RESPONSE_COLOR}"), end="")
+        console.file.write("\n")
+        console.file.flush()
+        self._capture_output_cursor()
+        self._render_idle()
+
+    def close(self):
+        self._restore()
+
+    def _restore(self):
+        self._restore_saved_region()
+        _ansi_write(f"{ANSI}r{ANSI}?25h{ANSI}{self.output_row};{self.output_col}H")
+
+    def _set_input_height(self, height):
+        height = max(3, min(height, self.rows))
+        self.input_height = height
+        self.output_bottom = max(1, self.rows - height)
+        _ansi_write(f"{ANSI}?25l")
+
+    def _set_output_scroll_region(self):
+        _ansi_write(f"{ANSI}1;{self.output_bottom}r")
+
+    def _scroll_output_if_needed(self):
+        if self.output_row <= self.output_bottom:
+            return
+
+        scroll_lines = self.output_row - self.output_bottom
+        _ansi_write(f"{ANSI}r{ANSI}{self.rows};1H" + ("\n" * scroll_lines))
+        self.output_row = self.output_bottom
+
+    def _capture_output_cursor(self):
+        info = _windows_console_info()
+        self.output_row = min(
+            max(info.dwCursorPosition.Y - info.srWindow.Top + 1, 1), self.rows
+        )
+        self.output_col = min(
+            max(info.dwCursorPosition.X - info.srWindow.Left + 1, 1), self.columns
+        )
+        self._scroll_output_if_needed()
+        self._set_output_scroll_region()
+
+    def _render_idle(self):
+        self.rows, self.columns = _bottom_terminal_size()
+        self.input_height = 3
+        self.output_bottom = max(1, self.rows - self.input_height)
+        self._scroll_output_if_needed()
+        self._set_output_scroll_region()
+
+        input_top = self.rows - self.input_height + 1
+        self._clear_input_area()
+        self._write_border(input_top)
+        self._write_border(self.rows)
+        _ansi_write(f"{ANSI}{input_top + 1};1H")
+        self._write_input_line(BOTTOM_INPUT_PROMPT, 0)
+        _ansi_write(f"{ANSI}{self.output_row};{self.output_col}H{ANSI}?25h")
+
+    def _clear_input_area(self, height=None):
+        height = self.input_height if height is None else height
+        if height <= 0:
+            return
+
+        height = min(height, self.rows)
+        input_top = max(1, self.rows - height + 1)
+        for row in range(input_top, self.rows + 1):
+            _ansi_write(f"{ANSI}{row};1H{ANSI}2K")
+
+    def _write_border(self, row):
+        _ansi_write(f"{ANSI}{row};1H{BOTTOM_INPUT_BORDER * self.columns}")
+
+    def _save_input_area(self, input_top):
+        self.saved_region = _windows_read_region(
+            input_top, self.input_height, self.columns
+        )
+
+    def _restore_saved_region(self):
+        if not self.saved_region:
+            return
+
+        _windows_write_region(self.saved_region)
+        self.saved_region = None
+
+    def _write_input_line(self, line, line_index):
+        if line_index == 0:
+            prompt_width = _input_text_width(BOTTOM_INPUT_PROMPT)
+            _ansi_write(
+                _input_rich_render(
+                    BOTTOM_INPUT_PROMPT,
+                    f"bold {STREAM_RESPONSE_COLOR}",
+                    prompt_width,
+                )
+            )
+            body = line[len(BOTTOM_INPUT_PROMPT) :]
+            width = self.columns - prompt_width
+        else:
+            body = line
+            width = self.columns
+
+        if line_index == 0 and not body and width > 0:
+            placeholder = BOTTOM_INPUT_PLACEHOLDER[:width]
+            _ansi_write(
+                _input_rich_render(placeholder, f"bold {STREAM_THINK_COLOR}", width)
+            )
+            return
+
+        if body and width > 0:
+            _ansi_write(_input_rich_render(body, "bold", width))
+
+    def _build_lines(self, chars, cursor):
+        lines = [BOTTOM_INPUT_PROMPT]
+        widths = [_input_text_width(BOTTOM_INPUT_PROMPT)]
+        cursor_row = 0
+        cursor_col = min(widths[0] + 1, self.columns)
+
+        for index, character in enumerate(chars):
+            if index == cursor:
+                cursor_row = len(lines) - 1
+                cursor_col = min(widths[-1] + 1, self.columns)
+
+            if character == "\n":
+                lines.append("")
+                widths.append(0)
+                continue
+
+            width = _input_char_width(character)
+            if widths[-1] + width > self.columns:
+                lines.append("")
+                widths.append(0)
+
+            lines[-1] += character
+            widths[-1] += width
+
+        if cursor == len(chars):
+            cursor_row = len(lines) - 1
+            cursor_col = min(widths[-1] + 1, self.columns)
+
+        return lines, cursor_row, max(1, cursor_col)
+
+
+def _read_bottom_multiline_input(prompt_text):
+    chars = []
+    cursor = 0
+    paste_active = False
+    skip_lf = False
+    target_column = None
+    renderer = _BottomInputRenderer(prompt_text)
+    renderer.render(chars, cursor)
+
+    try:
+        while True:
+            ch = msvcrt.getwch()
+
+            if ch in WINDOWS_SPECIAL_KEY_PREFIXES:
+                paste_active = False
+                skip_lf = False
+                key = msvcrt.getwch()
+                if key in ("H", "P"):
+                    if target_column is None:
+                        start, _ = _input_line_bounds(chars, cursor)
+                        target_column = _input_column_at(chars, start, cursor)
+                    cursor = _input_move_vertical(
+                        chars, cursor, -1 if key == "H" else 1, target_column
+                    )
+                    renderer.render(chars, cursor)
+                elif key == "K" and cursor > 0:
+                    target_column = None
+                    cursor -= 1
+                    renderer.render(chars, cursor)
+                elif key == "M" and cursor < len(chars):
+                    target_column = None
+                    cursor += 1
+                    renderer.render(chars, cursor)
+                elif key == "G":
+                    target_column = None
+                    cursor, _ = _input_line_bounds(chars, cursor)
+                    renderer.render(chars, cursor)
+                elif key == "O":
+                    target_column = None
+                    _, cursor = _input_line_bounds(chars, cursor)
+                    renderer.render(chars, cursor)
+                elif key == "S" and cursor < len(chars):
+                    target_column = None
+                    del chars[cursor]
+                    renderer.render(chars, cursor)
+                continue
+
+            queued = msvcrt.kbhit()
+            pasted = paste_active or queued
+
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x1a":
+                raise EOFError
+
+            if ch in ("\r", "\n"):
+                if ch == "\n" and skip_lf:
+                    skip_lf = False
+                    paste_active = queued
+                    continue
+
+                if any(_key_down(key) for key in WINDOWS_NEWLINE_KEYS) or pasted:
+                    target_column = None
+                    chars.insert(cursor, "\n")
+                    cursor += 1
+                    renderer.render(chars, cursor)
+                    paste_active = queued
+                    skip_lf = ch == "\r"
+                    continue
+
+                value = "".join(chars)
+                renderer.submit(value)
+                return value
+
+            skip_lf = False
+
+            if ch == "\b":
+                if cursor > 0:
+                    target_column = None
+                    cursor -= 1
+                    del chars[cursor]
+                    renderer.render(chars, cursor)
+                paste_active = queued
+                continue
+
+            if not ch.isprintable():
+                paste_active = queued
+                continue
+
+            target_column = None
+            chars.insert(cursor, ch)
+            cursor += 1
+            renderer.render(chars, cursor)
+            paste_active = queued
+    except BaseException:
+        renderer.close()
+        raise
+
+
 def _read_windows_multiline_input(prompt):
     chars = []
     cursor = 0
@@ -707,7 +1141,7 @@ def _read_windows_multiline_input(prompt):
 def get_user_input(prompt_text, multiline=False):
     prompt = _input_prompt(prompt_text)
     if multiline and os.name == "nt" and sys.stdin.isatty() and sys.stdout.isatty():
-        return _read_windows_multiline_input(prompt).strip()
+        return _read_bottom_multiline_input(prompt_text).strip()
     return console.input(prompt).strip()
 
 
