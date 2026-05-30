@@ -105,6 +105,7 @@ def _apply_config(chat, config):
             config.temperature,
             config.stream_mode,
             config.thinking_mode,
+            config.reasoning_effort,
         )
         chat.set_context_window_tokens(config.context_window_tokens)
         chat.set_agent_limits(config.max_agent_rounds, config.max_agent_tool_calls)
@@ -117,6 +118,7 @@ def _apply_config(chat, config):
             config.compaction_compact_model,
             config.compaction_trigger_ratio,
         )
+        chat.set_memory_model(config.memory_model)
         chat.set_web_search_config(
             config.web_search_enable,
             config.web_search_provider,
@@ -128,7 +130,6 @@ def _apply_config(chat, config):
 
         if config.agent_mode and not chat.get_agent_status().get("workspace_dir"):
             chat.set_agent_mode(False)
-            save_config_field("agent_mode", False)
             print_warn("Agent mode requires a startup workspace directory and has been turned off.")
         else:
             chat.set_agent_mode(config.agent_mode)
@@ -389,9 +390,17 @@ def handle_memory(chat, args):
         value = parts[1].strip() if len(parts) > 1 else ""
 
     if action in {"show", "status"}:
+        memory_model_status = (
+            chat.get_memory_model_status()
+            if hasattr(chat, "get_memory_model_status")
+            else {}
+        )
+        configured_model = memory_model_status.get("configured_model") or "None"
+        effective_model = memory_model_status.get("effective_model") or getattr(chat, "model", "")
         print_info(
             "Persistent memory files:\n"
             f"{store.paths_summary()}\n\n"
+            f"Memory model: {effective_model} (configured: {configured_model}).\n\n"
             "Usage: /memory core | /memory prefs | /memory today | "
             "/memory date YYYY-MM-DD | /memory search <query> | "
             "/memory history"
@@ -543,7 +552,6 @@ def handle_agent(chat, args):
     if mode == "on" and len(parts) == 1:
         if not status["workspace_dir"]:
             chat.set_agent_mode(False)
-            save_config_field("agent_mode", False)
             print_error("Agent mode requires a startup workspace directory. Example: python main.py <workspace>")
             return True
         chat.set_agent_mode(True)

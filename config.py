@@ -28,6 +28,7 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_STREAM_MODE = False
 DEFAULT_THINKING_MODE = False
+DEFAULT_REASONING_EFFORT = ""
 DEFAULT_AGENT_MODE = False
 DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
@@ -38,12 +39,14 @@ DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
 DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75
 DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
 DEFAULT_COMPACTION_COMPACT_MODEL = ""
+DEFAULT_MEMORY_MODEL = ""
 AGENT_THINKING_OFF = "off"
 AGENT_THINKING_SUMMARY = "summary"
 AGENT_THINKING_FULL = "full"
 DEFAULT_AGENT_SHOW_THINKING = AGENT_THINKING_SUMMARY
 AGENT_APPROVAL_MODES = {"confirm", "auto"}
 AGENT_THINKING_MODES = {AGENT_THINKING_OFF, AGENT_THINKING_SUMMARY, AGENT_THINKING_FULL}
+REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 SUPPORTED_API_TYPES = {
     API_TYPE_GLM,
     API_TYPE_ANTHROPIC,
@@ -63,6 +66,7 @@ class AppConfig:
     temperature: float = DEFAULT_TEMPERATURE
     stream_mode: bool = DEFAULT_STREAM_MODE
     thinking_mode: bool = DEFAULT_THINKING_MODE
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     agent_mode: bool = DEFAULT_AGENT_MODE
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
@@ -74,6 +78,7 @@ class AppConfig:
     compaction_trigger_ratio: float = DEFAULT_COMPACTION_TRIGGER_RATIO
     compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
+    memory_model: str = DEFAULT_MEMORY_MODEL
     web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
     web_search_provider: str = DEFAULT_WEB_SEARCH_PROVIDER
     web_search_api_key: str = ""
@@ -91,6 +96,7 @@ class AppConfig:
             "temperature": self.temperature,
             "stream_mode": self.stream_mode,
             "thinking_mode": self.thinking_mode,
+            "reasoning_effort": self.reasoning_effort,
             "context_window_tokens": self.context_window_tokens,
             "agent_mode": self.agent_mode,
             "max_agent_rounds": self.max_agent_rounds,
@@ -102,6 +108,7 @@ class AppConfig:
             "compaction_trigger_ratio": self.compaction_trigger_ratio,
             "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
             "compaction_compact_model": self.compaction_compact_model,
+            "memory_model": self.memory_model,
             "web_search_enable": self.web_search_enable,
             "web_search_provider": self.web_search_provider,
             "web_search_api_key": self.web_search_api_key,
@@ -120,6 +127,7 @@ class AppConfig:
             "temperature": self.temperature,
             "stream_mode": self.stream_mode,
             "thinking_mode": self.thinking_mode,
+            "reasoning_effort": self.reasoning_effort,
             "context_window_tokens": self.context_window_tokens,
             "agent_mode": {
                 "enable": self.agent_mode,
@@ -134,6 +142,9 @@ class AppConfig:
                 "trigger_ratio": self.compaction_trigger_ratio,
                 "keep_recent_messages": self.compaction_keep_recent_messages,
                 "compact_model": self.compaction_compact_model,
+            },
+            "memory_system": {
+                "memory_model": self.memory_model,
             },
             "web_search": {
                 "enable": self.web_search_enable,
@@ -269,6 +280,26 @@ def parse_agent_show_thinking(value):
     raise ValueError("Agent thinking display must be summary, full, or off.")
 
 
+def parse_reasoning_effort(value):
+    if value is None:
+        return DEFAULT_REASONING_EFFORT
+    if isinstance(value, bool):
+        return "medium" if value else "none"
+
+    effort = str(value or "").strip().lower()
+    if effort in {"", "default", "auto"}:
+        return DEFAULT_REASONING_EFFORT
+    if effort in {"false", "0", "no", "off", "disable", "disabled"}:
+        return "none"
+    if effort in {"true", "ture", "1", "yes", "on"}:
+        return "medium"
+    if effort not in REASONING_EFFORT_VALUES:
+        raise ValueError(
+            "Reasoning effort must be empty, none, minimal, low, medium, high, xhigh, or max."
+        )
+    return effort
+
+
 def parse_temperature(value):
     try:
         temperature = float(str(value).strip())
@@ -305,6 +336,11 @@ def _extract_compaction_config(config):
     return dict(raw_compaction_config) if isinstance(raw_compaction_config, dict) else {}
 
 
+def _extract_memory_config(config):
+    raw_memory_config = config.get("memory_system", {})
+    return dict(raw_memory_config) if isinstance(raw_memory_config, dict) else {}
+
+
 def _extract_web_search_config(config):
     raw_web_search_config = config.get("web_search", {})
     return dict(raw_web_search_config) if isinstance(raw_web_search_config, dict) else {}
@@ -313,6 +349,7 @@ def _extract_web_search_config(config):
 def _sanitize_config(config):
     agent_config = _extract_agent_config(config)
     compaction_config = _extract_compaction_config(config)
+    memory_config = _extract_memory_config(config)
     web_search_config = _extract_web_search_config(config)
 
     config["api_type"] = normalize_api_type(config.get("api_type"))
@@ -338,6 +375,16 @@ def _sanitize_config(config):
 
     config["stream_mode"] = _parse_bool(config.get("stream_mode"), DEFAULT_STREAM_MODE)
     config["thinking_mode"] = _parse_bool(config.get("thinking_mode"), DEFAULT_THINKING_MODE)
+    try:
+        config["reasoning_effort"] = parse_reasoning_effort(
+            config.get("reasoning_effort", DEFAULT_REASONING_EFFORT)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid reasoning_effort in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_REASONING_EFFORT or 'empty'}."
+        )
+        config["reasoning_effort"] = DEFAULT_REASONING_EFFORT
 
     context_window_tokens = config.pop("context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS)
     try:
@@ -425,6 +472,10 @@ def _sanitize_config(config):
         config["compaction_keep_recent_messages"] = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
     config["compaction_compact_model"] = str(
         compaction_config.get("compact_model", DEFAULT_COMPACTION_COMPACT_MODEL) or ""
+    ).strip()
+    config["memory_model"] = str(
+        memory_config.get("memory_model", DEFAULT_MEMORY_MODEL)
+        or ""
     ).strip()
 
     config["web_search_enable"] = _parse_bool(
@@ -579,6 +630,18 @@ def _prompt_temperature(prompt, default_value):
             print_error(str(error))
 
 
+def _prompt_reasoning_effort(prompt, default_value):
+    while True:
+        value = get_user_input(prompt).strip()
+        if not value:
+            return default_value
+
+        try:
+            return parse_reasoning_effort(value)
+        except ValueError as error:
+            print_error(str(error))
+
+
 def _prompt_compaction_trigger_ratio(prompt, default_value):
     while True:
         value = get_user_input(prompt).strip()
@@ -633,6 +696,7 @@ def load_config():
         temperature=temperature,
         stream_mode=DEFAULT_STREAM_MODE,
         thinking_mode=DEFAULT_THINKING_MODE,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
         context_window_tokens=context_window_tokens,
         agent_mode=DEFAULT_AGENT_MODE,
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
@@ -644,6 +708,7 @@ def load_config():
         compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
         compaction_compact_model=DEFAULT_COMPACTION_COMPACT_MODEL,
+        memory_model=DEFAULT_MEMORY_MODEL,
         web_search_enable=DEFAULT_WEB_SEARCH_ENABLE,
         web_search_provider=DEFAULT_WEB_SEARCH_PROVIDER,
         web_search_api_key="",
@@ -731,6 +796,10 @@ def update_config():
         f"Temperature (Current: {config.temperature}): ",
         config.temperature,
     )
+    new_reasoning_effort = _prompt_reasoning_effort(
+        f"Reasoning effort (Current: {config.reasoning_effort or 'provider default'}): ",
+        config.reasoning_effort,
+    )
     new_max_agent_rounds = _prompt_agent_rounds(
         f"Agent max rounds (Current: {config.max_agent_rounds}): ",
         config.max_agent_rounds,
@@ -755,6 +824,12 @@ def update_config():
         ).strip()
         or config.compaction_compact_model
     )
+    new_memory_model = (
+        get_user_input(
+            f"Memory model (Current: {config.memory_model or 'Current model'}): "
+        ).strip()
+        or config.memory_model
+    )
     new_compaction_trigger_ratio = _prompt_compaction_trigger_ratio(
         f"Auto compact trigger ratio (Current: {config.compaction_trigger_ratio}): ",
         config.compaction_trigger_ratio,
@@ -769,6 +844,7 @@ def update_config():
         temperature=new_temperature,
         stream_mode=config.stream_mode,
         thinking_mode=config.thinking_mode,
+        reasoning_effort=new_reasoning_effort,
         context_window_tokens=new_context_window_tokens,
         agent_mode=config.agent_mode,
         max_agent_rounds=new_max_agent_rounds,
@@ -780,6 +856,7 @@ def update_config():
         compaction_trigger_ratio=new_compaction_trigger_ratio,
         compaction_keep_recent_messages=config.compaction_keep_recent_messages,
         compaction_compact_model=new_compaction_compact_model,
+        memory_model=new_memory_model,
         web_search_enable=config.web_search_enable,
         web_search_provider=config.web_search_provider,
         web_search_api_key=config.web_search_api_key,

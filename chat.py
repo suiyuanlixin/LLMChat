@@ -35,6 +35,7 @@ from config import (
     SUPPORTED_API_TYPES,
     normalize_api_type,
     parse_agent_show_thinking,
+    parse_reasoning_effort,
 )
 from memory import MemoryStore, parse_memory_update_response
 from tools import (
@@ -181,6 +182,7 @@ class LLMChat:
         temperature=0.7,
         stream_mode=False,
         thinking_mode=False,
+        reasoning_effort="",
         agent_mode=False,
         workspace_dir=None,
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
@@ -192,6 +194,7 @@ class LLMChat:
         compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=12,
         compaction_compact_model="",
+        memory_model="",
         web_search_enabled=True,
         web_search_provider="tavily",
         web_search_api_key="",
@@ -208,6 +211,7 @@ class LLMChat:
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
+        self.reasoning_effort = parse_reasoning_effort(reasoning_effort)
         self.last_context_input_tokens = 0
         self.last_context_usage_source = ""
         self.set_context_window_tokens(context_window_tokens)
@@ -217,6 +221,7 @@ class LLMChat:
             compaction_compact_model,
             compaction_trigger_ratio,
         )
+        self.set_memory_model(memory_model)
         self.agent_tools = AgentTools(
             workspace_dir,
             approval_mode=agent_approval_mode,
@@ -245,7 +250,17 @@ class LLMChat:
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
-        self.configure(api_type, base_url, model, api_key, max_tokens, temperature, stream_mode)
+        self.configure(
+            api_type,
+            base_url,
+            model,
+            api_key,
+            max_tokens,
+            temperature,
+            stream_mode,
+            thinking_mode=None,
+            reasoning_effort=None,
+        )
 
     def configure(
         self,
@@ -257,6 +272,7 @@ class LLMChat:
         temperature=None,
         stream_mode=None,
         thinking_mode=None,
+        reasoning_effort=None,
     ):
         api_type = normalize_api_type(api_type)
         if api_type not in SUPPORTED_API_TYPES:
@@ -284,6 +300,8 @@ class LLMChat:
             self.stream_mode = stream_mode
         if thinking_mode is not None:
             self.thinking_mode = thinking_mode
+        if reasoning_effort is not None:
+            self.set_reasoning_effort(reasoning_effort)
 
     def _create_client(self, api_type, api_key, base_url):
         if api_type == API_TYPE_ANTHROPIC:
@@ -343,6 +361,9 @@ class LLMChat:
 
     def set_thinking_mode(self, enabled):
         self.thinking_mode = enabled
+
+    def set_reasoning_effort(self, effort):
+        self.reasoning_effort = parse_reasoning_effort(effort)
 
     def set_agent_limits(self, max_rounds=None, max_tool_calls=None):
         if max_rounds is not None:
@@ -405,6 +426,18 @@ class LLMChat:
                 raise ValueError("Auto compact trigger ratio must be greater than 0 and at most 1.")
             self.compaction_trigger_ratio = ratio
 
+    def set_memory_model(self, model):
+        self.memory_model = str(model or "").strip()
+
+    def _memory_model_name(self):
+        return self.memory_model or self.model
+
+    def get_memory_model_status(self):
+        return {
+            "configured_model": self.memory_model,
+            "effective_model": self._memory_model_name(),
+        }
+
     def set_workspace_dir(self, workspace_dir):
         self.agent_tools.set_workspace_dir(workspace_dir)
         if not self.agent_tools.enabled:
@@ -462,6 +495,7 @@ class LLMChat:
                     temperature=self.temperature,
                     system=self._normal_system_prompt(),
                     messages=self._anthropic_messages(),
+                    **self._anthropic_request_options(),
                 )
                 response = self._parse_anthropic_response(response)
             elif self.api_type == API_TYPE_OLLAMA:
@@ -795,6 +829,7 @@ class LLMChat:
                 system=self._normal_system_prompt(),
                 messages=self._anthropic_messages(),
                 tools=self._normal_web_search_tool_schemas(),
+                **self._anthropic_request_options(),
             )
             self._record_context_usage(response)
             blocks = self._anthropic_content_blocks(self._get_field(response, "content", []))
@@ -986,6 +1021,7 @@ class LLMChat:
             system=self._agent_system_prompt(),
             tools=anthropic_tool_schemas(self.agent_tools.web_search_available),
             stream=True,
+            **self._anthropic_request_options(),
         )
 
         usage_input_tokens = None
@@ -1575,22 +1611,23 @@ class LLMChat:
 
     def _schedule_memory_update_from_compaction(self, summary, source_messages, compact_model):
         compacted_messages = self._format_messages_for_compaction(source_messages)
+        memory_model = self._memory_model_name()
         self._start_memory_background_task(
             self._update_memory_from_compaction,
             summary,
             compacted_messages,
-            compact_model,
+            memory_model,
         )
         return {"changed": [], "scheduled": True}
 
-    def _update_memory_from_compaction(self, summary, compacted_messages, compact_model):
+    def _update_memory_from_compaction(self, summary, compacted_messages, memory_model):
         try:
             prompt = self.memory_store.build_update_prompt(compacted_messages, summary)
-            raw_update = self._create_memory_update(prompt, compact_model)
+            raw_update = self._create_memory_update(prompt, memory_model)
             update = self._parse_memory_update_with_repair(
                 raw_update,
                 prompt,
-                compact_model,
+                memory_model,
                 source="compaction",
                 expected="core_memory/preference_memory",
             )
@@ -1636,12 +1673,12 @@ class LLMChat:
                     formatted_messages,
                     current_entry,
                 )
-                compact_model = self.compaction_compact_model or self.model
-                raw_update = self._create_memory_update(prompt, compact_model)
+                memory_model = self._memory_model_name()
+                raw_update = self._create_memory_update(prompt, memory_model)
                 update = self._parse_memory_update_with_repair(
                     raw_update,
                     prompt,
-                    compact_model,
+                    memory_model,
                     source="session_episodic",
                     expected="episodic_memory",
                 )
@@ -1703,7 +1740,7 @@ class LLMChat:
         self,
         raw_update,
         original_prompt,
-        compact_model,
+        memory_model,
         source,
         expected,
     ):
@@ -1722,7 +1759,7 @@ class LLMChat:
         )
         repair_response = ""
         try:
-            repair_response = self._create_memory_update(repair_prompt, compact_model)
+            repair_response = self._create_memory_update(repair_prompt, memory_model)
             repaired = parse_memory_update_response(repair_response)
             if repaired:
                 self.memory_store.record_update_diagnostic(
@@ -1749,7 +1786,7 @@ class LLMChat:
         )
         return {}
 
-    def _create_memory_update(self, prompt, compact_model):
+    def _create_memory_update(self, prompt, memory_model):
         system_prompt = _with_persistent_memory(
             MEMORY_UPDATE_SYSTEM_PROMPT,
             self.memory_store,
@@ -1762,7 +1799,7 @@ class LLMChat:
 
         if self.api_type == API_TYPE_ANTHROPIC:
             response = self.client.messages.create(
-                model=compact_model,
+                model=memory_model,
                 max_tokens=MEMORY_UPDATE_MAX_TOKENS,
                 temperature=temperature,
                 system=system_prompt,
@@ -1773,7 +1810,7 @@ class LLMChat:
         if self.api_type == API_TYPE_OLLAMA:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
-                    model=compact_model,
+                    model=memory_model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=MEMORY_UPDATE_MAX_TOKENS,
@@ -1785,7 +1822,7 @@ class LLMChat:
 
         response = self.client.chat.completions.create(
             **self._chat_completion_kwargs(
-                model=compact_model,
+                model=memory_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=MEMORY_UPDATE_MAX_TOKENS,
@@ -2181,6 +2218,7 @@ class LLMChat:
                 system=self._normal_system_prompt(),
                 messages=self._anthropic_messages(),
                 stream=True,
+                **self._anthropic_request_options(),
             )
 
             if self.thinking_mode:
@@ -2513,6 +2551,98 @@ class LLMChat:
             )
         return _with_user_custom_prompt(_with_persistent_memory(prompt, self.memory_store))
 
+    def _reasoning_effort_value(self):
+        return parse_reasoning_effort(self.reasoning_effort)
+
+    def _reasoning_disabled_by_effort(self):
+        return self._reasoning_effort_value() == "none"
+
+    def _chat_completion_reasoning_effort(self, model=None):
+        effort = self._reasoning_effort_value()
+        if not effort or self.api_type == API_TYPE_GLM:
+            return ""
+        if self._uses_deepseek_openai_compat(model):
+            return self._deepseek_reasoning_effort(effort)
+        if self._uses_gemini_openai_compat(model):
+            return self._gemini_reasoning_effort(effort)
+        if effort == "max":
+            return "xhigh"
+        return effort
+
+    def _anthropic_request_options(self, include_reasoning=True):
+        if not include_reasoning:
+            return {}
+        effort_value = self._reasoning_effort_value()
+        options = {}
+        if self._uses_deepseek_anthropic_compat():
+            effort = self._deepseek_reasoning_effort(effort_value)
+            options["thinking"] = {
+                "type": (
+                    "enabled"
+                    if self.thinking_mode and effort_value != "none"
+                    else "disabled"
+                )
+            }
+        else:
+            effort = self._anthropic_reasoning_effort(effort_value)
+        if effort:
+            options["output_config"] = {"effort": effort}
+        return options
+
+    @staticmethod
+    def _anthropic_reasoning_effort(effort):
+        if not effort:
+            return ""
+        if effort in {"none", "minimal"}:
+            return "low"
+        return effort
+
+    @staticmethod
+    def _deepseek_reasoning_effort(effort):
+        if not effort or effort == "none":
+            return ""
+        if effort in {"max", "xhigh"}:
+            return "max"
+        return "high"
+
+    @staticmethod
+    def _gemini_reasoning_effort(effort):
+        if not effort:
+            return ""
+        if effort in {"max", "xhigh"}:
+            return "high"
+        return effort
+
+    @staticmethod
+    def _ollama_reasoning_effort_value(effort):
+        if not effort:
+            return ""
+        if effort == "none":
+            return False
+        if effort in {"minimal", "low"}:
+            return "low"
+        if effort == "medium":
+            return "medium"
+        return "high"
+
+    def _ollama_reasoning_effort(self, model=None):
+        effort = self._reasoning_effort_value()
+        if not effort:
+            return ""
+        return self._ollama_reasoning_effort_value(effort)
+
+    @staticmethod
+    def _merge_extra_body(kwargs, extra_body):
+        if not extra_body:
+            return
+        existing = kwargs.get("extra_body")
+        if isinstance(existing, dict):
+            merged = dict(existing)
+            merged.update(extra_body)
+            kwargs["extra_body"] = merged
+            return
+        kwargs["extra_body"] = dict(extra_body)
+
     def _chat_completion_kwargs(
         self,
         model=None,
@@ -2529,21 +2659,47 @@ class LLMChat:
             "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
+        if include_reasoning:
+            reasoning_effort = self._chat_completion_reasoning_effort(model)
+            if reasoning_effort:
+                kwargs["reasoning_effort"] = reasoning_effort
         if self.api_type == API_TYPE_GLM and include_reasoning:
-            kwargs["thinking"] = {"type": "enabled"} if self.thinking_mode else {}
+            kwargs["thinking"] = {
+                "type": (
+                    "enabled"
+                    if self.thinking_mode and not self._reasoning_disabled_by_effort()
+                    else "disabled"
+                )
+            }
+        elif include_reasoning and self._uses_deepseek_openai_compat(model):
+            self._merge_extra_body(
+                kwargs,
+                {
+                    "thinking": {
+                        "type": (
+                            "enabled"
+                            if self.thinking_mode and not self._reasoning_disabled_by_effort()
+                            else "disabled"
+                        ),
+                    }
+                },
+            )
         elif include_reasoning and self._uses_gemini_openai_compat(model):
-            if self.thinking_mode:
-                kwargs["extra_body"] = {
-                    "extra_body": {
-                        "google": {
-                            "thinking_config": {
-                                "include_thoughts": True,
+            if self.thinking_mode and not self._reasoning_disabled_by_effort():
+                self._merge_extra_body(
+                    kwargs,
+                    {
+                        "extra_body": {
+                            "google": {
+                                "thinking_config": {
+                                    "include_thoughts": True,
+                                }
                             }
                         }
-                    }
-                }
+                    },
+                )
         elif include_reasoning and self._uses_minimax_openai_compat(model):
-            kwargs["extra_body"] = {"reasoning_split": True}
+            self._merge_extra_body(kwargs, {"reasoning_split": True})
         if stream:
             kwargs["stream"] = True
         if tools is not None:
@@ -2633,6 +2789,11 @@ class LLMChat:
     def _ollama_think_value(self, model=None, include_reasoning=True):
         if not include_reasoning:
             return False
+        reasoning_effort = self._ollama_reasoning_effort(model)
+        if reasoning_effort is False:
+            return False
+        if reasoning_effort:
+            return reasoning_effort
         if not self.thinking_mode:
             return False
         model_name = str(model or self.model or "").lower()
@@ -2678,6 +2839,20 @@ class LLMChat:
         base_url = str(self.base_url or "").lower()
         model_name = str(model or self.model or "").lower()
         return "minimax" in base_url or "minimaxi" in base_url or model_name.startswith("minimax")
+
+    def _uses_deepseek_openai_compat(self, model=None):
+        if self.api_type != API_TYPE_OPENAI:
+            return False
+        base_url = str(self.base_url or "").lower()
+        model_name = str(model or self.model or "").lower()
+        return "deepseek" in base_url or model_name.startswith("deepseek")
+
+    def _uses_deepseek_anthropic_compat(self, model=None):
+        if self.api_type != API_TYPE_ANTHROPIC:
+            return False
+        base_url = str(self.base_url or "").lower()
+        model_name = str(model or self.model or "").lower()
+        return "deepseek" in base_url or model_name.startswith("deepseek")
 
     def _uses_gemini_openai_compat(self, model=None):
         if self.api_type == API_TYPE_GEMINI:

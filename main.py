@@ -14,7 +14,7 @@ from ui import (
     clean_and_print_stream_response,
     clean_display_text,
 )
-from config import load_config, save_config_field
+from config import load_config
 from chat import LLMChat
 from commands import process_command
 from tools import MAX_READ_CHARS, normalize_workspace_dir
@@ -150,7 +150,6 @@ def main():
     agent_auto_disabled = False
     if config.agent_mode and not workspace_dir:
         config.agent_mode = False
-        save_config_field("agent_mode", False)
         agent_auto_disabled = True
 
     show_dashboard(config.model, workspace_dir)
@@ -169,6 +168,7 @@ def main():
             temperature=config.temperature,
             stream_mode=config.stream_mode,
             thinking_mode=config.thinking_mode,
+            reasoning_effort=config.reasoning_effort,
             agent_mode=config.agent_mode,
             workspace_dir=workspace_dir,
             max_agent_rounds=config.max_agent_rounds,
@@ -180,6 +180,7 @@ def main():
             compaction_trigger_ratio=config.compaction_trigger_ratio,
             compaction_keep_recent_messages=config.compaction_keep_recent_messages,
             compaction_compact_model=config.compaction_compact_model,
+            memory_model=config.memory_model,
             web_search_enabled=config.web_search_enable,
             web_search_provider=config.web_search_provider,
             web_search_api_key=config.web_search_api_key,
