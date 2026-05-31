@@ -740,6 +740,12 @@ class LLMChat:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
+        if self.stream_mode:
+            return self._stream_chat_completion_normal_web_search_response(
+                stream_callback_thinking,
+                stream_callback_response,
+            )
+
         full_thinking = ""
         final_response = ""
 
@@ -779,6 +785,12 @@ class LLMChat:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
+        if self.stream_mode:
+            return self._stream_ollama_normal_web_search_response(
+                stream_callback_thinking,
+                stream_callback_response,
+            )
+
         full_thinking = ""
         final_response = ""
 
@@ -818,6 +830,12 @@ class LLMChat:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
+        if self.stream_mode:
+            return self._stream_anthropic_normal_web_search_response(
+                stream_callback_thinking,
+                stream_callback_response,
+            )
+
         full_thinking = ""
         final_response = ""
 
@@ -898,6 +916,698 @@ class LLMChat:
             return self.agent_tools.search_web(query, **kwargs)
         except Exception as error:
             return _error_text(str(error))
+
+    def _stream_chat_completion_normal_web_search_response(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        try:
+            thinking_started = False
+            if self.thinking_mode:
+                print_stream_thinking("")
+                thinking_started = True
+            full_thinking = ""
+            final_response = ""
+
+            for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+                (
+                    assistant_message,
+                    thinking,
+                    _text,
+                    tool_calls,
+                    _response_started,
+                ) = self._stream_chat_completion_normal_web_search_turn(
+                    full_thinking,
+                    False,
+                    stream_callback_thinking,
+                    None,
+                    emit_response=False,
+                )
+                full_thinking += thinking
+
+                if not tool_calls:
+                    return self._stream_normal_web_search_final_response(
+                        full_thinking,
+                        stream_callback_thinking,
+                        stream_callback_response,
+                        thinking_started=thinking_started,
+                    )
+
+                self.conversation_history.append(assistant_message)
+                self._append_normal_web_search_tool_results(tool_calls, provider="chat")
+
+            return self._stream_normal_web_search_round_limit_response(
+                full_thinking,
+                final_response,
+                False,
+                stream_callback_response,
+            )
+        except Exception as error:
+            print_error(f"Stream error: {error}")
+            return None
+
+    def _stream_chat_completion_normal_web_search_turn(
+        self,
+        prior_thinking,
+        response_started,
+        callback_thinking=None,
+        callback_response=None,
+        emit_response=True,
+    ):
+        kwargs = self._chat_completion_kwargs(
+            messages=self.conversation_history,
+            tools=self._normal_web_search_tool_schemas(),
+            stream=True,
+        )
+        kwargs["stream_options"] = {"include_usage": True}
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as error:
+            if not _stream_usage_unsupported(error):
+                raise
+            kwargs.pop("stream_options", None)
+            response = self.client.chat.completions.create(**kwargs)
+
+        field_thinking = ""
+        tagged_thinking = ""
+        raw_thinking = ""
+        full_response = ""
+        raw_response = ""
+        tool_call_parts = {}
+        usage_input_tokens = None
+
+        for chunk in response:
+            chunk_input_tokens = _response_input_tokens(chunk)
+            if chunk_input_tokens is not None:
+                usage_input_tokens = chunk_input_tokens
+            if not getattr(chunk, "choices", None):
+                continue
+
+            delta = chunk.choices[0].delta
+            reasoning, field_thinking, raw_thinking = self._stream_reasoning_delta(
+                delta,
+                field_thinking,
+                raw_thinking,
+            )
+            if (
+                reasoning
+                and not response_started
+                and callback_thinking
+                and self.thinking_mode
+            ):
+                callback_thinking(reasoning)
+
+            content, full_response, raw_response = self._stream_content_delta(
+                self._get_field(delta, "content", "") or "",
+                full_response,
+                raw_response,
+            )
+            tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                raw_response,
+                tagged_thinking,
+            )
+            if (
+                tagged_reasoning
+                and not response_started
+                and callback_thinking
+                and self.thinking_mode
+            ):
+                callback_thinking(tagged_reasoning)
+            full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
+            if content and emit_response:
+                response_started = self._start_normal_stream_response(
+                    response_started,
+                    prior_thinking + full_thinking,
+                )
+                if callback_response:
+                    callback_response(content)
+
+            self._update_chat_stream_tool_call_parts(
+                tool_call_parts,
+                self._get_field(delta, "tool_calls", None) or [],
+            )
+
+        if usage_input_tokens is not None:
+            self._set_context_input_tokens(usage_input_tokens, "api_usage")
+        else:
+            self._record_context_usage(None)
+
+        full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
+        assistant_message = self._chat_stream_assistant_message(full_response, full_thinking)
+        assistant_tool_calls, tool_calls = self._chat_stream_tool_calls(tool_call_parts)
+        if assistant_tool_calls:
+            assistant_message["tool_calls"] = assistant_tool_calls
+
+        return assistant_message, full_thinking, full_response, tool_calls, response_started
+
+    def _update_chat_stream_tool_call_parts(self, tool_call_parts, tool_call_deltas):
+        for fallback_index, call in enumerate(tool_call_deltas or []):
+            raw_index = self._get_field(call, "index", fallback_index)
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                index = fallback_index
+
+            part = tool_call_parts.setdefault(
+                index,
+                {
+                    "id": "",
+                    "type": "function",
+                    "name": "",
+                    "arguments": "",
+                },
+            )
+
+            call_id = self._get_field(call, "id", "") or ""
+            if call_id:
+                part["id"] = call_id
+            call_type = self._get_field(call, "type", "") or ""
+            if call_type:
+                part["type"] = call_type
+
+            function = self._get_field(call, "function", {}) or {}
+            name = self._get_field(function, "name", "") or ""
+            if name:
+                if not part["name"] or name.startswith(part["name"]):
+                    part["name"] = name
+                elif name != part["name"]:
+                    part["name"] += name
+
+            arguments = self._get_field(function, "arguments", None)
+            if isinstance(arguments, str):
+                part["arguments"] += arguments
+            elif arguments:
+                serialized = json.dumps(arguments, ensure_ascii=False)
+                part["arguments"] = part["arguments"] or serialized
+
+    def _chat_stream_tool_calls(self, tool_call_parts):
+        assistant_tool_calls = []
+        tool_calls = []
+        for index in sorted(tool_call_parts):
+            part = tool_call_parts[index]
+            arguments = part.get("arguments", "")
+            name = part.get("name", "")
+            call_id = part.get("id", "")
+            assistant_tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": part.get("type") or "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }
+            )
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "arguments": self._parse_tool_arguments(arguments),
+                }
+            )
+        return assistant_tool_calls, tool_calls
+
+    def _stream_ollama_normal_web_search_response(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        try:
+            thinking_started = False
+            if self.thinking_mode:
+                print_stream_thinking("")
+                thinking_started = True
+            full_thinking = ""
+            final_response = ""
+
+            for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+                (
+                    assistant_message,
+                    thinking,
+                    _text,
+                    tool_calls,
+                    _response_started,
+                ) = self._stream_ollama_normal_web_search_turn(
+                    full_thinking,
+                    False,
+                    stream_callback_thinking,
+                    None,
+                    emit_response=False,
+                )
+                full_thinking += thinking
+
+                if not tool_calls:
+                    return self._stream_normal_web_search_final_response(
+                        _clean_reasoning_text(full_thinking),
+                        stream_callback_thinking,
+                        stream_callback_response,
+                        thinking_started=thinking_started,
+                    )
+
+                self.conversation_history.append(assistant_message)
+                self._append_normal_web_search_tool_results(tool_calls, provider="ollama")
+
+            return self._stream_normal_web_search_round_limit_response(
+                _clean_reasoning_text(full_thinking),
+                final_response,
+                False,
+                stream_callback_response,
+            )
+        except Exception as error:
+            print_error(f"Stream error: {error}")
+            return None
+
+    def _stream_ollama_normal_web_search_turn(
+        self,
+        prior_thinking,
+        response_started,
+        callback_thinking=None,
+        callback_response=None,
+        emit_response=True,
+    ):
+        response = self.client.chat(
+            **self._ollama_chat_kwargs(
+                messages=self.conversation_history,
+                tools=self._normal_web_search_tool_schemas(),
+                stream=True,
+            )
+        )
+
+        field_thinking = ""
+        tagged_thinking = ""
+        full_response = ""
+        raw_response = ""
+        tool_call_parts = {}
+        usage_input_tokens = None
+
+        for chunk in response:
+            chunk_input_tokens = _response_input_tokens(chunk)
+            if chunk_input_tokens is not None:
+                usage_input_tokens = chunk_input_tokens
+
+            message = self._get_field(chunk, "message", {})
+            thinking = self._get_field(message, "thinking", "") or ""
+            if thinking:
+                field_thinking += thinking
+                if callback_thinking and self.thinking_mode and not response_started:
+                    callback_thinking(thinking)
+
+            content, full_response, raw_response = self._stream_content_delta(
+                self._get_field(message, "content", "") or "",
+                full_response,
+                raw_response,
+            )
+            tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                raw_response,
+                tagged_thinking,
+            )
+            if (
+                tagged_reasoning
+                and not response_started
+                and callback_thinking
+                and self.thinking_mode
+            ):
+                callback_thinking(tagged_reasoning)
+            full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
+            if content and emit_response:
+                response_started = self._start_normal_stream_response(
+                    response_started,
+                    prior_thinking + full_thinking,
+                )
+                if callback_response:
+                    callback_response(content)
+
+            self._update_ollama_stream_tool_call_parts(
+                tool_call_parts,
+                self._get_field(message, "tool_calls", None) or [],
+            )
+
+        if usage_input_tokens is not None:
+            self._set_context_input_tokens(usage_input_tokens, "api_usage")
+        else:
+            self._record_context_usage(None)
+
+        assistant_tool_calls, tool_calls = self._ollama_stream_tool_calls(tool_call_parts)
+        full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
+        assistant_message = self._ollama_assistant_message(
+            full_response,
+            _clean_reasoning_text(full_thinking),
+            assistant_tool_calls,
+        )
+        return assistant_message, full_thinking, full_response, tool_calls, response_started
+
+    def _update_ollama_stream_tool_call_parts(self, tool_call_parts, raw_tool_calls):
+        for fallback_index, call in enumerate(raw_tool_calls or []):
+            function = self._get_field(call, "function", {}) or {}
+            raw_index = self._get_field(function, "index", fallback_index)
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                index = fallback_index
+
+            part = tool_call_parts.setdefault(
+                index,
+                {
+                    "type": self._get_field(call, "type", "function") or "function",
+                    "name": "",
+                    "arguments": "",
+                },
+            )
+            call_type = self._get_field(call, "type", "") or ""
+            if call_type:
+                part["type"] = call_type
+
+            name = self._get_field(function, "name", "") or ""
+            if name:
+                if not part["name"] or name.startswith(part["name"]):
+                    part["name"] = name
+                elif name != part["name"]:
+                    part["name"] += name
+
+            arguments = self._get_field(function, "arguments", None)
+            if isinstance(arguments, dict):
+                part["arguments"] = arguments
+            elif isinstance(arguments, str):
+                existing = part.get("arguments")
+                part["arguments"] = (existing if isinstance(existing, str) else "") + arguments
+            elif arguments:
+                part["arguments"] = arguments
+
+    def _ollama_stream_tool_calls(self, tool_call_parts):
+        assistant_tool_calls = []
+        tool_calls = []
+        for index in sorted(tool_call_parts):
+            part = tool_call_parts[index]
+            parsed_arguments = self._parse_tool_arguments(part.get("arguments", {}))
+            function_call = {
+                "name": part.get("name", ""),
+                "arguments": parsed_arguments,
+            }
+            if len(tool_call_parts) > 1:
+                function_call["index"] = index
+            assistant_tool_calls.append(
+                {
+                    "type": part.get("type") or "function",
+                    "function": function_call,
+                }
+            )
+            tool_calls.append(
+                {
+                    "name": part.get("name", ""),
+                    "arguments": parsed_arguments,
+                }
+            )
+        return assistant_tool_calls, tool_calls
+
+    def _stream_anthropic_normal_web_search_response(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        try:
+            thinking_started = False
+            if self.thinking_mode:
+                print_stream_thinking("")
+                thinking_started = True
+            full_thinking = ""
+            final_response = ""
+
+            for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+                (
+                    blocks,
+                    thinking,
+                    _text,
+                    tool_uses,
+                    _response_started,
+                ) = self._stream_anthropic_normal_web_search_turn(
+                    full_thinking,
+                    False,
+                    stream_callback_thinking,
+                    None,
+                    emit_response=False,
+                )
+                full_thinking += thinking
+
+                if not tool_uses:
+                    return self._stream_normal_web_search_final_response(
+                        full_thinking,
+                        stream_callback_thinking,
+                        stream_callback_response,
+                        thinking_started=thinking_started,
+                    )
+
+                self.conversation_history.append({"role": "assistant", "content": blocks})
+                tool_results = []
+                for tool_use in tool_uses:
+                    tool_result = self._execute_normal_web_search_tool(
+                        tool_use.get("name", ""),
+                        tool_use.get("input", {}),
+                    )
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.get("id", ""),
+                            "content": tool_result,
+                            "is_error": tool_result.startswith("ERROR:"),
+                        }
+                    )
+                self.conversation_history.append({"role": "user", "content": tool_results})
+
+            return self._stream_normal_web_search_round_limit_response(
+                full_thinking,
+                final_response,
+                False,
+                stream_callback_response,
+            )
+        except Exception as error:
+            print_error(f"Stream error: {error}")
+            return None
+
+    def _stream_anthropic_normal_web_search_turn(
+        self,
+        prior_thinking,
+        response_started,
+        callback_thinking=None,
+        callback_response=None,
+        emit_response=True,
+    ):
+        blocks = []
+        active_block_index = None
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system=self._normal_system_prompt(),
+            messages=self._anthropic_messages(),
+            tools=self._normal_web_search_tool_schemas(),
+            stream=True,
+            **self._anthropic_request_options(),
+        )
+
+        field_thinking = ""
+        tagged_thinking = ""
+        full_response = ""
+        raw_response = ""
+        usage_input_tokens = None
+        for chunk in response:
+            chunk_input_tokens = _response_input_tokens(chunk)
+            if chunk_input_tokens is not None:
+                usage_input_tokens = chunk_input_tokens
+            chunk_type = self._get_field(chunk, "type", "")
+
+            if chunk_type == "content_block_start":
+                content_block = self._get_field(chunk, "content_block")
+                block_type = self._get_field(content_block, "type", "")
+                if block_type == "text":
+                    initial_text = self._get_field(content_block, "text", "") or ""
+                    block = {"type": "text", "text": ""}
+                    if initial_text:
+                        content, full_response, raw_response = self._stream_content_delta(
+                            initial_text,
+                            full_response,
+                            raw_response,
+                        )
+                        block["text"] = block.get("text", "") + content
+                        tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                            raw_response,
+                            tagged_thinking,
+                        )
+                        if (
+                            tagged_reasoning
+                            and not response_started
+                            and callback_thinking
+                            and self.thinking_mode
+                        ):
+                            callback_thinking(tagged_reasoning)
+                        full_thinking = _combine_reasoning_text(
+                            field_thinking,
+                            tagged_thinking,
+                        )
+                        if content and emit_response:
+                            response_started = self._start_normal_stream_response(
+                                response_started,
+                                prior_thinking + full_thinking,
+                            )
+                            if callback_response:
+                                callback_response(content)
+                elif block_type == "thinking":
+                    initial_thinking = self._get_field(content_block, "thinking", "") or ""
+                    block = {"type": "thinking", "thinking": initial_thinking}
+                    if initial_thinking:
+                        field_thinking += initial_thinking
+                        if callback_thinking and self.thinking_mode and not response_started:
+                            callback_thinking(initial_thinking)
+                    signature = self._get_field(content_block, "signature")
+                    if signature:
+                        block["signature"] = signature
+                elif block_type == "tool_use":
+                    block = {
+                        "type": "tool_use",
+                        "id": self._get_field(content_block, "id", "") or "",
+                        "name": self._get_field(content_block, "name", "") or "",
+                        "input": self._get_field(content_block, "input", {}) or {},
+                        "_input_json": "",
+                    }
+                else:
+                    block = {"type": block_type or "unknown"}
+                blocks.append(block)
+                active_block_index = len(blocks) - 1
+                continue
+
+            if chunk_type == "content_block_delta" and active_block_index is not None:
+                delta = self._get_field(chunk, "delta")
+                delta_type = self._get_field(delta, "type", "")
+                block = blocks[active_block_index]
+
+                if delta_type == "text_delta":
+                    text_delta = self._get_field(delta, "text", "") or ""
+                    if text_delta:
+                        content, full_response, raw_response = self._stream_content_delta(
+                            text_delta,
+                            full_response,
+                            raw_response,
+                        )
+                        block["text"] = block.get("text", "") + content
+                        tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                            raw_response,
+                            tagged_thinking,
+                        )
+                        if (
+                            tagged_reasoning
+                            and not response_started
+                            and callback_thinking
+                            and self.thinking_mode
+                        ):
+                            callback_thinking(tagged_reasoning)
+                        full_thinking = _combine_reasoning_text(
+                            field_thinking,
+                            tagged_thinking,
+                        )
+                        if content and emit_response:
+                            response_started = self._start_normal_stream_response(
+                                response_started,
+                                prior_thinking + full_thinking,
+                            )
+                            if callback_response:
+                                callback_response(content)
+                elif delta_type == "thinking_delta":
+                    thinking_delta = self._get_field(delta, "thinking", "") or ""
+                    if thinking_delta:
+                        field_thinking += thinking_delta
+                        block["thinking"] = block.get("thinking", "") + thinking_delta
+                        if callback_thinking and self.thinking_mode and not response_started:
+                            callback_thinking(thinking_delta)
+                elif delta_type == "signature_delta":
+                    block["signature"] = block.get("signature", "") + (
+                        self._get_field(delta, "signature", "") or ""
+                    )
+                elif delta_type == "input_json_delta":
+                    block["_input_json"] = block.get("_input_json", "") + (
+                        self._get_field(delta, "partial_json", "") or ""
+                    )
+                continue
+
+            if chunk_type == "content_block_stop" and active_block_index is not None:
+                block = blocks[active_block_index]
+                if block.get("type") == "tool_use":
+                    raw_input = block.pop("_input_json", "")
+                    if raw_input:
+                        block["input"] = self._parse_tool_arguments(raw_input)
+                active_block_index = None
+
+        for block in blocks:
+            block.pop("_input_json", None)
+        if usage_input_tokens is not None:
+            self._set_context_input_tokens(usage_input_tokens, "api_usage")
+        else:
+            self._record_context_usage(None)
+
+        thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
+        thinking = _combine_reasoning_text(
+            _merge_reasoning_text(thinking, field_thinking),
+            tagged_thinking,
+        )
+        return blocks, thinking, text, tool_uses, response_started
+
+    def _start_normal_stream_response(self, response_started, thinking):
+        if response_started:
+            return True
+        if thinking and not thinking.endswith("\n"):
+            console.print()
+        print_stream_response_start(self.model)
+        return True
+
+    def _stream_normal_web_search_final_response(
+        self,
+        prior_thinking,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+        thinking_started=False,
+    ):
+        previous = getattr(self, "_normal_web_search_final_response_active", False)
+        self._normal_web_search_final_response_active = True
+        try:
+            response = self._stream_response(
+                stream_callback_thinking,
+                stream_callback_response,
+                self.model,
+                initial_thinking=prior_thinking,
+                thinking_started=thinking_started,
+            )
+        finally:
+            self._normal_web_search_final_response_active = previous
+
+        if not response:
+            return None
+        response["thinking"] = _combine_reasoning_text(
+            prior_thinking,
+            response.get("thinking", ""),
+        )
+        response["response_streamed"] = True
+        return response
+
+    def _stream_normal_web_search_round_limit_response(
+        self,
+        thinking,
+        response,
+        response_started,
+        stream_callback_response=None,
+    ):
+        message = "Web search stopped after reaching the normal-mode search round limit."
+        if response_started or thinking:
+            console.print()
+        print_error(message)
+        final_response = response or message
+        if not response and stream_callback_response:
+            response_started = self._start_normal_stream_response(response_started, thinking)
+            stream_callback_response(message)
+        return {
+            "thinking": thinking,
+            "response": final_response,
+            "response_streamed": response_started,
+        }
 
     def _finalize_normal_web_search_response(
         self,
@@ -2083,11 +2793,30 @@ class LLMChat:
     def _restore_history(self, history):
         self.conversation_history = [dict(message) for message in history]
 
-    def _stream_response(self, callback_thinking, callback_response, model_name):
+    def _stream_response(
+        self,
+        callback_thinking,
+        callback_response,
+        model_name,
+        initial_thinking="",
+        thinking_started=False,
+    ):
         if self.api_type == API_TYPE_ANTHROPIC:
-            return self._stream_anthropic_response(callback_thinking, callback_response, model_name)
+            return self._stream_anthropic_response(
+                callback_thinking,
+                callback_response,
+                model_name,
+                initial_thinking,
+                thinking_started,
+            )
         if self.api_type == API_TYPE_OLLAMA:
-            return self._stream_ollama_response(callback_thinking, callback_response, model_name)
+            return self._stream_ollama_response(
+                callback_thinking,
+                callback_response,
+                model_name,
+                initial_thinking,
+                thinking_started,
+            )
 
         try:
             kwargs = self._chat_completion_kwargs(
@@ -2103,9 +2832,10 @@ class LLMChat:
                 kwargs.pop("stream_options", None)
                 response = self.client.chat.completions.create(**kwargs)
 
-            if self.thinking_mode:
+            if self.thinking_mode and not thinking_started:
                 print_stream_thinking("")
-            full_thinking = ""
+            field_thinking = ""
+            tagged_thinking = ""
             raw_thinking = ""
             full_response = ""
             raw_response = ""
@@ -2119,13 +2849,13 @@ class LLMChat:
                 if not getattr(chunk, "choices", None):
                     continue
                 delta = chunk.choices[0].delta
-                reasoning, full_thinking, raw_thinking = self._stream_reasoning_delta(
+                reasoning, field_thinking, raw_thinking = self._stream_reasoning_delta(
                     delta,
-                    full_thinking,
+                    field_thinking,
                     raw_thinking,
                 )
                 if reasoning:
-                    if callback_thinking and self.thinking_mode:
+                    if callback_thinking and self.thinking_mode and not thinking_ended:
                         callback_thinking(reasoning)
 
                 content, full_response, raw_response = self._stream_content_delta(
@@ -2133,9 +2863,28 @@ class LLMChat:
                     full_response,
                     raw_response,
                 )
+                tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                    raw_response,
+                    tagged_thinking,
+                )
+                if (
+                    tagged_reasoning
+                    and not thinking_ended
+                    and callback_thinking
+                    and self.thinking_mode
+                ):
+                    callback_thinking(tagged_reasoning)
+                full_thinking = _combine_reasoning_text(
+                    field_thinking,
+                    tagged_thinking,
+                )
+                separator_thinking = _combine_reasoning_text(
+                    initial_thinking,
+                    full_thinking,
+                )
                 if content:
                     if not thinking_ended:
-                        if full_thinking and not full_thinking.endswith("\n"):
+                        if separator_thinking and not separator_thinking.endswith("\n"):
                             console.print()
                         print_stream_response_start(model_name)
                         thinking_ended = True
@@ -2143,19 +2892,32 @@ class LLMChat:
                         callback_response(content)
 
             self.conversation_history.append(
-                self._chat_stream_assistant_message(full_response, full_thinking)
+                self._chat_stream_assistant_message(
+                    full_response,
+                    _combine_reasoning_text(field_thinking, tagged_thinking),
+                )
             )
             if usage_input_tokens is not None:
                 self._set_context_input_tokens(usage_input_tokens, "api_usage")
             else:
                 self._record_context_usage(None)
-            return {"thinking": full_thinking, "response": full_response}
+            return {
+                "thinking": _combine_reasoning_text(field_thinking, tagged_thinking),
+                "response": full_response,
+            }
 
         except Exception as error:
             print_error(f"Stream error: {error}")
             return None
 
-    def _stream_ollama_response(self, callback_thinking, callback_response, model_name):
+    def _stream_ollama_response(
+        self,
+        callback_thinking,
+        callback_response,
+        model_name,
+        initial_thinking="",
+        thinking_started=False,
+    ):
         try:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
@@ -2164,10 +2926,12 @@ class LLMChat:
                 )
             )
 
-            if self.thinking_mode:
+            if self.thinking_mode and not thinking_started:
                 print_stream_thinking("")
-            full_thinking = ""
+            field_thinking = ""
+            tagged_thinking = ""
             full_response = ""
+            raw_response = ""
             response_started = False
             usage_input_tokens = None
 
@@ -2178,23 +2942,46 @@ class LLMChat:
                 message = self._get_field(chunk, "message", {})
                 thinking = self._get_field(message, "thinking", "") or ""
                 if thinking:
-                    full_thinking += thinking
-                    if callback_thinking and self.thinking_mode:
+                    field_thinking += thinking
+                    if callback_thinking and self.thinking_mode and not response_started:
                         callback_thinking(thinking)
 
-                content = self._get_field(message, "content", "") or ""
+                content, full_response, raw_response = self._stream_content_delta(
+                    self._get_field(message, "content", "") or "",
+                    full_response,
+                    raw_response,
+                )
+                tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                    raw_response,
+                    tagged_thinking,
+                )
+                if (
+                    tagged_reasoning
+                    and not response_started
+                    and callback_thinking
+                    and self.thinking_mode
+                ):
+                    callback_thinking(tagged_reasoning)
+                full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
+                separator_thinking = _combine_reasoning_text(
+                    initial_thinking,
+                    full_thinking,
+                )
                 if content:
                     if not response_started:
-                        if full_thinking and not full_thinking.endswith("\n"):
+                        if separator_thinking and not separator_thinking.endswith("\n"):
                             console.print()
                         print_stream_response_start(model_name)
                         response_started = True
-                    full_response += content
                     if callback_response:
                         callback_response(content)
 
+            full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
             self.conversation_history.append(
-                self._ollama_assistant_message(full_response, full_thinking)
+                self._ollama_assistant_message(
+                    full_response,
+                    full_thinking,
+                )
             )
             if usage_input_tokens is not None:
                 self._set_context_input_tokens(usage_input_tokens, "api_usage")
@@ -2209,7 +2996,14 @@ class LLMChat:
             print_error(f"Stream error: {error}")
             return None
 
-    def _stream_anthropic_response(self, callback_thinking, callback_response, model_name):
+    def _stream_anthropic_response(
+        self,
+        callback_thinking,
+        callback_response,
+        model_name,
+        initial_thinking="",
+        thinking_started=False,
+    ):
         try:
             response = self.client.messages.create(
                 model=self.model,
@@ -2221,10 +3015,12 @@ class LLMChat:
                 **self._anthropic_request_options(),
             )
 
-            if self.thinking_mode:
+            if self.thinking_mode and not thinking_started:
                 print_stream_thinking("")
-            full_thinking = ""
+            field_thinking = ""
+            tagged_thinking = ""
             full_response = ""
+            raw_response = ""
             response_started = False
             usage_input_tokens = None
 
@@ -2236,11 +3032,41 @@ class LLMChat:
 
                 if chunk_type == "content_block_start":
                     content_block = self._get_field(chunk, "content_block")
-                    if self._get_field(content_block, "type") == "text" and not response_started:
-                        if full_thinking and not full_thinking.endswith("\n"):
-                            console.print()
-                        print_stream_response_start(model_name)
-                        response_started = True
+                    if self._get_field(content_block, "type") == "text":
+                        initial_text = self._get_field(content_block, "text", "") or ""
+                        if initial_text:
+                            content, full_response, raw_response = self._stream_content_delta(
+                                initial_text,
+                                full_response,
+                                raw_response,
+                            )
+                            tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                                raw_response,
+                                tagged_thinking,
+                            )
+                            if (
+                                tagged_reasoning
+                                and not response_started
+                                and callback_thinking
+                                and self.thinking_mode
+                            ):
+                                callback_thinking(tagged_reasoning)
+                            full_thinking = _combine_reasoning_text(
+                                field_thinking,
+                                tagged_thinking,
+                            )
+                            separator_thinking = _combine_reasoning_text(
+                                initial_thinking,
+                                full_thinking,
+                            )
+                            if content:
+                                if not response_started:
+                                    if separator_thinking and not separator_thinking.endswith("\n"):
+                                        console.print()
+                                    print_stream_response_start(model_name)
+                                    response_started = True
+                                if callback_response:
+                                    callback_response(content)
                     continue
 
                 if chunk_type != "content_block_delta":
@@ -2252,27 +3078,54 @@ class LLMChat:
                 if delta_type == "thinking_delta":
                     thinking = self._get_field(delta, "thinking", "") or ""
                     if thinking:
-                        full_thinking += thinking
-                        if callback_thinking and self.thinking_mode:
+                        field_thinking += thinking
+                        if callback_thinking and self.thinking_mode and not response_started:
                             callback_thinking(thinking)
                 elif delta_type == "text_delta":
                     text = self._get_field(delta, "text", "") or ""
                     if text:
-                        if not response_started:
-                            if full_thinking and not full_thinking.endswith("\n"):
-                                console.print()
-                            print_stream_response_start(model_name)
-                            response_started = True
-                        full_response += text
-                        if callback_response:
-                            callback_response(text)
+                        content, full_response, raw_response = self._stream_content_delta(
+                            text,
+                            full_response,
+                            raw_response,
+                        )
+                        tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
+                            raw_response,
+                            tagged_thinking,
+                        )
+                        if (
+                            tagged_reasoning
+                            and not response_started
+                            and callback_thinking
+                            and self.thinking_mode
+                        ):
+                            callback_thinking(tagged_reasoning)
+                        full_thinking = _combine_reasoning_text(
+                            field_thinking,
+                            tagged_thinking,
+                        )
+                        separator_thinking = _combine_reasoning_text(
+                            initial_thinking,
+                            full_thinking,
+                        )
+                        if content:
+                            if not response_started:
+                                if separator_thinking and not separator_thinking.endswith("\n"):
+                                    console.print()
+                                print_stream_response_start(model_name)
+                                response_started = True
+                            if callback_response:
+                                callback_response(content)
 
             self.conversation_history.append({"role": "assistant", "content": full_response})
             if usage_input_tokens is not None:
                 self._set_context_input_tokens(usage_input_tokens, "api_usage")
             else:
                 self._record_context_usage(None)
-            return {"thinking": full_thinking, "response": full_response}
+            return {
+                "thinking": _combine_reasoning_text(field_thinking, tagged_thinking),
+                "response": full_response,
+            }
 
         except Exception as error:
             print_error(f"Stream error: {error}")
@@ -2535,7 +3388,13 @@ class LLMChat:
 
     def _normal_system_prompt(self):
         prompt = NORMAL_SYSTEM_PROMPT
-        if self._normal_web_search_available():
+        if getattr(self, "_normal_web_search_final_response_active", False):
+            prompt += (
+                "\nWeb search planning for this turn is complete. If search results are "
+                "present in the conversation, use them for the final answer and cite their "
+                "source URLs. Do not call web_search in this final response."
+            )
+        elif self._normal_web_search_available():
             prompt += (
                 "\n联网搜索已开启。遇到近期、易变化、外部事实不足或需要来源支撑的问题时，"
                 "使用 web_search；回答中引用搜索结果里的来源 URL。"
@@ -2881,16 +3740,21 @@ class LLMChat:
         return str(content or "")
 
     def _stream_content_delta(self, content, current_response, raw_response):
-        if not self._uses_minimax_openai_compat():
-            delta, current_response = self._split_stream_delta(current_response, content)
-            return delta, current_response, raw_response
-
         delta, raw_response = self._split_stream_delta(raw_response, content)
         if not delta and not content:
             return "", current_response, raw_response
-        clean_response = _clean_content_text(raw_response)
+
+        clean_response, _, has_tagged_thinking = _split_tagged_think_text(raw_response)
+        if self._uses_minimax_openai_compat() and not has_tagged_thinking:
+            clean_response = _clean_content_text(raw_response)
         clean_delta, clean_response = self._split_stream_delta(current_response, clean_response)
         return clean_delta, clean_response, raw_response
+
+    def _stream_tagged_reasoning_delta(self, raw_response, current_tagged_thinking):
+        _, tagged_thinking, has_tagged_thinking = _split_tagged_think_text(raw_response)
+        if not has_tagged_thinking:
+            return "", current_tagged_thinking
+        return self._split_stream_delta(current_tagged_thinking, tagged_thinking)
 
     def _stream_reasoning_delta(self, delta, current_thinking, raw_thinking):
         reasoning = (
@@ -3134,6 +3998,82 @@ def _clean_reasoning_text(content):
     text = re.sub(r"<\s*/?\s*think\s*>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE)
     return text.strip()
+
+
+def _combine_reasoning_text(*parts):
+    return _clean_reasoning_text("".join(str(part or "") for part in parts if part))
+
+
+def _merge_reasoning_text(first, second):
+    first = str(first or "")
+    second = str(second or "")
+    if not first:
+        return second
+    if not second:
+        return first
+    if second.startswith(first):
+        return second
+    if first.startswith(second):
+        return first
+    return first + second
+
+
+def _split_tagged_think_text(content):
+    text = str(content or "")
+    if not text:
+        return "", "", False
+
+    open_pattern = re.compile(r"<\s*think\s*>", flags=re.IGNORECASE)
+    close_pattern = re.compile(r"<\s*/\s*think\s*>", flags=re.IGNORECASE)
+    partial_pattern = re.compile(
+        r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    content_parts = []
+    thinking_parts = []
+    position = 0
+    in_thinking = False
+    found_tag = False
+
+    while position < len(text):
+        if in_thinking:
+            close_match = close_pattern.search(text, position)
+            if close_match is None:
+                thinking_parts.append(partial_pattern.sub("", text[position:]))
+                break
+            thinking_parts.append(text[position : close_match.start()])
+            position = close_match.end()
+            in_thinking = False
+            found_tag = True
+            continue
+
+        open_match = open_pattern.search(text, position)
+        close_match = close_pattern.search(text, position)
+
+        if open_match is not None and (
+            close_match is None or open_match.start() <= close_match.start()
+        ):
+            content_parts.append(text[position : open_match.start()])
+            position = open_match.end()
+            in_thinking = True
+            found_tag = True
+            continue
+
+        if close_match is not None:
+            content_parts.append(text[position : close_match.start()])
+            position = close_match.end()
+            found_tag = True
+            continue
+
+        tail = text[position:]
+        cleaned_tail = partial_pattern.sub("", tail)
+        if cleaned_tail != tail:
+            found_tag = True
+        content_parts.append(cleaned_tail)
+        break
+
+    return "".join(content_parts), _clean_reasoning_text("".join(thinking_parts)), found_tag
 
 
 def _clean_content_text(content):

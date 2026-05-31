@@ -5,7 +5,6 @@ import re
 import shutil
 import sys
 import threading
-import time
 import unicodedata
 from io import StringIO
 
@@ -26,12 +25,15 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI as PromptANSI
+from prompt_toolkit.formatted_text import fragment_list_to_text
 from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
@@ -777,8 +779,8 @@ BOTTOM_INPUT_PLACEHOLDER = "Type a message..."
 ANSI = "\x1b["
 MAX_TUI_MESSAGE_CHARS = 400000
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-TUI_STREAM_CHUNK_SIZE = 8
-TUI_STREAM_CHUNK_DELAY_SECONDS = 0.006
+TUI_MOUSE_SCROLL_LINES = 4
+TUI_PAGE_SCROLL_MARGIN = 2
 
 
 def _is_dashboard_capture():
@@ -869,6 +871,21 @@ class _TUIPlaceholderProcessor(Processor):
         return Transformation(transformation_input.fragments)
 
 
+class _ScrollableMessageControl(FormattedTextControl):
+    def __init__(self, session, *args, **kwargs):
+        self.session = session
+        super().__init__(*args, **kwargs)
+
+    def mouse_handler(self, mouse_event):
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.session.scroll_messages(TUI_MOUSE_SCROLL_LINES)
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.session.scroll_messages(-TUI_MOUSE_SCROLL_LINES)
+            return None
+        return super().mouse_handler(mouse_event)
+
+
 class ChatTUISession:
     def __init__(
         self,
@@ -882,6 +899,8 @@ class ChatTUISession:
         self.messages_ansi = ""
         self.messages_plain = ""
         self.message_fragments = []
+        self.message_scroll_offset = 0
+        self.message_render_line_lengths = [0]
         self.input_enabled = False
         self.pending_prompt_text = ""
         self.pending_prompt_rendered = False
@@ -902,7 +921,8 @@ class ChatTUISession:
         )
         self.input_area.buffer.on_text_changed += lambda _: self._input_changed()
 
-        self.message_control = FormattedTextControl(
+        self.message_control = _ScrollableMessageControl(
+            self,
             self._message_text,
             show_cursor=False,
             get_cursor_position=self._message_cursor_position,
@@ -948,7 +968,7 @@ class ChatTUISession:
             layout=self.layout,
             key_bindings=self._key_bindings(),
             full_screen=True,
-            mouse_support=False,
+            mouse_support=True,
             color_depth=ColorDepth.TRUE_COLOR,
             input=app_input,
             output=app_output,
@@ -1005,6 +1025,7 @@ class ChatTUISession:
             self.messages_plain += _strip_ansi(text)
             self.message_fragments.extend(to_formatted_text(PromptANSI(str(text))))
             self._trim_messages()
+            self._clamp_message_scroll_offset_locked()
         self.invalidate()
 
     def append_styled_text(self, text, style):
@@ -1016,20 +1037,14 @@ class ChatTUISession:
             self.messages_plain += text
             self.message_fragments.append((style, text))
             self._trim_messages()
+            self._clamp_message_scroll_offset_locked()
         self.invalidate()
 
     def append_stream_text(self, text, style):
         text = str(text or "")
         if not text:
             return
-
-        if len(text) <= TUI_STREAM_CHUNK_SIZE:
-            self.append_styled_text(text, style)
-            return
-
-        for index in range(0, len(text), TUI_STREAM_CHUNK_SIZE):
-            self.append_styled_text(text[index : index + TUI_STREAM_CHUNK_SIZE], style)
-            time.sleep(TUI_STREAM_CHUNK_DELAY_SECONDS)
+        self.append_styled_text(text, style)
 
     def clear_current_lines(self, line_count=1):
         line_count = max(1, int(line_count or 1))
@@ -1047,6 +1062,7 @@ class ChatTUISession:
                 text = text[: index + 1]
             self.messages_ansi = text
             self._rebuild_message_cache()
+            self._clamp_message_scroll_offset_locked()
         self.invalidate()
 
     def request_console_input(self, prompt):
@@ -1134,6 +1150,18 @@ class ChatTUISession:
             if not self.input_area.text:
                 self._wake_input(EOFError())
 
+        @bindings.add("pageup", eager=True, is_global=True)
+        def _(event):
+            self.scroll_messages(self._message_page_lines())
+
+        @bindings.add("pagedown", eager=True, is_global=True)
+        def _(event):
+            self.scroll_messages(-self._message_page_lines())
+
+        @bindings.add("c-end", eager=True, is_global=True)
+        def _(event):
+            self.scroll_messages_to_bottom()
+
         return bindings
 
     def _submit_input(self):
@@ -1184,16 +1212,54 @@ class ChatTUISession:
 
     def _message_text(self):
         with self.lock:
-            fragments = list(self.message_fragments)
+            fragments = list(self.message_fragments) or [("", "")]
+            self._refresh_message_render_lines_locked(fragments)
         return fragments or [("", "")]
 
     def _message_cursor_position(self):
         with self.lock:
-            plain = self.messages_plain
-        if not plain:
-            return Point(x=0, y=0)
-        lines = plain.split("\n")
-        return Point(x=len(lines[-1]), y=max(0, len(lines) - 1))
+            scroll_offset = self.message_scroll_offset
+            line_lengths = list(self.message_render_line_lengths) or [0]
+        max_offset = max(0, len(line_lengths) - 1)
+        line_index = max(0, len(line_lengths) - 1 - min(scroll_offset, max_offset))
+        return Point(x=line_lengths[line_index], y=line_index)
+
+    def scroll_messages(self, delta):
+        with self.lock:
+            self.message_scroll_offset = max(
+                0,
+                min(
+                    self.message_scroll_offset + int(delta or 0),
+                    self._message_max_scroll_offset_locked(),
+                ),
+            )
+        self.invalidate()
+
+    def scroll_messages_to_bottom(self):
+        with self.lock:
+            self.message_scroll_offset = 0
+        self.invalidate()
+
+    def _message_page_lines(self):
+        render_info = getattr(self.message_window, "render_info", None)
+        if render_info is not None:
+            return max(1, int(render_info.window_height) - TUI_PAGE_SCROLL_MARGIN)
+        return max(1, self._rows() - self._dashboard_height() - self._input_height() - 2)
+
+    def _message_max_scroll_offset_locked(self):
+        if not self.messages_plain:
+            return 0
+        return max(0, len(self.messages_plain.split("\n")) - 1)
+
+    def _refresh_message_render_lines_locked(self, fragments):
+        try:
+            line_lengths = [
+                len(fragment_list_to_text(line))
+                for line in split_lines(fragments or [("", "")])
+            ]
+        except Exception:
+            line_lengths = [0]
+        self.message_render_line_lengths = line_lengths or [0]
 
     def _dashboard_text(self):
         width = self._columns()
@@ -1242,6 +1308,13 @@ class ChatTUISession:
             size = shutil.get_terminal_size(fallback=(80, 24))
             return max(10, int(size.columns))
 
+    def _rows(self):
+        try:
+            return max(5, int(self.app.output.get_size().rows))
+        except Exception:
+            size = shutil.get_terminal_size(fallback=(80, 24))
+            return max(5, int(size.lines))
+
     def _trim_messages(self):
         if len(self.messages_ansi) <= MAX_TUI_MESSAGE_CHARS:
             return
@@ -1257,6 +1330,13 @@ class ChatTUISession:
     def _rebuild_message_cache(self):
         self.messages_plain = _strip_ansi(self.messages_ansi)
         self.message_fragments = list(to_formatted_text(PromptANSI(self.messages_ansi)))
+        self._clamp_message_scroll_offset_locked()
+
+    def _clamp_message_scroll_offset_locked(self):
+        self.message_scroll_offset = max(
+            0,
+            min(self.message_scroll_offset, self._message_max_scroll_offset_locked()),
+        )
 
 
 def fragment_list_to_text_safe(value):
