@@ -1,7 +1,11 @@
 import os
 import json
+import queue
+import re
 import shutil
 import sys
+import threading
+import time
 import unicodedata
 from io import StringIO
 
@@ -16,7 +20,56 @@ from rich.panel import Panel
 from rich.console import Console
 from rich.table import Table
 
-console = Console()
+from prompt_toolkit.application import Application
+from prompt_toolkit.output.color_depth import ColorDepth
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import ANSI as PromptANSI
+from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import TextArea
+
+
+_console_override = threading.local()
+_dashboard_capture = threading.local()
+_tui_session = None
+
+
+class _ConsoleProxy:
+    def __init__(self):
+        self._console = Console()
+
+    def _delegate(self):
+        return getattr(_console_override, "console", self._console)
+
+    def __getattr__(self, name):
+        return getattr(self._delegate(), name)
+
+    def print(self, *objects, **kwargs):
+        override = getattr(_console_override, "console", None)
+        if override is not None:
+            return override.print(*objects, **kwargs)
+        if _tui_session is not None:
+            _tui_session.append_console_print(*objects, **kwargs)
+            return None
+        return self._console.print(*objects, **kwargs)
+
+    def input(self, prompt="", *args, **kwargs):
+        override = getattr(_console_override, "console", None)
+        if override is not None:
+            return override.input(prompt, *args, **kwargs)
+        if _tui_session is not None:
+            return _tui_session.request_console_input(prompt)
+        return self._console.input(prompt, *args, **kwargs)
+
+
+console = _ConsoleProxy()
 
 VERSION = "2.5.0"
 
@@ -69,8 +122,8 @@ if os.name == "nt":
             ("dwMaximumWindowSize", _COORD),
         ]
 
-    KERNEL32 = ctypes.windll.kernel32
-    USER32 = ctypes.windll.user32
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    USER32 = ctypes.WinDLL("user32", use_last_error=True)
 
     KERNEL32.GetStdHandle.argtypes = [wintypes.DWORD]
     KERNEL32.GetStdHandle.restype = wintypes.HANDLE
@@ -244,6 +297,18 @@ def print_thinking(content):
 
 def print_stream_thinking(content, leading_newline=True):
     prefix = "\n" if leading_newline else ""
+    if _tui_session is not None:
+        console.print(
+            Text.assemble(
+                prefix,
+                gradient_text("[*] Thinking: ", *THINK_COLOR),
+            ),
+            end="",
+        )
+        if content:
+            _tui_session.append_stream_text(content, f"bold {STREAM_THINK_COLOR}")
+        return
+
     console.print(
         Text.assemble(
             prefix,
@@ -258,10 +323,16 @@ def print_stream_thinking_continue(content):
     # Collapse multiple \n into single \n
     while "\n\n" in content:
         content = content.replace("\n\n", "\n")
+    if _tui_session is not None:
+        _tui_session.append_stream_text(content, f"bold {STREAM_THINK_COLOR}")
+        return
     console.print(Text(content, style=f"bold {STREAM_THINK_COLOR}"), end="")
 
 
 def clear_current_line():
+    if _tui_session is not None:
+        _tui_session.clear_current_lines(1)
+        return
     if not console.is_terminal:
         return
     console.file.write("\r\033[2K")
@@ -269,6 +340,9 @@ def clear_current_line():
 
 
 def clear_current_lines(line_count):
+    if _tui_session is not None:
+        _tui_session.clear_current_lines(line_count)
+        return
     if not console.is_terminal:
         return
     line_count = max(1, int(line_count or 1))
@@ -296,10 +370,16 @@ def clean_and_print_stream_response(content):
     # Remove leading \n
     if content.startswith("\n"):
         content = content[1:]
+    if _tui_session is not None:
+        _tui_session.append_stream_text(content, f"bold {STREAM_RESPONSE_COLOR}")
+        return
     console.print(Text(content, style=f"bold {STREAM_RESPONSE_COLOR}"), end="")
 
 
 def print_stream_response_continue(content):
+    if _tui_session is not None:
+        _tui_session.append_stream_text(content, f"bold {STREAM_RESPONSE_COLOR}")
+        return
     console.print(Text(content, style=f"bold {STREAM_RESPONSE_COLOR}"), end="")
 
 
@@ -403,8 +483,14 @@ def _get_last_record_text(line_number):
 
 
 def show_dashboard(model_name, workspace_dir=None):
-    console.clear()
-    console.print()
+    if _tui_session is not None and not _is_dashboard_capture():
+        _tui_session.set_dashboard(model_name, workspace_dir)
+        return
+
+    if not _is_dashboard_capture():
+        console.clear()
+    if not _is_dashboard_capture():
+        console.print()
     title = Text.assemble(
         gradient_text("LLM Chat", *INFO_TEXT_COLOR),
         gradient_text(f" v{VERSION}", *TEXT_COLOR),
@@ -689,6 +775,519 @@ BOTTOM_INPUT_BORDER = "\u2500"
 BOTTOM_INPUT_PROMPT = "❯ "
 BOTTOM_INPUT_PLACEHOLDER = "Type a message..."
 ANSI = "\x1b["
+MAX_TUI_MESSAGE_CHARS = 400000
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+TUI_STREAM_CHUNK_SIZE = 8
+TUI_STREAM_CHUNK_DELAY_SECONDS = 0.006
+
+
+def _is_dashboard_capture():
+    return bool(getattr(_dashboard_capture, "active", False))
+
+
+def _strip_ansi(text):
+    return ANSI_ESCAPE_PATTERN.sub("", str(text or ""))
+
+
+def _ansi_styled_text(text, style):
+    text = str(text or "")
+    if not text:
+        return ""
+
+    codes = []
+    style_text = str(style or "")
+    if "bold" in style_text.split():
+        codes.append("1")
+
+    match = re.search(r"#([0-9a-fA-F]{6})", style_text)
+    if match:
+        value = match.group(1)
+        red = int(value[0:2], 16)
+        green = int(value[2:4], 16)
+        blue = int(value[4:6], 16)
+        codes.append(f"38;2;{red};{green};{blue}")
+
+    if not codes:
+        return text
+    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
+
+
+def _render_console_print_to_ansi(width, *objects, **kwargs):
+    output = StringIO()
+    render_console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        width=max(1, int(width or 80)),
+        legacy_windows=False,
+        highlight=False,
+    )
+    render_console.print(*objects, **kwargs)
+    return output.getvalue()
+
+
+def _render_dashboard_ansi(model_name, workspace_dir, width):
+    output = StringIO()
+    render_console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        width=max(1, int(width or 80)),
+        legacy_windows=False,
+        highlight=False,
+    )
+    previous_console = getattr(_console_override, "console", None)
+    previous_capture = getattr(_dashboard_capture, "active", False)
+    _console_override.console = render_console
+    _dashboard_capture.active = True
+    try:
+        show_dashboard(model_name, workspace_dir)
+    finally:
+        if previous_console is None:
+            try:
+                del _console_override.console
+            except AttributeError:
+                pass
+        else:
+            _console_override.console = previous_console
+        _dashboard_capture.active = previous_capture
+    return output.getvalue().rstrip("\n")
+
+
+class _TUIPlaceholderProcessor(Processor):
+    def __init__(self, session):
+        self.session = session
+
+    def apply_transformation(self, transformation_input):
+        if (
+            transformation_input.lineno == 0
+            and not self.session.input_area.text
+        ):
+            return Transformation(
+                [("class:input.placeholder", BOTTOM_INPUT_PLACEHOLDER)]
+            )
+        return Transformation(transformation_input.fragments)
+
+
+class ChatTUISession:
+    def __init__(
+        self,
+        model_name=None,
+        workspace_dir=None,
+        app_input=None,
+        app_output=None,
+    ):
+        self.model_name = model_name or ""
+        self.workspace_dir = workspace_dir
+        self.messages_ansi = ""
+        self.messages_plain = ""
+        self.message_fragments = []
+        self.input_enabled = False
+        self.pending_prompt_text = ""
+        self.pending_prompt_rendered = False
+        self.lock = threading.RLock()
+        self.input_queue = queue.Queue()
+        self.dashboard_cache_key = None
+        self.dashboard_cache_text = ""
+
+        self.input_area = TextArea(
+            multiline=True,
+            prompt="",
+            scrollbar=False,
+            wrap_lines=True,
+            height=1,
+            read_only=Condition(lambda: not self.input_enabled),
+            input_processors=[_TUIPlaceholderProcessor(self)],
+            style="class:input",
+        )
+        self.input_area.buffer.on_text_changed += lambda _: self._input_changed()
+
+        self.message_control = FormattedTextControl(
+            self._message_text,
+            show_cursor=False,
+            get_cursor_position=self._message_cursor_position,
+        )
+        self.message_window = Window(
+            content=self.message_control,
+            wrap_lines=True,
+            always_hide_cursor=True,
+        )
+        self.dashboard_window = Window(
+            content=FormattedTextControl(
+                self._dashboard_text,
+                show_cursor=False,
+            ),
+            height=self._dashboard_height,
+            always_hide_cursor=True,
+        )
+        self.input_top_border = Window(
+            content=FormattedTextControl(
+                lambda: [("class:input.border", self._border_line())]
+            ),
+            height=1,
+            always_hide_cursor=True,
+        )
+        self.input_bottom_border = Window(
+            content=FormattedTextControl(
+                lambda: [("class:input.border", self._border_line())]
+            ),
+            height=1,
+            always_hide_cursor=True,
+        )
+        self.root = HSplit(
+            [
+                self.dashboard_window,
+                self.message_window,
+                self.input_top_border,
+                self.input_area,
+                self.input_bottom_border,
+            ]
+        )
+        self.layout = Layout(self.root, focused_element=self.input_area)
+        self.app = Application(
+            layout=self.layout,
+            key_bindings=self._key_bindings(),
+            full_screen=True,
+            mouse_support=False,
+            color_depth=ColorDepth.TRUE_COLOR,
+            input=app_input,
+            output=app_output,
+            max_render_postpone_time=0,
+            refresh_interval=0.02,
+            style=Style.from_dict(
+                {
+                    "input": f"bold {STREAM_RESPONSE_COLOR}",
+                    "input.border": f"bold {STREAM_RESPONSE_COLOR}",
+                    "input.placeholder": f"bold {STREAM_THINK_COLOR}",
+                    "text-area": f"bold {STREAM_RESPONSE_COLOR}",
+                }
+            ),
+        )
+
+    def set_dashboard(self, model_name, workspace_dir=None):
+        with self.lock:
+            self.model_name = model_name or ""
+            self.workspace_dir = workspace_dir
+            self.dashboard_cache_key = None
+        self.invalidate()
+
+    def run(self, worker):
+        def start_worker():
+            worker_thread = threading.Thread(
+                target=self._run_worker,
+                args=(worker,),
+                daemon=True,
+            )
+            worker_thread.start()
+
+        try:
+            self.app.run(pre_run=start_worker)
+        finally:
+            self.input_enabled = False
+
+    def stop(self):
+        self._wake_input(EOFError())
+        try:
+            self.app.exit()
+        except Exception:
+            pass
+        self.invalidate()
+
+    def append_console_print(self, *objects, **kwargs):
+        ansi = _render_console_print_to_ansi(self._columns(), *objects, **kwargs)
+        self.append_ansi(ansi)
+
+    def append_ansi(self, text):
+        if not text:
+            return
+        with self.lock:
+            self.messages_ansi += str(text)
+            self.messages_plain += _strip_ansi(text)
+            self.message_fragments.extend(to_formatted_text(PromptANSI(str(text))))
+            self._trim_messages()
+        self.invalidate()
+
+    def append_styled_text(self, text, style):
+        if not text:
+            return
+        text = str(text)
+        with self.lock:
+            self.messages_ansi += _ansi_styled_text(text, style)
+            self.messages_plain += text
+            self.message_fragments.append((style, text))
+            self._trim_messages()
+        self.invalidate()
+
+    def append_stream_text(self, text, style):
+        text = str(text or "")
+        if not text:
+            return
+
+        if len(text) <= TUI_STREAM_CHUNK_SIZE:
+            self.append_styled_text(text, style)
+            return
+
+        for index in range(0, len(text), TUI_STREAM_CHUNK_SIZE):
+            self.append_styled_text(text[index : index + TUI_STREAM_CHUNK_SIZE], style)
+            time.sleep(TUI_STREAM_CHUNK_DELAY_SECONDS)
+
+    def clear_current_lines(self, line_count=1):
+        line_count = max(1, int(line_count or 1))
+        with self.lock:
+            plain = self.messages_plain
+            if not plain:
+                return
+
+            text = self.messages_ansi.rstrip("\n")
+            for _ in range(line_count):
+                index = text.rfind("\n")
+                if index < 0:
+                    text = ""
+                    break
+                text = text[: index + 1]
+            self.messages_ansi = text
+            self._rebuild_message_cache()
+        self.invalidate()
+
+    def request_console_input(self, prompt):
+        return self.request_input(
+            prompt_text="",
+            prompt_renderable=prompt,
+            prompt_rendered=True,
+        )
+
+    def request_input(
+        self,
+        prompt_text="",
+        prompt_renderable=None,
+        prompt_rendered=False,
+    ):
+        while True:
+            try:
+                self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if prompt_renderable is not None:
+            self.append_console_print(prompt_renderable, end="")
+
+        with self.lock:
+            self.pending_prompt_text = str(prompt_text or "")
+            self.pending_prompt_rendered = bool(prompt_rendered)
+            self.input_enabled = True
+
+        self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
+        self._resize_input()
+        self.layout.focus(self.input_area)
+        self.invalidate()
+
+        result = self.input_queue.get()
+        if isinstance(result, BaseException):
+            raise result
+        return str(result)
+
+    def invalidate(self):
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
+
+    def _run_worker(self, worker):
+        try:
+            worker()
+        except BaseException as error:
+            if not isinstance(error, (KeyboardInterrupt, EOFError)):
+                print_error(f"Error occurred: {error}")
+        finally:
+            self.stop()
+
+    def _key_bindings(self):
+        bindings = KeyBindings()
+
+        @bindings.add("enter")
+        def _(event):
+            if (
+                self.input_enabled
+                and os.name == "nt"
+                and (
+                    _key_down(VK_SHIFT) != _key_down(VK_CONTROL)
+                )
+            ):
+                event.current_buffer.insert_text("\n")
+                return
+            self._submit_input()
+
+        @bindings.add("escape", "[", "1", "3", ";", "2", "u")
+        @bindings.add("escape", "[", "1", "3", ";", "5", "u")
+        @bindings.add("escape", "[", "1", "3", ";", "2", "~")
+        @bindings.add("escape", "[", "1", "3", ";", "5", "~")
+        def _(event):
+            if self.input_enabled:
+                event.current_buffer.insert_text("\n")
+
+        @bindings.add("c-c")
+        def _(event):
+            self._wake_input(KeyboardInterrupt())
+
+        @bindings.add("c-d")
+        def _(event):
+            if not self.input_area.text:
+                self._wake_input(EOFError())
+
+        return bindings
+
+    def _submit_input(self):
+        if not self.input_enabled:
+            return
+
+        value = self.input_area.text
+        with self.lock:
+            prompt_text = self.pending_prompt_text
+            prompt_rendered = self.pending_prompt_rendered
+            self.input_enabled = False
+            self.pending_prompt_text = ""
+            self.pending_prompt_rendered = False
+
+        self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
+        self._resize_input()
+        self._echo_submitted_input(value, prompt_text, prompt_rendered)
+        self.input_queue.put(value)
+        self.invalidate()
+
+    def _wake_input(self, exception):
+        if self.input_enabled:
+            self.input_queue.put(exception)
+        self.input_enabled = False
+        self.invalidate()
+
+    def _echo_submitted_input(self, value, prompt_text, prompt_rendered):
+        if prompt_rendered:
+            ansi = _render_console_print_to_ansi(
+                self._columns(),
+                Text(str(value), style=f"bold {STREAM_RESPONSE_COLOR}"),
+                end="\n",
+            )
+            self.append_ansi(ansi)
+            return
+
+        ansi = _render_console_print_to_ansi(
+            self._columns(),
+            _submitted_prompt(prompt_text),
+            end="",
+        )
+        ansi += _render_console_print_to_ansi(
+            self._columns(),
+            Text(str(value), style=f"bold {STREAM_RESPONSE_COLOR}"),
+            end="\n",
+        )
+        self.append_ansi(ansi)
+
+    def _message_text(self):
+        with self.lock:
+            fragments = list(self.message_fragments)
+        return fragments or [("", "")]
+
+    def _message_cursor_position(self):
+        with self.lock:
+            plain = self.messages_plain
+        if not plain:
+            return Point(x=0, y=0)
+        lines = plain.split("\n")
+        return Point(x=len(lines[-1]), y=max(0, len(lines) - 1))
+
+    def _dashboard_text(self):
+        width = self._columns()
+        with self.lock:
+            key = (self.model_name, self.workspace_dir, width)
+            if key != self.dashboard_cache_key:
+                self.dashboard_cache_text = _render_dashboard_ansi(
+                    self.model_name,
+                    self.workspace_dir,
+                    width,
+                )
+                self.dashboard_cache_key = key
+            text = self.dashboard_cache_text
+        return PromptANSI(text)
+
+    def _dashboard_height(self):
+        plain = _strip_ansi(fragment_list_to_text_safe(self._dashboard_text()))
+        return max(1, len(plain.splitlines()) or 1)
+
+    def _input_height(self):
+        width = max(1, self._columns())
+        text = self.input_area.text if hasattr(self, "input_area") else ""
+        lines = text.split("\n") or [""]
+        height = 0
+        for line in lines:
+            line_width = max(1, _input_text_width(line))
+            height += max(1, (line_width + width - 1) // width)
+        return max(1, min(10, height))
+
+    def _input_changed(self):
+        self._resize_input()
+        self.invalidate()
+
+    def _resize_input(self):
+        if not hasattr(self, "input_area"):
+            return
+        self.input_area.window.height = Dimension.exact(self._input_height())
+
+    def _border_line(self):
+        return BOTTOM_INPUT_BORDER * self._columns()
+
+    def _columns(self):
+        try:
+            return max(10, int(self.app.output.get_size().columns))
+        except Exception:
+            size = shutil.get_terminal_size(fallback=(80, 24))
+            return max(10, int(size.columns))
+
+    def _trim_messages(self):
+        if len(self.messages_ansi) <= MAX_TUI_MESSAGE_CHARS:
+            return
+
+        overflow = len(self.messages_ansi) - MAX_TUI_MESSAGE_CHARS
+        index = self.messages_ansi.find("\n", overflow)
+        if index < 0:
+            self.messages_ansi = self.messages_ansi[-MAX_TUI_MESSAGE_CHARS:]
+        else:
+            self.messages_ansi = self.messages_ansi[index + 1 :]
+        self._rebuild_message_cache()
+
+    def _rebuild_message_cache(self):
+        self.messages_plain = _strip_ansi(self.messages_ansi)
+        self.message_fragments = list(to_formatted_text(PromptANSI(self.messages_ansi)))
+
+
+def fragment_list_to_text_safe(value):
+    try:
+        from prompt_toolkit.formatted_text import fragment_list_to_text
+        from prompt_toolkit.formatted_text import to_formatted_text
+
+        return fragment_list_to_text(to_formatted_text(value))
+    except Exception:
+        return str(value or "")
+
+
+def start_tui(model_name=None, workspace_dir=None):
+    global _tui_session
+    _tui_session = ChatTUISession(model_name, workspace_dir)
+    return _tui_session
+
+
+def run_tui(worker):
+    global _tui_session
+    if _tui_session is None:
+        start_tui()
+    try:
+        _tui_session.run(worker)
+    finally:
+        _tui_session = None
+
+
+def stop_tui():
+    if _tui_session is not None:
+        _tui_session.stop()
 
 
 def _ansi_write(text):
@@ -1139,6 +1738,16 @@ def _read_windows_multiline_input(prompt):
 
 
 def get_user_input(prompt_text, multiline=False):
+    if _tui_session is not None:
+        prompt_renderable = (
+            None if str(prompt_text or "") == "You: " else _input_prompt(prompt_text)
+        )
+        return _tui_session.request_input(
+            prompt_text,
+            prompt_renderable=prompt_renderable,
+            prompt_rendered=prompt_renderable is not None,
+        ).strip()
+
     prompt = _input_prompt(prompt_text)
     if multiline and os.name == "nt" and sys.stdin.isatty() and sys.stdout.isatty():
         return _read_bottom_multiline_input(prompt_text).strip()

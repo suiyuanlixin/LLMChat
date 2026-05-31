@@ -9,7 +9,9 @@ from ui import (
     print_warn,
     print_thinking,
     get_user_input,
+    run_tui,
     show_dashboard,
+    start_tui,
     print_stream_thinking_continue,
     clean_and_print_stream_response,
     clean_display_text,
@@ -49,11 +51,11 @@ def handle_response(response, model_name, stream_mode=False, thinking_mode=False
         return
 
     if stream_mode:
-        print()
+        console.print()
         return
 
     if response.get("response_streamed"):
-        print()
+        console.print()
         return
 
     if response.get("agent_stopped"):
@@ -144,15 +146,7 @@ def attach_external_file_references(user_input):
     return f"{user_input}\n\n" + "\n\n".join(blocks)
 
 
-def main():
-    config = load_config()
-    workspace_dir, workspace_error = get_startup_workspace(sys.argv)
-    agent_auto_disabled = False
-    if config.agent_mode and not workspace_dir:
-        config.agent_mode = False
-        agent_auto_disabled = True
-
-    show_dashboard(config.model, workspace_dir)
+def run_chat_loop(config, workspace_dir, workspace_error=None, agent_auto_disabled=False):
     if workspace_error:
         print_error(workspace_error)
     if agent_auto_disabled:
@@ -228,6 +222,30 @@ def main():
             break
         except Exception as error:
             print_error(f"Error occurred: {error}")
+
+
+def main():
+    config = load_config()
+    workspace_dir, workspace_error = get_startup_workspace(sys.argv)
+    agent_auto_disabled = False
+    if config.agent_mode and not workspace_dir:
+        config.agent_mode = False
+        agent_auto_disabled = True
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        start_tui(config.model, workspace_dir)
+        run_tui(
+            lambda: run_chat_loop(
+                config,
+                workspace_dir,
+                workspace_error,
+                agent_auto_disabled,
+            )
+        )
+        return
+
+    show_dashboard(config.model, workspace_dir)
+    run_chat_loop(config, workspace_dir, workspace_error, agent_auto_disabled)
 
 
 if __name__ == "__main__":
