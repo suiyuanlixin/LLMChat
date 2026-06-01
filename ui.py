@@ -21,7 +21,7 @@ from rich.table import Table
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.output.color_depth import ColorDepth
-from prompt_toolkit.data_structures import Point
+from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI as PromptANSI
@@ -886,6 +886,35 @@ class _ScrollableMessageControl(FormattedTextControl):
         return super().mouse_handler(mouse_event)
 
 
+def _patch_windows_output_full_width(output):
+    if os.name != "nt" or output is None:
+        return
+
+    target = getattr(output, "win32_output", output)
+    if getattr(target, "_llmchat_full_width_patched", False):
+        return
+    if not hasattr(target, "get_win32_screen_buffer_info"):
+        return
+
+    original_get_size = target.get_size
+
+    def get_size_full_width():
+        try:
+            info = target.get_win32_screen_buffer_info()
+            if getattr(target, "use_complete_width", False):
+                width = int(info.dwSize.X)
+            else:
+                width = int(info.srWindow.Right - info.srWindow.Left + 1)
+            height = int(info.srWindow.Bottom - info.srWindow.Top + 1)
+            width = min(max(1, int(info.dwSize.X)), max(1, width))
+            return Size(rows=max(1, height), columns=width)
+        except Exception:
+            return original_get_size()
+
+    target.get_size = get_size_full_width
+    target._llmchat_full_width_patched = True
+
+
 class ChatTUISession:
     def __init__(
         self,
@@ -908,6 +937,7 @@ class ChatTUISession:
         self.input_queue = queue.Queue()
         self.dashboard_cache_key = None
         self.dashboard_cache_text = ""
+        self.terminal_select_mode = False
 
         self.input_area = TextArea(
             multiline=True,
@@ -968,12 +998,11 @@ class ChatTUISession:
             layout=self.layout,
             key_bindings=self._key_bindings(),
             full_screen=True,
-            mouse_support=True,
+            mouse_support=Condition(self._mouse_support_enabled),
             color_depth=ColorDepth.TRUE_COLOR,
             input=app_input,
             output=app_output,
             max_render_postpone_time=0,
-            refresh_interval=0.02,
             style=Style.from_dict(
                 {
                     "input": f"bold {STREAM_RESPONSE_COLOR}",
@@ -983,6 +1012,7 @@ class ChatTUISession:
                 }
             ),
         )
+        _patch_windows_output_full_width(self.app.output)
 
     def set_dashboard(self, model_name, workspace_dir=None):
         with self.lock:
@@ -1103,8 +1133,46 @@ class ChatTUISession:
         return str(result)
 
     def invalidate(self):
+        with self.lock:
+            if self.terminal_select_mode:
+                return
+        self._invalidate_app()
+
+    def _invalidate_app(self):
         try:
             self.app.invalidate()
+        except Exception:
+            pass
+
+    def _mouse_support_enabled(self):
+        with self.lock:
+            return not self.terminal_select_mode
+
+    def _toggle_terminal_select_mode(self):
+        with self.lock:
+            active = not self.terminal_select_mode
+        self._set_terminal_select_mode(active)
+
+    def _set_terminal_select_mode(self, active):
+        active = bool(active)
+        with self.lock:
+            if self.terminal_select_mode == active:
+                return
+            self.terminal_select_mode = active
+
+        if active:
+            self._disable_terminal_mouse_support_now()
+        else:
+            self._invalidate_app()
+
+    def _disable_terminal_mouse_support_now(self):
+        try:
+            output = self.app.output
+            output.disable_mouse_support()
+            output.flush()
+            renderer = getattr(self.app, "renderer", None)
+            if renderer is not None:
+                renderer._mouse_support_enabled = False
         except Exception:
             pass
 
@@ -1119,6 +1187,10 @@ class ChatTUISession:
 
     def _key_bindings(self):
         bindings = KeyBindings()
+
+        @bindings.add("f2", eager=True, is_global=True)
+        def _(event):
+            self._toggle_terminal_select_mode()
 
         @bindings.add("enter")
         def _(event):
