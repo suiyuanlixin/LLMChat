@@ -525,7 +525,7 @@ class LLMChat:
                 self.request_agent_stop()
                 self._restore_history(original_history)
                 self._separate_after_agent_thinking()
-                print_warn("Agent stopped by user.")
+                self._print_agent_stopped_by_user()
                 return {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
             raise
         except Exception as error:
@@ -557,7 +557,7 @@ class LLMChat:
             return self._finalize_agent_response(self._chat_completion_agent_response())
         except KeyboardInterrupt:
             self.agent_stop_requested = True
-            print_warn("Agent stopped by user.")
+            self._print_agent_stopped_by_user()
             return self._finalize_agent_response(
                 {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
             )
@@ -1808,12 +1808,16 @@ class LLMChat:
     def _agent_stopped_response(self, thinking, response):
         message = "Agent stopped by user."
         self._separate_after_agent_thinking()
-        print_warn(message)
+        self._print_agent_stopped_by_user()
         return {
             "thinking": thinking,
             "response": response or message,
             "agent_stopped": True,
         }
+
+    def _print_agent_stopped_by_user(self):
+        console.print()
+        print_warn("Agent stopped by user.")
 
     def _agent_tool_budget_exceeded(self, requested_tool_calls):
         return self.agent_tool_calls + requested_tool_calls > self.max_agent_tool_calls

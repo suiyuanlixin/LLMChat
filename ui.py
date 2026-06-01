@@ -212,20 +212,83 @@ def background_block(content, background_color):
 
 
 def diff_background_block(content):
+    return _DiffBackgroundBlock(content)
+
+
+class _DiffBackgroundBlock:
+    def __init__(self, content):
+        self.content = str(content or "")
+
+    def __rich_console__(self, rich_console, options):
+        yield _build_diff_background_table(self.content)
+
+
+def _build_diff_background_table(content):
     table = Table.grid(expand=True, padding=(0, 0))
     table.add_column(ratio=1)
 
     lines = str(content or "").splitlines() or [""]
+    number_width = _diff_line_number_width(lines)
+    old_line = None
+    new_line = None
+
     for line in lines:
+        hunk_match = re.match(
+            r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@",
+            line,
+        )
+        if hunk_match:
+            old_line = int(hunk_match.group(1))
+            new_line = int(hunk_match.group(3))
+            rendered_line = _diff_numbered_line(line, None, number_width)
+        elif line.startswith("+") and not line.startswith("+++") and new_line is not None:
+            rendered_line = _diff_numbered_line(line, new_line, number_width)
+            new_line += 1
+        elif line.startswith("-") and not line.startswith("---") and old_line is not None:
+            rendered_line = _diff_numbered_line(line, old_line, number_width)
+            old_line += 1
+        elif line.startswith(" ") and old_line is not None and new_line is not None:
+            rendered_line = _diff_numbered_line(line, new_line, number_width)
+            old_line += 1
+            new_line += 1
+        else:
+            rendered_line = _diff_numbered_line(line, None, number_width)
+
         if line.startswith("+") and not line.startswith("+++"):
             style = f"bold {TEXT_COLOR[1]} on {SUCCESS_COLOR[0]}"
         elif line.startswith("-") and not line.startswith("---"):
             style = f"bold {TEXT_COLOR[1]} on {ERROR_COLOR[0]}"
         else:
             style = f"bold {TEXT_COLOR[1]}"
-        table.add_row(Text(line, style=style))
+        table.add_row(Text(rendered_line), style=style)
 
     return table
+
+
+def _diff_line_number_width(lines):
+    max_line = 0
+    for line in lines:
+        match = re.match(
+            r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@",
+            line,
+        )
+        if not match:
+            continue
+        old_start = int(match.group(1))
+        old_count = int(match.group(2) or "1")
+        new_start = int(match.group(3))
+        new_count = int(match.group(4) or "1")
+        max_line = max(
+            max_line,
+            old_start + max(0, old_count - 1),
+            new_start + max(0, new_count - 1),
+        )
+    return max(1, len(str(max_line or 1)))
+
+
+def _diff_numbered_line(line, line_number, width):
+    number_text = f"{line_number:>{width}}" if line_number is not None else " " * width
+    return f"{number_text} | {line}"
 
 
 def _blend_channels(start, end, progress):
@@ -828,6 +891,14 @@ def _render_console_print_to_ansi(width, *objects, **kwargs):
     return output.getvalue()
 
 
+def _render_diff_background_block_ansi(width, content, print_kwargs=None):
+    return _render_console_print_to_ansi(
+        width,
+        _build_diff_background_table(content),
+        **dict(print_kwargs or {}),
+    )
+
+
 def _render_dashboard_ansi(model_name, workspace_dir, width):
     output = StringIO()
     render_console = Console(
@@ -928,6 +999,9 @@ class ChatTUISession:
         self.messages_ansi = ""
         self.messages_plain = ""
         self.message_fragments = []
+        self.message_blocks = []
+        self.message_blocks_have_dynamic = False
+        self.message_blocks_width = None
         self.message_scroll_offset = 0
         self.message_render_line_lengths = [0]
         self.input_enabled = False
@@ -1044,16 +1118,42 @@ class ChatTUISession:
         self.invalidate()
 
     def append_console_print(self, *objects, **kwargs):
+        if len(objects) == 1 and isinstance(objects[0], _DiffBackgroundBlock):
+            self.append_diff_block(objects[0], kwargs)
+            return
         ansi = _render_console_print_to_ansi(self._columns(), *objects, **kwargs)
         self.append_ansi(ansi)
+
+    def append_diff_block(self, block, print_kwargs=None):
+        width = self._columns()
+        print_kwargs = dict(print_kwargs or {})
+        ansi = _render_diff_background_block_ansi(
+            width,
+            block.content,
+            print_kwargs,
+        )
+        if not ansi:
+            return
+        with self.lock:
+            self.message_blocks.append(("diff", block.content, print_kwargs))
+            self.message_blocks_have_dynamic = True
+            self.message_blocks_width = width
+            self.messages_ansi += ansi
+            self.messages_plain += _strip_ansi(ansi)
+            self.message_fragments.extend(to_formatted_text(PromptANSI(ansi)))
+            self._trim_messages()
+            self._clamp_message_scroll_offset_locked()
+        self.invalidate()
 
     def append_ansi(self, text):
         if not text:
             return
+        text = str(text)
         with self.lock:
-            self.messages_ansi += str(text)
+            self.message_blocks.append(("ansi", text))
+            self.messages_ansi += text
             self.messages_plain += _strip_ansi(text)
-            self.message_fragments.extend(to_formatted_text(PromptANSI(str(text))))
+            self.message_fragments.extend(to_formatted_text(PromptANSI(text)))
             self._trim_messages()
             self._clamp_message_scroll_offset_locked()
         self.invalidate()
@@ -1062,8 +1162,10 @@ class ChatTUISession:
         if not text:
             return
         text = str(text)
+        ansi = _ansi_styled_text(text, style)
         with self.lock:
-            self.messages_ansi += _ansi_styled_text(text, style)
+            self.message_blocks.append(("ansi", ansi))
+            self.messages_ansi += ansi
             self.messages_plain += text
             self.message_fragments.append((style, text))
             self._trim_messages()
@@ -1091,6 +1193,9 @@ class ChatTUISession:
                     break
                 text = text[: index + 1]
             self.messages_ansi = text
+            self.message_blocks = [("ansi", self.messages_ansi)]
+            self.message_blocks_have_dynamic = False
+            self.message_blocks_width = None
             self._rebuild_message_cache()
             self._clamp_message_scroll_offset_locked()
         self.invalidate()
@@ -1283,7 +1388,13 @@ class ChatTUISession:
         self.append_ansi(ansi)
 
     def _message_text(self):
+        width = self._columns()
         with self.lock:
+            if (
+                self.message_blocks_have_dynamic
+                and self.message_blocks_width != width
+            ):
+                self._rebuild_message_cache(width)
             fragments = list(self.message_fragments) or [("", "")]
             self._refresh_message_render_lines_locked(fragments)
         return fragments or [("", "")]
@@ -1397,12 +1508,33 @@ class ChatTUISession:
             self.messages_ansi = self.messages_ansi[-MAX_TUI_MESSAGE_CHARS:]
         else:
             self.messages_ansi = self.messages_ansi[index + 1 :]
+        self.message_blocks = [("ansi", self.messages_ansi)]
+        self.message_blocks_have_dynamic = False
+        self.message_blocks_width = None
         self._rebuild_message_cache()
 
-    def _rebuild_message_cache(self):
+    def _rebuild_message_cache(self, width=None):
+        if self.message_blocks_have_dynamic:
+            width = max(1, int(width or self._columns()))
+            self.messages_ansi = self._render_message_blocks_locked(width)
+            self.message_blocks_width = width
         self.messages_plain = _strip_ansi(self.messages_ansi)
         self.message_fragments = list(to_formatted_text(PromptANSI(self.messages_ansi)))
         self._clamp_message_scroll_offset_locked()
+
+    def _render_message_blocks_locked(self, width):
+        rendered = []
+        for block in self.message_blocks:
+            if not block:
+                continue
+            if block[0] == "diff":
+                _, content, print_kwargs = block
+                rendered.append(
+                    _render_diff_background_block_ansi(width, content, print_kwargs)
+                )
+            else:
+                rendered.append(block[1])
+        return "".join(rendered)
 
     def _clamp_message_scroll_offset_locked(self):
         self.message_scroll_offset = max(
