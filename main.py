@@ -170,6 +170,7 @@ def run_chat_loop(config, workspace_dir, workspace_error=None, agent_auto_disabl
             agent_approval_mode=config.agent_approval_mode,
             agent_show_thinking=config.agent_show_thinking,
             agent_summary_model=config.agent_summary_model,
+            agent_skills=config.agent_skills,
             compaction_enable=config.compaction_enable,
             compaction_trigger_ratio=config.compaction_trigger_ratio,
             compaction_keep_recent_messages=config.compaction_keep_recent_messages,

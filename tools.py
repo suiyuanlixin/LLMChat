@@ -6,6 +6,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from skills import SkillRegistry
 from ui import get_agent_diff_confirmation, get_user_input
 from search import (
     DEFAULT_WEB_SEARCH_DEPTH,
@@ -320,18 +321,54 @@ WEB_SEARCH_TOOL_DEFINITION = {
 }
 
 
-def tool_definitions(include_web_search=False):
+SKILL_TOOL_DEFINITIONS = [
+    {
+        "name": "list_skills",
+        "description": "List reusable agent skills available from the program skills directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "read_skill",
+        "description": (
+            "Read a skill's SKILL.md instructions and optionally additional files from that skill directory. "
+            "Call this before following a matching skill workflow."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name, such as git-commit.",
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional skill-relative files to read after SKILL.md.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+]
+
+
+def tool_definitions(include_web_search=False, include_skills=False):
     definitions = list(TOOL_DEFINITIONS)
+    if include_skills:
+        definitions.extend(SKILL_TOOL_DEFINITIONS)
     if include_web_search:
         definitions.append(WEB_SEARCH_TOOL_DEFINITION)
     return definitions
 
 
-def anthropic_tool_schemas(include_web_search=False):
-    return tool_definitions(include_web_search)
+def anthropic_tool_schemas(include_web_search=False, include_skills=False):
+    return tool_definitions(include_web_search, include_skills)
 
 
-def glm_tool_schemas(include_web_search=False):
+def glm_tool_schemas(include_web_search=False, include_skills=False):
     return [
         {
             "type": "function",
@@ -341,16 +378,16 @@ def glm_tool_schemas(include_web_search=False):
                 "parameters": tool["input_schema"],
             },
         }
-        for tool in tool_definitions(include_web_search)
+        for tool in tool_definitions(include_web_search, include_skills)
     ]
 
 
-def openai_tool_schemas(include_web_search=False):
-    return glm_tool_schemas(include_web_search)
+def openai_tool_schemas(include_web_search=False, include_skills=False):
+    return glm_tool_schemas(include_web_search, include_skills)
 
 
-def ollama_tool_schemas(include_web_search=False):
-    return glm_tool_schemas(include_web_search)
+def ollama_tool_schemas(include_web_search=False, include_skills=False):
+    return glm_tool_schemas(include_web_search, include_skills)
 
 
 class AgentToolError(Exception):
@@ -369,9 +406,11 @@ class AgentTools:
         web_search_max_results=DEFAULT_WEB_SEARCH_MAX_RESULTS,
         web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
         web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
+        skills_enabled=True,
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
+        self.skill_registry = SkillRegistry(enabled=skills_enabled)
         self.set_approval_mode(approval_mode)
         self.set_web_search_config(
             web_search_enabled,
@@ -398,6 +437,25 @@ class AgentTools:
 
     def set_visible_output_callback(self, callback):
         self.visible_output_callback = callback
+
+    def set_skills_enabled(self, enabled):
+        self.skill_registry.enabled = bool(enabled)
+        self.skill_registry.reload()
+
+    @property
+    def skills_available(self):
+        return bool(self.skill_registry.enabled)
+
+    def skills_catalog_prompt(self):
+        return self.skill_registry.catalog_prompt()
+
+    def skills_status(self):
+        skills = self.skill_registry.list_skills()
+        return {
+            "enabled": self.skill_registry.enabled,
+            "directory": str(self.skill_registry.skills_dir),
+            "count": len(skills),
+        }
 
     def set_web_search_config(
         self,
@@ -548,6 +606,8 @@ class AgentTools:
                 "grep": self._grep,
                 "glob": self._glob,
                 "web_search": self._web_search,
+                "list_skills": self._list_skills,
+                "read_skill": self._read_skill,
             }
             handler = handlers.get(name)
             if handler is None:
@@ -877,6 +937,13 @@ class AgentTools:
         safe_matches.sort()
         suffix = "\n[truncated]" if len(safe_matches) >= MAX_GLOB_MATCHES else ""
         return "\n".join(safe_matches) + suffix
+
+    def _list_skills(self, tool_input):
+        return self.skill_registry.list_for_tool()
+
+    def _read_skill(self, tool_input):
+        name = _required_string(tool_input, "name")
+        return self.skill_registry.read_skill(name, tool_input.get("files"))
 
     def _web_search(self, tool_input):
         if not self.web_search_enabled:

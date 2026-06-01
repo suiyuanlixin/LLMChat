@@ -190,6 +190,7 @@ class LLMChat:
         agent_approval_mode="confirm",
         agent_show_thinking=True,
         agent_summary_model="",
+        agent_skills=True,
         compaction_enable=True,
         compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=12,
@@ -232,6 +233,7 @@ class LLMChat:
             web_search_max_results=web_search_max_results,
             web_search_depth=web_search_depth,
             web_search_topic=web_search_topic,
+            skills_enabled=agent_skills,
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
         self.agent_show_thinking = parse_agent_show_thinking(agent_show_thinking)
@@ -380,6 +382,9 @@ class LLMChat:
     def set_agent_summary_model(self, model):
         self.agent_summary_model = str(model or "").strip()
 
+    def set_agent_skills(self, enabled):
+        self.agent_tools.set_skills_enabled(enabled)
+
     def set_web_search_config(
         self,
         enabled=None,
@@ -464,6 +469,7 @@ class LLMChat:
             "approval_mode": self.agent_tools.approval_mode,
             "show_thinking": self.agent_show_thinking,
             "summary_model": self.agent_summary_model,
+            "skills": self.agent_tools.skills_status(),
         }
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
@@ -1674,7 +1680,10 @@ class LLMChat:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
                     messages=self._ollama_agent_messages(),
-                    tools=ollama_tool_schemas(self.agent_tools.web_search_available),
+                    tools=ollama_tool_schemas(
+                        self.agent_tools.web_search_available,
+                        self.agent_tools.skills_available,
+                    ),
                 )
             )
             self._record_context_usage(response)
@@ -1729,7 +1738,10 @@ class LLMChat:
             temperature=self.temperature,
             messages=self._anthropic_messages(),
             system=self._agent_system_prompt(),
-            tools=anthropic_tool_schemas(self.agent_tools.web_search_available),
+            tools=anthropic_tool_schemas(
+                self.agent_tools.web_search_available,
+                self.agent_tools.skills_available,
+            ),
             stream=True,
             **self._anthropic_request_options(),
         )
@@ -3412,6 +3424,9 @@ class LLMChat:
                 "\n- Use web_search for recent, unstable, or external facts when local files "
                 "are insufficient. Cite source URLs from search results in the final answer."
             )
+        skills_prompt = self.agent_tools.skills_catalog_prompt()
+        if skills_prompt:
+            prompt += skills_prompt
         return _with_user_custom_prompt(_with_persistent_memory(prompt, self.memory_store))
 
     def _reasoning_effort_value(self):
@@ -3597,9 +3612,10 @@ class LLMChat:
 
     def _chat_tool_schemas(self):
         include_web_search = self.agent_tools.web_search_available
+        include_skills = self.agent_tools.skills_available
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
-            return openai_tool_schemas(include_web_search)
-        return glm_tool_schemas(include_web_search)
+            return openai_tool_schemas(include_web_search, include_skills)
+        return glm_tool_schemas(include_web_search, include_skills)
 
     def _normal_web_search_tool_schemas(self):
         if self.api_type == API_TYPE_ANTHROPIC:

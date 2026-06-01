@@ -34,6 +34,7 @@ DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
 DEFAULT_AGENT_SUMMARY_MODEL = ""
+DEFAULT_AGENT_SKILLS = True
 DEFAULT_COMPACTION_ENABLE = True
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
 DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75
@@ -74,6 +75,7 @@ class AppConfig:
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
     agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
     agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
+    agent_skills: bool = DEFAULT_AGENT_SKILLS
     compaction_enable: bool = DEFAULT_COMPACTION_ENABLE
     compaction_trigger_ratio: float = DEFAULT_COMPACTION_TRIGGER_RATIO
     compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
@@ -104,6 +106,7 @@ class AppConfig:
             "agent_approval_mode": self.agent_approval_mode,
             "agent_show_thinking": self.agent_show_thinking,
             "agent_summary_model": self.agent_summary_model,
+            "agent_skills": self.agent_skills,
             "compaction_enable": self.compaction_enable,
             "compaction_trigger_ratio": self.compaction_trigger_ratio,
             "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
@@ -136,6 +139,7 @@ class AppConfig:
                 "approve": self.agent_approval_mode,
                 "show_thinking": self.agent_show_thinking,
                 "summary_model": self.agent_summary_model,
+                "skills": self.agent_skills,
             },
             "auto_compact": {
                 "enable": self.compaction_enable,
@@ -400,6 +404,10 @@ def _sanitize_config(config):
     config["agent_summary_model"] = str(
         agent_config.get("summary_model", DEFAULT_AGENT_SUMMARY_MODEL) or ""
     ).strip()
+    config["agent_skills"] = _parse_bool(
+        agent_config.get("skills"),
+        DEFAULT_AGENT_SKILLS,
+    )
     try:
         config["agent_show_thinking"] = parse_agent_show_thinking(
             agent_config.get("show_thinking", DEFAULT_AGENT_SHOW_THINKING)
@@ -704,6 +712,7 @@ def load_config():
         agent_approval_mode=DEFAULT_AGENT_APPROVAL_MODE,
         agent_show_thinking=DEFAULT_AGENT_SHOW_THINKING,
         agent_summary_model=DEFAULT_AGENT_SUMMARY_MODEL,
+        agent_skills=DEFAULT_AGENT_SKILLS,
         compaction_enable=DEFAULT_COMPACTION_ENABLE,
         compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
@@ -852,6 +861,7 @@ def update_config():
         agent_approval_mode=new_agent_approval_mode,
         agent_show_thinking=config.agent_show_thinking,
         agent_summary_model=new_agent_summary_model,
+        agent_skills=config.agent_skills,
         compaction_enable=config.compaction_enable,
         compaction_trigger_ratio=new_compaction_trigger_ratio,
         compaction_keep_recent_messages=config.compaction_keep_recent_messages,

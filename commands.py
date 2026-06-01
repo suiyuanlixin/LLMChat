@@ -536,14 +536,17 @@ def handle_agent(chat, args):
         approval = status.get("approval_mode", "confirm")
         show_thinking = status.get("show_thinking", "summary")
         summary_model = status.get("summary_model") or "local"
+        skills = status.get("skills") or {}
+        skills_state = "on" if skills.get("enabled") else "off"
         print_info(
             f"Current agent mode: {current} ({running}).\n"
             f"Budget: {budget}.\n"
             f"Approval: {approval}.\n"
             f"Show thinking: {show_thinking}.\n"
             f"Summary model: {summary_model}.\n"
+            f"Skills: {skills_state} ({skills.get('count', 0)} loaded).\n"
             f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
-            f"/agent approve confirm|auto | /agent show-thinking summary|full|off"
+            f"/agent approve confirm|auto | /agent show-thinking summary|full|off | /agent skills on|off|reload"
         )
         return True
 
@@ -631,11 +634,34 @@ def handle_agent(chat, args):
         chat.set_agent_show_thinking(show_thinking)
         save_config_field("agent_show_thinking", show_thinking)
         print_success(f"Agent thinking display set to {show_thinking}.")
+    elif mode == "skills":
+        skills = status.get("skills") or {}
+        if len(parts) == 1:
+            state = "on" if skills.get("enabled") else "off"
+            print_info(
+                f"Current agent skills: {state} ({skills.get('count', 0)} loaded).\n"
+                f"Directory: {skills.get('directory') or 'skills'}.\n"
+                "Usage: /agent skills on|off|reload"
+            )
+            return True
+        if len(parts) != 2 or parts[1].lower() not in {"on", "off", "reload"}:
+            print_error("Usage: /agent skills on|off|reload")
+            return True
+        action = parts[1].lower()
+        if action == "reload":
+            chat.agent_tools.skill_registry.reload()
+            skills = chat.get_agent_status().get("skills") or {}
+            print_success(f"Agent skills reloaded ({skills.get('count', 0)} loaded).")
+            return True
+        enabled = action == "on"
+        chat.set_agent_skills(enabled)
+        save_config_field("agent_skills", enabled)
+        print_success(f"Agent skills turned {'on' if enabled else 'off'}.")
     else:
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
             f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto, "
-            f"/agent show-thinking summary|full|off."
+            f"/agent show-thinking summary|full|off, /agent skills on|off|reload."
         )
     return True
 
