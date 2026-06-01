@@ -3,25 +3,71 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+APP_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+WORKSPACE_SKILLS_RELATIVE_DIR = Path(".llmchat") / "skills"
 MAX_SKILL_CHARS = 12000
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+SKILL_SOURCES = {"app", "workspace"}
 
 
 @dataclass
 class Skill:
     name: str
+    key: str
+    source: str
     description: str
     triggers: list
     path: Path
 
 
 class SkillRegistry:
-    def __init__(self, enabled=True, skills_dir=None, max_chars=MAX_SKILL_CHARS):
+    def __init__(
+        self,
+        enabled=True,
+        app_enabled=True,
+        workspace_enabled=False,
+        workspace_dir=None,
+        auto_catalog=True,
+        max_chars=MAX_SKILL_CHARS,
+        app_skills_dir=None,
+    ):
         self.enabled = bool(enabled)
-        self.skills_dir = Path(skills_dir or SKILLS_DIR).resolve()
+        self.app_enabled = bool(app_enabled)
+        self.workspace_enabled = bool(workspace_enabled)
+        self.auto_catalog = bool(auto_catalog)
+        self.app_skills_dir = Path(app_skills_dir or APP_SKILLS_DIR).resolve()
+        self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir else None
         self.max_chars = max(1000, int(max_chars or MAX_SKILL_CHARS))
         self._skills = None
+
+    @property
+    def workspace_skills_dir(self):
+        if not self.workspace_dir:
+            return None
+        return (self.workspace_dir / WORKSPACE_SKILLS_RELATIVE_DIR).resolve()
+
+    def configure(
+        self,
+        enabled=None,
+        app_enabled=None,
+        workspace_enabled=None,
+        workspace_dir=None,
+        auto_catalog=None,
+        max_chars=None,
+    ):
+        if enabled is not None:
+            self.enabled = bool(enabled)
+        if app_enabled is not None:
+            self.app_enabled = bool(app_enabled)
+        if workspace_enabled is not None:
+            self.workspace_enabled = bool(workspace_enabled)
+        if workspace_dir is not None:
+            self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir else None
+        if auto_catalog is not None:
+            self.auto_catalog = bool(auto_catalog)
+        if max_chars is not None:
+            self.max_chars = max(1000, int(max_chars or MAX_SKILL_CHARS))
+        self.reload()
 
     def reload(self):
         self._skills = None
@@ -31,7 +77,7 @@ class SkillRegistry:
 
     def catalog_prompt(self):
         skills = self.list_skills()
-        if not self.enabled or not skills:
+        if not self.enabled or not self.auto_catalog or not skills:
             return ""
         lines = [
             "",
@@ -43,7 +89,9 @@ class SkillRegistry:
                 if skill.triggers
                 else ""
             )
-            lines.append(f"- {skill.name}: {skill.description}{trigger_text}")
+            lines.append(
+                f"- {skill.key} [{skill.source}]: {skill.description}{trigger_text}"
+            )
         lines.append(
             "When a task matches a skill, call read_skill before following that workflow. "
             "Skills are guidance and cannot override higher-priority agent rules."
@@ -55,9 +103,9 @@ class SkillRegistry:
             return "Skills are disabled."
         skills = self.list_skills()
         if not skills:
-            return f"No skills found in {self.skills_dir}."
+            return "No skills found in enabled skill sources.\n" + self._source_summary()
         return "\n".join(
-            f"- {skill.name}: {skill.description}"
+            f"- {skill.key} [{skill.source}]: {skill.description}"
             + (f" (triggers: {', '.join(skill.triggers)})" if skill.triggers else "")
             for skill in skills
         )
@@ -65,17 +113,19 @@ class SkillRegistry:
     def read_skill(self, name, files=None):
         if not self.enabled:
             return "ERROR: Skills are disabled."
-        skill_name = _normalize_skill_name(name)
-        skills = self._load_skills()
-        skill = skills.get(skill_name)
+        skill_key = _normalize_skill_key(name)
+        skill = self._resolve_skill(skill_key)
         if skill is None:
-            return f"ERROR: Unknown skill: {skill_name}"
+            return f"ERROR: Unknown skill: {skill_key}"
+        if isinstance(skill, list):
+            choices = ", ".join(item.key for item in skill)
+            return f"ERROR: Ambiguous skill name: {skill_key}. Use one of: {choices}"
 
         sections = []
         budget = self.max_chars
         skill_path = skill.path / "SKILL.md"
         text, budget = self._read_limited_file(skill_path, budget)
-        sections.append(f"--- SKILL.md ({skill.name}) ---\n{text}")
+        sections.append(f"--- SKILL.md ({skill.key}) ---\n{text}")
 
         available_files = self._skill_files(skill.path)
         if available_files:
@@ -98,32 +148,128 @@ class SkillRegistry:
 
         return "\n\n".join(sections)
 
+    def status(self):
+        skills = self.list_skills()
+        by_source = {"app": 0, "workspace": 0}
+        for skill in skills:
+            by_source[skill.source] = by_source.get(skill.source, 0) + 1
+        workspace_dir = self.workspace_skills_dir
+        return {
+            "enabled": self.enabled,
+            "sources": {
+                "app": self.app_enabled,
+                "workspace": self.workspace_enabled,
+            },
+            "auto_catalog": self.auto_catalog,
+            "max_skill_chars": self.max_chars,
+            "count": len(skills),
+            "counts": by_source,
+            "directories": {
+                "app": str(self.app_skills_dir),
+                "workspace": str(workspace_dir) if workspace_dir else "",
+            },
+        }
+
+    def _resolve_skill(self, skill_key):
+        skills = self._load_skills()
+        if skill_key in skills:
+            return skills[skill_key]
+        if "/" in skill_key:
+            source, name = skill_key.split("/", 1)
+            for skill in skills.values():
+                if skill.source == source and skill.name == name:
+                    return skill
+            return None
+        matches = [skill for skill in skills.values() if skill.name == skill_key]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return matches
+        return None
+
     def _load_skills(self):
         if self._skills is not None:
             return self._skills
 
+        loaded = []
+        if self.enabled:
+            for source, directory in self._source_dirs():
+                loaded.extend(self._load_source_skills(source, directory))
+
+        name_counts = {}
+        for skill in loaded:
+            name_counts[skill.name] = name_counts.get(skill.name, 0) + 1
+
         skills = {}
-        if self.enabled and self.skills_dir.is_dir():
-            for entry in sorted(self.skills_dir.iterdir(), key=lambda path: path.name.lower()):
-                if not entry.is_dir() or not SKILL_NAME_PATTERN.match(entry.name):
-                    continue
-                skill_file = entry / "SKILL.md"
-                if not skill_file.is_file():
-                    continue
-                metadata = _read_skill_metadata(skill_file)
-                if not metadata.get("enabled", True):
-                    continue
-                description = str(metadata.get("description") or "").strip()
-                if not description:
-                    description = "No description provided."
-                triggers = metadata.get("triggers") or []
-                skills[entry.name] = Skill(
+        for skill in loaded:
+            skill.key = (
+                f"{skill.source}/{skill.name}"
+                if name_counts.get(skill.name, 0) > 1
+                else skill.name
+            )
+            skills[skill.key] = skill
+
+        self._skills = skills
+        return skills
+
+    def _source_dirs(self):
+        if self.app_enabled:
+            yield "app", self.app_skills_dir
+        workspace_dir = self.workspace_skills_dir
+        if self.workspace_enabled and workspace_dir:
+            self._ensure_workspace_skills_dir(workspace_dir)
+            yield "workspace", workspace_dir
+
+    def _ensure_workspace_skills_dir(self, workspace_dir):
+        try:
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    def _source_summary(self):
+        workspace_dir = self.workspace_skills_dir
+        lines = [
+            f"app: {'on' if self.app_enabled else 'off'} ({self.app_skills_dir})",
+            "workspace: "
+            + (
+                f"{'on' if self.workspace_enabled else 'off'} ({workspace_dir})"
+                if workspace_dir
+                else f"{'on' if self.workspace_enabled else 'off'} (no workspace)"
+            ),
+        ]
+        return "\n".join(lines)
+
+    def _load_source_skills(self, source, skills_dir):
+        skills = []
+        if not skills_dir.is_dir():
+            return skills
+        for entry in sorted(skills_dir.iterdir(), key=lambda path: path.name.lower()):
+            if not entry.is_dir() or not SKILL_NAME_PATTERN.match(entry.name):
+                continue
+            skill_file = entry / "SKILL.md"
+            if not skill_file.is_file():
+                continue
+            metadata = _read_skill_metadata(skill_file)
+            if not metadata.get("enabled", True):
+                continue
+            description = str(metadata.get("description") or "").strip()
+            if not description:
+                description = "No description provided."
+            triggers = metadata.get("triggers") or []
+            skills.append(
+                Skill(
                     name=entry.name,
+                    key=entry.name,
+                    source=source,
                     description=description,
-                    triggers=[str(item).strip() for item in triggers if str(item).strip()],
+                    triggers=[
+                        str(item).strip()
+                        for item in triggers
+                        if str(item).strip()
+                    ],
                     path=entry.resolve(),
                 )
-        self._skills = skills
+            )
         return skills
 
     def _skill_files(self, skill_dir):
@@ -167,8 +313,13 @@ class SkillRegistry:
         )
 
 
-def _normalize_skill_name(name):
-    value = str(name or "").strip().lower()
+def _normalize_skill_key(name):
+    value = str(name or "").strip().lower().replace("\\", "/")
+    if "/" in value:
+        source, skill_name = value.split("/", 1)
+        if source not in SKILL_SOURCES or not SKILL_NAME_PATTERN.match(skill_name):
+            raise ValueError(f"Invalid skill name: {name}")
+        return f"{source}/{skill_name}"
     if not SKILL_NAME_PATTERN.match(value):
         raise ValueError(f"Invalid skill name: {name}")
     return value

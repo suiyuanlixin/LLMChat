@@ -34,7 +34,11 @@ DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
 DEFAULT_AGENT_SUMMARY_MODEL = ""
-DEFAULT_AGENT_SKILLS = True
+DEFAULT_SKILLS_ENABLE = True
+DEFAULT_SKILLS_SOURCE_APP = True
+DEFAULT_SKILLS_SOURCE_WORKSPACE = False
+DEFAULT_SKILLS_AUTO_CATALOG = True
+DEFAULT_SKILLS_MAX_CHARS = 12000
 DEFAULT_COMPACTION_ENABLE = True
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
 DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75
@@ -75,7 +79,11 @@ class AppConfig:
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
     agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
     agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
-    agent_skills: bool = DEFAULT_AGENT_SKILLS
+    skills_enable: bool = DEFAULT_SKILLS_ENABLE
+    skills_source_app: bool = DEFAULT_SKILLS_SOURCE_APP
+    skills_source_workspace: bool = DEFAULT_SKILLS_SOURCE_WORKSPACE
+    skills_auto_catalog: bool = DEFAULT_SKILLS_AUTO_CATALOG
+    skills_max_chars: int = DEFAULT_SKILLS_MAX_CHARS
     compaction_enable: bool = DEFAULT_COMPACTION_ENABLE
     compaction_trigger_ratio: float = DEFAULT_COMPACTION_TRIGGER_RATIO
     compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
@@ -106,7 +114,11 @@ class AppConfig:
             "agent_approval_mode": self.agent_approval_mode,
             "agent_show_thinking": self.agent_show_thinking,
             "agent_summary_model": self.agent_summary_model,
-            "agent_skills": self.agent_skills,
+            "skills_enable": self.skills_enable,
+            "skills_source_app": self.skills_source_app,
+            "skills_source_workspace": self.skills_source_workspace,
+            "skills_auto_catalog": self.skills_auto_catalog,
+            "skills_max_chars": self.skills_max_chars,
             "compaction_enable": self.compaction_enable,
             "compaction_trigger_ratio": self.compaction_trigger_ratio,
             "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
@@ -139,7 +151,15 @@ class AppConfig:
                 "approve": self.agent_approval_mode,
                 "show_thinking": self.agent_show_thinking,
                 "summary_model": self.agent_summary_model,
-                "skills": self.agent_skills,
+            },
+            "skills": {
+                "enable": self.skills_enable,
+                "sources": {
+                    "app": self.skills_source_app,
+                    "workspace": self.skills_source_workspace,
+                },
+                "auto_catalog": self.skills_auto_catalog,
+                "max_skill_chars": self.skills_max_chars,
             },
             "auto_compact": {
                 "enable": self.compaction_enable,
@@ -199,6 +219,13 @@ def parse_max_tokens(value):
 
 def parse_context_window_tokens(value):
     return _parse_positive_integer(value, "Model context window tokens")
+
+
+def parse_skill_max_chars(value):
+    parsed = _parse_positive_integer(value, "Skill max chars")
+    if parsed < 1000:
+        raise ValueError("Skill max chars must be at least 1000.")
+    return parsed
 
 
 def parse_agent_rounds(value):
@@ -335,6 +362,11 @@ def _extract_agent_config(config):
     return dict(raw_agent_config) if isinstance(raw_agent_config, dict) else {}
 
 
+def _extract_skills_config(config):
+    raw_skills_config = config.get("skills", {})
+    return dict(raw_skills_config) if isinstance(raw_skills_config, dict) else {}
+
+
 def _extract_compaction_config(config):
     raw_compaction_config = config.get("auto_compact", {})
     return dict(raw_compaction_config) if isinstance(raw_compaction_config, dict) else {}
@@ -352,6 +384,7 @@ def _extract_web_search_config(config):
 
 def _sanitize_config(config):
     agent_config = _extract_agent_config(config)
+    skills_config = _extract_skills_config(config)
     compaction_config = _extract_compaction_config(config)
     memory_config = _extract_memory_config(config)
     web_search_config = _extract_web_search_config(config)
@@ -404,10 +437,37 @@ def _sanitize_config(config):
     config["agent_summary_model"] = str(
         agent_config.get("summary_model", DEFAULT_AGENT_SUMMARY_MODEL) or ""
     ).strip()
-    config["agent_skills"] = _parse_bool(
-        agent_config.get("skills"),
-        DEFAULT_AGENT_SKILLS,
+
+    skills_sources_config = skills_config.get("sources", {})
+    if not isinstance(skills_sources_config, dict):
+        skills_sources_config = {}
+    config["skills_enable"] = _parse_bool(
+        skills_config.get("enable"),
+        DEFAULT_SKILLS_ENABLE,
     )
+    config["skills_source_app"] = _parse_bool(
+        skills_sources_config.get("app"),
+        DEFAULT_SKILLS_SOURCE_APP,
+    )
+    config["skills_source_workspace"] = _parse_bool(
+        skills_sources_config.get("workspace"),
+        DEFAULT_SKILLS_SOURCE_WORKSPACE,
+    )
+    config["skills_auto_catalog"] = _parse_bool(
+        skills_config.get("auto_catalog"),
+        DEFAULT_SKILLS_AUTO_CATALOG,
+    )
+    try:
+        config["skills_max_chars"] = parse_skill_max_chars(
+            skills_config.get("max_skill_chars", DEFAULT_SKILLS_MAX_CHARS)
+        )
+    except ValueError as error:
+        print_warn(
+            f"Invalid skills.max_skill_chars in {CONFIG_FILE}: {error} "
+            f"Fallback to {DEFAULT_SKILLS_MAX_CHARS}."
+        )
+        config["skills_max_chars"] = DEFAULT_SKILLS_MAX_CHARS
+
     try:
         config["agent_show_thinking"] = parse_agent_show_thinking(
             agent_config.get("show_thinking", DEFAULT_AGENT_SHOW_THINKING)
@@ -712,7 +772,11 @@ def load_config():
         agent_approval_mode=DEFAULT_AGENT_APPROVAL_MODE,
         agent_show_thinking=DEFAULT_AGENT_SHOW_THINKING,
         agent_summary_model=DEFAULT_AGENT_SUMMARY_MODEL,
-        agent_skills=DEFAULT_AGENT_SKILLS,
+        skills_enable=DEFAULT_SKILLS_ENABLE,
+        skills_source_app=DEFAULT_SKILLS_SOURCE_APP,
+        skills_source_workspace=DEFAULT_SKILLS_SOURCE_WORKSPACE,
+        skills_auto_catalog=DEFAULT_SKILLS_AUTO_CATALOG,
+        skills_max_chars=DEFAULT_SKILLS_MAX_CHARS,
         compaction_enable=DEFAULT_COMPACTION_ENABLE,
         compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
@@ -861,7 +925,11 @@ def update_config():
         agent_approval_mode=new_agent_approval_mode,
         agent_show_thinking=config.agent_show_thinking,
         agent_summary_model=new_agent_summary_model,
-        agent_skills=config.agent_skills,
+        skills_enable=config.skills_enable,
+        skills_source_app=config.skills_source_app,
+        skills_source_workspace=config.skills_source_workspace,
+        skills_auto_catalog=config.skills_auto_catalog,
+        skills_max_chars=config.skills_max_chars,
         compaction_enable=config.compaction_enable,
         compaction_trigger_ratio=new_compaction_trigger_ratio,
         compaction_keep_recent_messages=config.compaction_keep_recent_messages,

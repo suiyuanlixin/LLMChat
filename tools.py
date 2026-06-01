@@ -324,7 +324,7 @@ WEB_SEARCH_TOOL_DEFINITION = {
 SKILL_TOOL_DEFINITIONS = [
     {
         "name": "list_skills",
-        "description": "List reusable agent skills available from the program skills directory.",
+        "description": "List reusable agent skills available from enabled skill sources.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -407,10 +407,21 @@ class AgentTools:
         web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
         web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
         skills_enabled=True,
+        skills_app_enabled=True,
+        skills_workspace_enabled=False,
+        skills_auto_catalog=True,
+        skills_max_chars=12000,
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
-        self.skill_registry = SkillRegistry(enabled=skills_enabled)
+        self.skill_registry = SkillRegistry(
+            enabled=skills_enabled,
+            app_enabled=skills_app_enabled,
+            workspace_enabled=skills_workspace_enabled,
+            workspace_dir=self.workspace_dir,
+            auto_catalog=skills_auto_catalog,
+            max_chars=skills_max_chars,
+        )
         self.set_approval_mode(approval_mode)
         self.set_web_search_config(
             web_search_enabled,
@@ -439,8 +450,24 @@ class AgentTools:
         self.visible_output_callback = callback
 
     def set_skills_enabled(self, enabled):
-        self.skill_registry.enabled = bool(enabled)
-        self.skill_registry.reload()
+        self.skill_registry.configure(enabled=enabled)
+
+    def set_skills_config(
+        self,
+        enabled=None,
+        app_enabled=None,
+        workspace_enabled=None,
+        auto_catalog=None,
+        max_chars=None,
+    ):
+        self.skill_registry.configure(
+            enabled=enabled,
+            app_enabled=app_enabled,
+            workspace_enabled=workspace_enabled,
+            workspace_dir=self.workspace_dir,
+            auto_catalog=auto_catalog,
+            max_chars=max_chars,
+        )
 
     @property
     def skills_available(self):
@@ -450,12 +477,7 @@ class AgentTools:
         return self.skill_registry.catalog_prompt()
 
     def skills_status(self):
-        skills = self.skill_registry.list_skills()
-        return {
-            "enabled": self.skill_registry.enabled,
-            "directory": str(self.skill_registry.skills_dir),
-            "count": len(skills),
-        }
+        return self.skill_registry.status()
 
     def set_web_search_config(
         self,

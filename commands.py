@@ -5,6 +5,7 @@ from config import (
     parse_agent_show_thinking,
     parse_agent_tool_calls,
     parse_max_tokens,
+    parse_skill_max_chars,
     parse_temperature,
     parse_web_search_depth,
     parse_web_search_max_results,
@@ -32,6 +33,7 @@ COMMANDS = {
     "/comp": "Compact the current conversation context immediately.",
     "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
     "/search": "Toggle, inspect or configure web search (Example: /search on).",
+    "/skills": "Toggle, inspect or configure agent skills (Example: /skills workspace on).",
     "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
 }
 
@@ -112,6 +114,13 @@ def _apply_config(chat, config):
         chat.set_agent_approval_mode(config.agent_approval_mode)
         chat.set_agent_show_thinking(config.agent_show_thinking)
         chat.set_agent_summary_model(config.agent_summary_model)
+        chat.set_skills_config(
+            config.skills_enable,
+            config.skills_source_app,
+            config.skills_source_workspace,
+            config.skills_auto_catalog,
+            config.skills_max_chars,
+        )
         chat.set_compaction_config(
             config.compaction_enable,
             config.compaction_keep_recent_messages,
@@ -526,6 +535,98 @@ def _print_memory_section(title, content):
     print_info(f"{title}:\n{content}")
 
 
+def _format_skills_status(skills):
+    state = "on" if skills.get("enabled") else "off"
+    sources = skills.get("sources") or {}
+    counts = skills.get("counts") or {}
+    directories = skills.get("directories") or {}
+    auto_catalog = "on" if skills.get("auto_catalog") else "off"
+    return (
+        f"Current skills: {state} ({skills.get('count', 0)} loaded).\n"
+        f"Sources: app={'on' if sources.get('app') else 'off'} "
+        f"({counts.get('app', 0)} loaded), "
+        f"workspace={'on' if sources.get('workspace') else 'off'} "
+        f"({counts.get('workspace', 0)} loaded).\n"
+        f"App directory: {directories.get('app') or 'skills'}.\n"
+        f"Workspace directory: {directories.get('workspace') or 'no workspace'}.\n"
+        f"Auto catalog: {auto_catalog}. Max chars: {skills.get('max_skill_chars', 0)}.\n"
+        "Usage: /skills on|off|reload|app on|off|workspace on|off|catalog on|off|max-chars <num>"
+    )
+
+
+def handle_skills(chat, args):
+    status = chat.get_agent_status().get("skills") or {}
+    parts = args.split() if args else []
+    if not parts:
+        print_info(_format_skills_status(status))
+        return True
+
+    action = parts[0].lower().strip()
+    if action in {"on", "off"} and len(parts) == 1:
+        enabled = action == "on"
+        chat.set_skills_config(enabled=enabled)
+        save_config_field("skills_enable", enabled)
+        print_success(f"Skills turned {'on' if enabled else 'off'}.")
+        return True
+
+    if action == "reload" and len(parts) == 1:
+        chat.agent_tools.skill_registry.reload()
+        status = chat.get_agent_status().get("skills") or {}
+        print_success(f"Skills reloaded ({status.get('count', 0)} loaded).")
+        return True
+
+    if action in {"app", "workspace"}:
+        if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
+            print_error(f"Usage: /skills {action} on|off")
+            return True
+        enabled = parts[1].lower() == "on"
+        if action == "app":
+            chat.set_skills_config(app_enabled=enabled)
+            save_config_field("skills_source_app", enabled)
+            print_success(f"App skills source turned {'on' if enabled else 'off'}.")
+            return True
+
+        chat.set_skills_config(workspace_enabled=enabled)
+        save_config_field("skills_source_workspace", enabled)
+        status = chat.get_agent_status().get("skills") or {}
+        message = f"Workspace skills source turned {'on' if enabled else 'off'}."
+        if enabled and not (status.get("directories") or {}).get("workspace"):
+            message += " No workspace directory is active."
+        elif enabled and (status.get("counts") or {}).get("workspace", 0) == 0:
+            message += " No workspace skills loaded; add .llmchat/skills/<name>/SKILL.md if needed."
+        print_success(message)
+        return True
+
+    if action in {"catalog", "auto-catalog", "auto_catalog"}:
+        if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
+            print_error("Usage: /skills catalog on|off")
+            return True
+        enabled = parts[1].lower() == "on"
+        chat.set_skills_config(auto_catalog=enabled)
+        save_config_field("skills_auto_catalog", enabled)
+        print_success(f"Skills auto catalog turned {'on' if enabled else 'off'}.")
+        return True
+
+    if action in {"max-chars", "max_chars", "max-skill-chars", "max_skill_chars"}:
+        if len(parts) != 2:
+            print_error("Usage: /skills max-chars <num>")
+            return True
+        try:
+            max_chars = parse_skill_max_chars(parts[1])
+        except ValueError as error:
+            print_error(str(error))
+            return True
+        chat.set_skills_config(max_chars=max_chars)
+        save_config_field("skills_max_chars", max_chars)
+        print_success(f"Skills max chars set to {max_chars}.")
+        return True
+
+    print_error(
+        "Usage: /skills on|off|reload|app on|off|workspace on|off|catalog on|off|max-chars <num>"
+    )
+    return True
+
+
 def handle_agent(chat, args):
     status = chat.get_agent_status()
 
@@ -538,15 +639,18 @@ def handle_agent(chat, args):
         summary_model = status.get("summary_model") or "local"
         skills = status.get("skills") or {}
         skills_state = "on" if skills.get("enabled") else "off"
+        skill_sources = skills.get("sources") or {}
         print_info(
             f"Current agent mode: {current} ({running}).\n"
             f"Budget: {budget}.\n"
             f"Approval: {approval}.\n"
             f"Show thinking: {show_thinking}.\n"
             f"Summary model: {summary_model}.\n"
-            f"Skills: {skills_state} ({skills.get('count', 0)} loaded).\n"
+            f"Skills: {skills_state} ({skills.get('count', 0)} loaded; "
+            f"app={'on' if skill_sources.get('app') else 'off'}, "
+            f"workspace={'on' if skill_sources.get('workspace') else 'off'}).\n"
             f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
-            f"/agent approve confirm|auto | /agent show-thinking summary|full|off | /agent skills on|off|reload"
+            f"/agent approve confirm|auto | /agent show-thinking summary|full|off | /skills"
         )
         return True
 
@@ -635,33 +739,12 @@ def handle_agent(chat, args):
         save_config_field("agent_show_thinking", show_thinking)
         print_success(f"Agent thinking display set to {show_thinking}.")
     elif mode == "skills":
-        skills = status.get("skills") or {}
-        if len(parts) == 1:
-            state = "on" if skills.get("enabled") else "off"
-            print_info(
-                f"Current agent skills: {state} ({skills.get('count', 0)} loaded).\n"
-                f"Directory: {skills.get('directory') or 'skills'}.\n"
-                "Usage: /agent skills on|off|reload"
-            )
-            return True
-        if len(parts) != 2 or parts[1].lower() not in {"on", "off", "reload"}:
-            print_error("Usage: /agent skills on|off|reload")
-            return True
-        action = parts[1].lower()
-        if action == "reload":
-            chat.agent_tools.skill_registry.reload()
-            skills = chat.get_agent_status().get("skills") or {}
-            print_success(f"Agent skills reloaded ({skills.get('count', 0)} loaded).")
-            return True
-        enabled = action == "on"
-        chat.set_agent_skills(enabled)
-        save_config_field("agent_skills", enabled)
-        print_success(f"Agent skills turned {'on' if enabled else 'off'}.")
+        return handle_skills(chat, " ".join(parts[1:]) if len(parts) > 1 else None)
     else:
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
             f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto, "
-            f"/agent show-thinking summary|full|off, /agent skills on|off|reload."
+            f"/agent show-thinking summary|full|off, or /skills."
         )
     return True
 
@@ -678,6 +761,7 @@ COMMAND_HANDLERS = {
     "/comp": handle_comp,
     "/memory": handle_memory,
     "/search": handle_search,
+    "/skills": handle_skills,
     "/agent": handle_agent,
     "/token": handle_token,
     "/temp": handle_temp,

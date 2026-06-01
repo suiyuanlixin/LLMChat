@@ -190,7 +190,11 @@ class LLMChat:
         agent_approval_mode="confirm",
         agent_show_thinking=True,
         agent_summary_model="",
-        agent_skills=True,
+        skills_enabled=True,
+        skills_source_app=True,
+        skills_source_workspace=False,
+        skills_auto_catalog=True,
+        skills_max_chars=12000,
         compaction_enable=True,
         compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=12,
@@ -233,7 +237,11 @@ class LLMChat:
             web_search_max_results=web_search_max_results,
             web_search_depth=web_search_depth,
             web_search_topic=web_search_topic,
-            skills_enabled=agent_skills,
+            skills_enabled=skills_enabled,
+            skills_app_enabled=skills_source_app,
+            skills_workspace_enabled=skills_source_workspace,
+            skills_auto_catalog=skills_auto_catalog,
+            skills_max_chars=skills_max_chars,
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
         self.agent_show_thinking = parse_agent_show_thinking(agent_show_thinking)
@@ -384,6 +392,22 @@ class LLMChat:
 
     def set_agent_skills(self, enabled):
         self.agent_tools.set_skills_enabled(enabled)
+
+    def set_skills_config(
+        self,
+        enabled=None,
+        app_enabled=None,
+        workspace_enabled=None,
+        auto_catalog=None,
+        max_chars=None,
+    ):
+        self.agent_tools.set_skills_config(
+            enabled=enabled,
+            app_enabled=app_enabled,
+            workspace_enabled=workspace_enabled,
+            auto_catalog=auto_catalog,
+            max_chars=max_chars,
+        )
 
     def set_web_search_config(
         self,
