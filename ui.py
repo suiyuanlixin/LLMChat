@@ -29,7 +29,7 @@ from prompt_toolkit.formatted_text import fragment_list_to_text
 from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.processors import Processor, Transformation
@@ -927,6 +927,55 @@ def _render_dashboard_ansi(model_name, workspace_dir, width):
     return output.getvalue().rstrip("\n")
 
 
+def _render_todo_panel_ansi(todos, width, max_lines):
+    width = max(10, int(width or 80))
+    max_lines = max(1, int(max_lines or 1))
+    content_width = max(1, width - 2)
+    visible_todos = list(todos or [])[:max_lines]
+
+    lines = []
+    for todo in visible_todos:
+        status = str(todo.get("status") or "pending").strip().lower()
+        marker = "[ ]"
+        marker_colors = TEXT_COLOR
+        if status == "in_progress":
+            marker = "[-]"
+            marker_colors = INFO_COLOR
+        elif status == "completed":
+            marker = "[✓]"
+            marker_colors = SUCCESS_COLOR
+
+        content = _truncate_cells(
+            str(todo.get("content") or ""),
+            max(1, content_width - _input_text_width(marker) - 1),
+        )
+        lines.append(
+            Text.assemble(
+                gradient_text(marker, *marker_colors),
+                " ",
+                gradient_text(content, *TEXT_COLOR),
+            )
+        )
+
+    body_parts = []
+    for index, line in enumerate(lines):
+        body_parts.append(line)
+        if index < len(lines) - 1:
+            body_parts.append("\n")
+
+    title = Text.assemble(gradient_text("Todo List", *INFO_TEXT_COLOR))
+    return _render_console_print_to_ansi(
+        width,
+        Panel(
+            Text.assemble(*body_parts),
+            padding=0,
+            title=title,
+            title_align="left",
+            border_style="bold #6d8da8",
+        ),
+    ).rstrip("\n")
+
+
 class _TUIPlaceholderProcessor(Processor):
     def __init__(self, session):
         self.session = session
@@ -1012,6 +1061,9 @@ class ChatTUISession:
         self.dashboard_cache_key = None
         self.dashboard_cache_text = ""
         self.terminal_select_mode = False
+        self.todo_items = []
+        self.todo_cache_key = None
+        self.todo_cache_text = ""
 
         self.input_area = TextArea(
             multiline=True,
@@ -1044,6 +1096,19 @@ class ChatTUISession:
             height=self._dashboard_height,
             always_hide_cursor=True,
         )
+        self.todo_window = Window(
+            content=FormattedTextControl(
+                self._todo_text,
+                show_cursor=False,
+            ),
+            height=self._todo_height,
+            wrap_lines=False,
+            always_hide_cursor=True,
+        )
+        self.todo_container = ConditionalContainer(
+            content=self.todo_window,
+            filter=Condition(self._todo_visible),
+        )
         self.input_top_border = Window(
             content=FormattedTextControl(
                 lambda: [("class:input.border", self._border_line())]
@@ -1062,6 +1127,7 @@ class ChatTUISession:
             [
                 self.dashboard_window,
                 self.message_window,
+                self.todo_container,
                 self.input_top_border,
                 self.input_area,
                 self.input_bottom_border,
@@ -1177,6 +1243,25 @@ class ChatTUISession:
         if not text:
             return
         self.append_styled_text(text, style)
+
+    def set_todos(self, todos):
+        normalized = []
+        for todo in todos or []:
+            if not isinstance(todo, dict):
+                continue
+            content = str(todo.get("content") or "").strip()
+            if not content:
+                continue
+            normalized.append(
+                {
+                    "content": content,
+                    "status": str(todo.get("status") or "pending").strip().lower(),
+                }
+            )
+        with self.lock:
+            self.todo_items = normalized
+            self.todo_cache_key = None
+        self.invalidate()
 
     def clear_current_lines(self, line_count=1):
         line_count = max(1, int(line_count or 1))
@@ -1371,6 +1456,7 @@ class ChatTUISession:
                 self._columns(),
                 Text(str(value), style=f"bold {STREAM_RESPONSE_COLOR}"),
                 end="\n",
+                soft_wrap=True,
             )
             self.append_ansi(ansi)
             return
@@ -1384,6 +1470,7 @@ class ChatTUISession:
             self._columns(),
             Text(str(value), style=f"bold {STREAM_RESPONSE_COLOR}"),
             end="\n",
+            soft_wrap=True,
         )
         self.append_ansi(ansi)
 
@@ -1461,6 +1548,38 @@ class ChatTUISession:
     def _dashboard_height(self):
         plain = _strip_ansi(fragment_list_to_text_safe(self._dashboard_text()))
         return max(1, len(plain.splitlines()) or 1)
+
+    def _todo_visible(self):
+        with self.lock:
+            return bool(self.todo_items)
+
+    def _todo_height(self):
+        plain = _strip_ansi(fragment_list_to_text_safe(self._todo_text()))
+        return max(1, len(plain.splitlines()) or 1)
+
+    def _todo_max_lines(self):
+        return max(1, min(8, self._rows() - self._dashboard_height() - self._input_height() - 6))
+
+    def _todo_text(self):
+        width = self._columns()
+        max_lines = self._todo_max_lines()
+        with self.lock:
+            todos = list(self.todo_items)
+            key = (
+                width,
+                max_lines,
+                tuple((todo.get("status"), todo.get("content")) for todo in todos),
+            )
+            if key == self.todo_cache_key:
+                return PromptANSI(self.todo_cache_text)
+        if not todos:
+            return PromptANSI("")
+
+        text = _render_todo_panel_ansi(todos, width, max_lines)
+        with self.lock:
+            self.todo_cache_key = key
+            self.todo_cache_text = text
+        return PromptANSI(text)
 
     def _input_height(self):
         width = max(1, self._columns())
@@ -1559,6 +1678,15 @@ def start_tui(model_name=None, workspace_dir=None):
     return _tui_session
 
 
+def set_todos_panel(todos):
+    if _tui_session is not None:
+        _tui_session.set_todos(todos)
+
+
+def clear_todos_panel():
+    set_todos_panel([])
+
+
 def run_tui(worker):
     global _tui_session
     if _tui_session is None:
@@ -1609,6 +1737,26 @@ def _bottom_terminal_size():
 
 def _input_text_width(text):
     return sum(_input_char_width(character) for character in text)
+
+
+def _truncate_cells(text, max_width):
+    max_width = max(1, int(max_width or 1))
+    text = str(text or "").replace("\r", " ").replace("\n", " ")
+    if _input_text_width(text) <= max_width:
+        return text
+    if max_width <= 3:
+        return "." * max_width
+
+    kept = []
+    current_width = 0
+    target_width = max_width - 3
+    for character in text:
+        width = _input_char_width(character)
+        if current_width + width > target_width:
+            break
+        kept.append(character)
+        current_width += width
+    return "".join(kept).rstrip() + "..."
 
 
 def _input_rich_render(text, style, width):

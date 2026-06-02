@@ -6,6 +6,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from planning import TodoStore
 from skills import SkillRegistry
 from ui import get_agent_diff_confirmation, get_user_input
 from search import (
@@ -36,6 +37,44 @@ SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", ".py
 
 
 TOOL_DEFINITIONS = [
+    {
+        "name": "update_todos",
+        "description": (
+            "Replace the current task plan with a full todo list. "
+            "Use this for multi-step agent work. At most one item may be in_progress."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": (
+                        "The complete current todo list. Use an empty array to clear todos."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Short task description.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Current task state.",
+                            },
+                            "id": {
+                                "type": "string",
+                                "description": "Optional stable id for the task.",
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                },
+            },
+            "required": ["todos"],
+        },
+    },
     {
         "name": "read_file",
         "description": "Read a UTF-8 text file from the configured workspace.",
@@ -406,6 +445,7 @@ class AgentTools:
         web_search_max_results=DEFAULT_WEB_SEARCH_MAX_RESULTS,
         web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
         web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
+        todo_update_callback=None,
         skills_enabled=True,
         skills_app_enabled=True,
         skills_workspace_enabled=False,
@@ -414,6 +454,7 @@ class AgentTools:
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
+        self.todo_store = TodoStore(on_change=todo_update_callback)
         self.skill_registry = SkillRegistry(
             enabled=skills_enabled,
             app_enabled=skills_app_enabled,
@@ -448,6 +489,9 @@ class AgentTools:
 
     def set_visible_output_callback(self, callback):
         self.visible_output_callback = callback
+
+    def set_todo_update_callback(self, callback):
+        self.todo_store.set_on_change(callback)
 
     def set_skills_enabled(self, enabled):
         self.skill_registry.configure(enabled=enabled)
@@ -541,6 +585,7 @@ class AgentTools:
         return self._web_search(payload)
 
     def begin_agent_session(self):
+        self.todo_store.clear()
         self.session_changed_files = []
         self._session_changed_file_set = set()
         self.session_mutating_commands = []
@@ -556,6 +601,24 @@ class AgentTools:
 
     def session_change_count(self):
         return len(self.session_changed_files) + len(self.session_mutating_commands)
+
+    def todo_revision(self):
+        return self.todo_store.revision
+
+    def todo_status(self):
+        return self.todo_store.status()
+
+    def todo_summary(self, include_completed=True):
+        return self.todo_store.summary(include_completed=include_completed)
+
+    def todo_incomplete_summary(self):
+        return self.todo_store.incomplete_summary()
+
+    def has_incomplete_todos(self):
+        return self.todo_store.has_incomplete()
+
+    def clear_todos(self):
+        self.todo_store.clear()
 
     def session_summary(self):
         parts = []
@@ -616,6 +679,7 @@ class AgentTools:
                 raise AgentToolError("Tool input must be an object.")
 
             handlers = {
+                "update_todos": self._update_todos,
                 "read_file": self._read_file,
                 "list_dir": self._list_dir,
                 "write_file": self._write_file,
@@ -637,6 +701,11 @@ class AgentTools:
             return handler(tool_input)
         except Exception as error:
             return _error_result(str(error))
+
+    def _update_todos(self, tool_input):
+        todos = tool_input.get("todos")
+        self.todo_store.update(todos)
+        return self.todo_store.tool_result()
 
     def _read_file(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))

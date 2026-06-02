@@ -31,6 +31,7 @@ COMMANDS = {
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
     "/comp": "Compact the current conversation context immediately.",
+    "/plan": "Inspect or clear current agent todos (Example: /plan clear).",
     "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
     "/search": "Toggle, inspect or configure web search (Example: /search on).",
     "/skills": "Toggle, inspect or configure agent skills (Example: /skills workspace on).",
@@ -258,6 +259,43 @@ def handle_comp(chat, args):
     else:
         print_info(reason)
     return True
+
+
+def handle_plan(chat, args):
+    action = str(args or "").strip().lower()
+    if action in {"clear", "reset"}:
+        chat.clear_todos()
+        print_success("Todos cleared.")
+        return True
+    if action:
+        print_error("Usage: /plan | /plan clear")
+        return True
+
+    status = chat.get_todo_status()
+    items = status.get("items") or []
+    if not items:
+        print_info("No todos.")
+        return True
+
+    summary = _format_todos_for_display(items)
+    if status.get("all_completed"):
+        print_info("No active todos. Last completed plan:\n" + summary)
+    else:
+        print_info("Current todos:\n" + summary)
+    return True
+
+
+def _format_todos_for_display(items):
+    lines = []
+    for item in items:
+        status = item.get("status") or "pending"
+        marker = "[ ]"
+        if status == "in_progress":
+            marker = "[-]"
+        elif status == "completed":
+            marker = "[✓]"
+        lines.append(f"{marker} {item.get('content') or ''}")
+    return "\n".join(lines)
 
 
 def handle_search(chat, args):
@@ -759,6 +797,7 @@ COMMAND_HANDLERS = {
     "/mode": handle_mode,
     "/think": handle_think,
     "/comp": handle_comp,
+    "/plan": handle_plan,
     "/memory": handle_memory,
     "/search": handle_search,
     "/skills": handle_skills,

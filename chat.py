@@ -18,6 +18,7 @@ from ui import (
     print_stream_response_continue,
     print_stream_response_start,
     print_warn,
+    set_todos_panel,
 )
 from config import (
     API_TYPE_ANTHROPIC,
@@ -92,6 +93,11 @@ AGENT_SYSTEM_PROMPT = f"""{AGENT_PROJECT_PROMPT}
 
 Rules:
 - Work only inside the configured workspace and use tools for local file facts.
+- For multi-step tasks, create and maintain a task plan with update_todos before acting.
+- Call update_todos with the full current todo list whenever task status changes.
+- Keep at most one todo in_progress. Mark the active step in_progress before working on it.
+- Mark completed steps completed, and do not give the final answer while any todo is pending or in_progress.
+- Skip update_todos for simple one-step answers or direct questions that do not need a plan.
 - Explore before editing: list directories, search, and read relevant line ranges first.
 - Prefer small, targeted changes. Do not rewrite unrelated code.
 - Use read_file with line ranges and line numbers when a file is long.
@@ -237,6 +243,7 @@ class LLMChat:
             web_search_max_results=web_search_max_results,
             web_search_depth=web_search_depth,
             web_search_topic=web_search_topic,
+            todo_update_callback=set_todos_panel,
             skills_enabled=skills_enabled,
             skills_app_enabled=skills_source_app,
             skills_workspace_enabled=skills_source_workspace,
@@ -495,6 +502,12 @@ class LLMChat:
             "summary_model": self.agent_summary_model,
             "skills": self.agent_tools.skills_status(),
         }
+
+    def get_todo_status(self):
+        return self.agent_tools.todo_status()
+
+    def clear_todos(self):
+        self.agent_tools.clear_todos()
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
         original_history = self._history_snapshot()
@@ -2793,6 +2806,21 @@ class LLMChat:
         )
 
     def _append_agent_final_check_if_needed(self):
+        if self.agent_tools.has_incomplete_todos():
+            self.conversation_history.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Automatic task plan check for this local agent run:\n\n"
+                        f"{self.agent_tools.todo_incomplete_summary()}\n\n"
+                        "There are still pending or in-progress todos. Continue using tools "
+                        "to finish the remaining work. Update the todo list as each item changes. "
+                        "Only provide the final response after all todos are completed."
+                    ),
+                }
+            )
+            return True
+
         if self.agent_final_check_done or not self.agent_tools.session_has_changes():
             return False
 
@@ -2818,11 +2846,15 @@ class LLMChat:
     def _execute_agent_tool(self, name, tool_input):
         self.agent_tool_calls += 1
         change_count_before = self.agent_tools.session_change_count()
+        todo_revision_before = self.agent_tools.todo_revision()
         tool_result = self.agent_tools.execute(name, tool_input)
         if self.agent_tools.consume_output_separator():
             self.agent_output_needs_separator = True
             self.agent_summary_thinking_active = False
-        if self.agent_tools.session_change_count() > change_count_before:
+        if (
+            self.agent_tools.session_change_count() > change_count_before
+            or self.agent_tools.todo_revision() != todo_revision_before
+        ):
             self.agent_final_check_done = False
         context_result = _compact_tool_result_for_context(tool_result)
         return context_result
@@ -3884,12 +3916,14 @@ class LLMChat:
         self.conversation_history = []
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
+        self.clear_todos()
         self._clear_context_usage()
 
     def set_history(self, history):
         self.conversation_history = list(history or [])
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
+        self.clear_todos()
         self._clear_context_usage()
 
     def get_history(self):
