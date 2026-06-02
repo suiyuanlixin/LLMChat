@@ -220,10 +220,10 @@ class _DiffBackgroundBlock:
         self.content = str(content or "")
 
     def __rich_console__(self, rich_console, options):
-        yield _build_diff_background_table(self.content)
+        yield _build_diff_background_table(self.content, options.max_width)
 
 
-def _build_diff_background_table(content):
+def _build_diff_background_table(content, width=None):
     table = Table.grid(expand=True, padding=(0, 0))
     table.add_column(ratio=1)
 
@@ -260,7 +260,7 @@ def _build_diff_background_table(content):
             style = f"bold {TEXT_COLOR[1]} on {ERROR_COLOR[0]}"
         else:
             style = f"bold {TEXT_COLOR[1]}"
-        table.add_row(Text(rendered_line), style=style)
+        table.add_row(_diff_row_text(rendered_line, style, width), style=style)
 
     return table
 
@@ -289,6 +289,17 @@ def _diff_line_number_width(lines):
 def _diff_numbered_line(line, line_number, width):
     number_text = f"{line_number:>{width}}" if line_number is not None else " " * width
     return f"{number_text} | {line}"
+
+
+def _diff_row_text(line, style, width=None):
+    line = str(line or "")
+    text = Text(line, style=style)
+    if width is None:
+        return text
+    pad_width = max(0, int(width or 0) - _input_text_width(line))
+    if pad_width:
+        text.append(" " * pad_width, style=style)
+    return text
 
 
 def _blend_channels(start, end, progress):
@@ -894,7 +905,7 @@ def _render_console_print_to_ansi(width, *objects, **kwargs):
 def _render_diff_background_block_ansi(width, content, print_kwargs=None):
     return _render_console_print_to_ansi(
         width,
-        _build_diff_background_table(content),
+        _build_diff_background_table(content, width),
         **dict(print_kwargs or {}),
     )
 
@@ -1053,6 +1064,9 @@ class ChatTUISession:
         self.message_blocks_width = None
         self.message_scroll_offset = 0
         self.message_render_line_lengths = [0]
+        self.message_content_line_lengths = [0]
+        self.message_render_lines_dirty = False
+        self.message_plain_newline_count = 0
         self.input_enabled = False
         self.pending_prompt_text = ""
         self.pending_prompt_rendered = False
@@ -1172,6 +1186,12 @@ class ChatTUISession:
 
         try:
             self.app.run(pre_run=start_worker)
+        except KeyboardInterrupt:
+            self._wake_input(KeyboardInterrupt())
+            try:
+                self.app.exit()
+            except Exception:
+                pass
         finally:
             self.input_enabled = False
 
@@ -1205,8 +1225,11 @@ class ChatTUISession:
             self.message_blocks_have_dynamic = True
             self.message_blocks_width = width
             self.messages_ansi += ansi
-            self.messages_plain += _strip_ansi(ansi)
+            plain = _strip_ansi(ansi)
+            self.messages_plain += plain
+            self.message_plain_newline_count += plain.count("\n")
             self.message_fragments.extend(to_formatted_text(PromptANSI(ansi)))
+            self._mark_message_render_lines_dirty_locked()
             self._trim_messages()
             self._clamp_message_scroll_offset_locked()
         self.invalidate()
@@ -1218,8 +1241,11 @@ class ChatTUISession:
         with self.lock:
             self.message_blocks.append(("ansi", text))
             self.messages_ansi += text
-            self.messages_plain += _strip_ansi(text)
+            plain = _strip_ansi(text)
+            self.messages_plain += plain
+            self.message_plain_newline_count += plain.count("\n")
             self.message_fragments.extend(to_formatted_text(PromptANSI(text)))
+            self._mark_message_render_lines_dirty_locked()
             self._trim_messages()
             self._clamp_message_scroll_offset_locked()
         self.invalidate()
@@ -1233,7 +1259,9 @@ class ChatTUISession:
             self.message_blocks.append(("ansi", ansi))
             self.messages_ansi += ansi
             self.messages_plain += text
+            self.message_plain_newline_count += text.count("\n")
             self.message_fragments.append((style, text))
+            self._mark_message_render_lines_dirty_locked()
             self._trim_messages()
             self._clamp_message_scroll_offset_locked()
         self.invalidate()
@@ -1477,19 +1505,17 @@ class ChatTUISession:
     def _message_text(self):
         width = self._columns()
         with self.lock:
-            if (
-                self.message_blocks_have_dynamic
-                and self.message_blocks_width != width
-            ):
-                self._rebuild_message_cache(width)
+            self._ensure_message_render_cache_locked(width)
             fragments = list(self.message_fragments) or [("", "")]
-            self._refresh_message_render_lines_locked(fragments)
+            self.message_content_line_lengths = (
+                list(self.message_render_line_lengths) or [0]
+            )
         return fragments or [("", "")]
 
     def _message_cursor_position(self):
         with self.lock:
             scroll_offset = self.message_scroll_offset
-            line_lengths = list(self.message_render_line_lengths) or [0]
+            line_lengths = list(self.message_content_line_lengths) or [0]
         max_offset = max(0, len(line_lengths) - 1)
         line_index = max(0, len(line_lengths) - 1 - min(scroll_offset, max_offset))
         return Point(x=line_lengths[line_index], y=line_index)
@@ -1517,9 +1543,27 @@ class ChatTUISession:
         return max(1, self._rows() - self._dashboard_height() - self._input_height() - 2)
 
     def _message_max_scroll_offset_locked(self):
-        if not self.messages_plain:
-            return 0
-        return max(0, len(self.messages_plain.split("\n")) - 1)
+        return max(0, self.message_plain_newline_count)
+
+    def _mark_message_render_lines_dirty_locked(self):
+        self.message_render_lines_dirty = True
+
+    def _refresh_message_render_lines_if_needed_locked(self, fragments):
+        if not self.message_render_lines_dirty:
+            return
+        self._refresh_message_render_lines_locked(fragments)
+        self.message_render_lines_dirty = False
+
+    def _ensure_message_render_cache_locked(self, width=None):
+        width = max(1, int(width or self._columns()))
+        if (
+            self.message_blocks_have_dynamic
+            and self.message_blocks_width != width
+        ):
+            self._rebuild_message_cache(width)
+        self._refresh_message_render_lines_if_needed_locked(
+            self.message_fragments or [("", "")]
+        )
 
     def _refresh_message_render_lines_locked(self, fragments):
         try:
@@ -1638,7 +1682,9 @@ class ChatTUISession:
             self.messages_ansi = self._render_message_blocks_locked(width)
             self.message_blocks_width = width
         self.messages_plain = _strip_ansi(self.messages_ansi)
+        self.message_plain_newline_count = self.messages_plain.count("\n")
         self.message_fragments = list(to_formatted_text(PromptANSI(self.messages_ansi)))
+        self._mark_message_render_lines_dirty_locked()
         self._clamp_message_scroll_offset_locked()
 
     def _render_message_blocks_locked(self, width):
@@ -1693,6 +1739,8 @@ def run_tui(worker):
         start_tui()
     try:
         _tui_session.run(worker)
+    except KeyboardInterrupt:
+        pass
     finally:
         _tui_session = None
 
