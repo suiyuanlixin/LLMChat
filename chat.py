@@ -95,7 +95,12 @@ Rules:
 - Work only inside the configured workspace and use tools for local file facts.
 - For multi-step tasks, create and maintain a task plan with update_todos before acting.
 - Call update_todos with the full current todo list whenever task status changes.
+- Give each todo a stable id when dependencies matter. Use depends_on to block later work until prerequisites are completed.
+- Use priority p0/p1/p2/p3 to reflect urgency. Prefer p0/p1 tasks when budget is tight.
 - Keep at most one todo in_progress. Mark the active step in_progress before working on it.
+- Use completion_criteria for tasks that need observable proof, and set verified=true with a verification_note only after tool output proves the criteria.
+- Use blocked with a clear reason when progress requires user input or an external change.
+- Use failed with a clear reason when verification fails or an attempted approach is invalid; do not mark it completed just to finish.
 - Mark completed steps completed, and do not give the final answer while any todo is pending or in_progress.
 - Skip update_todos for simple one-step answers or direct questions that do not need a plan.
 - Explore before editing: list directories, search, and read relevant line ranges first.
@@ -2812,27 +2817,50 @@ class LLMChat:
                     "role": "user",
                     "content": (
                         "Automatic task plan check for this local agent run:\n\n"
-                        f"{self.agent_tools.todo_incomplete_summary()}\n\n"
+                        f"{self.agent_tools.todo_actionable_summary()}\n\n"
                         "There are still pending or in-progress todos. Continue using tools "
-                        "to finish the remaining work. Update the todo list as each item changes. "
-                        "Only provide the final response after all todos are completed."
+                        "to finish the remaining work. Respect depends_on before starting later "
+                        "todos, and update the todo list as each item changes. Only provide the "
+                        "final response after all pending/in-progress todos are completed, blocked, "
+                        "or failed with a clear reason."
                     ),
                 }
             )
             return True
 
-        if self.agent_final_check_done or not self.agent_tools.session_has_changes():
+        needs_verification = (
+            self.agent_tools.session_has_changes()
+            or self.agent_tools.has_unverified_completed_todos()
+        )
+        if self.agent_final_check_done or not needs_verification:
             return False
 
         self.agent_final_check_done = True
         check_result = self.agent_tools.final_check()
+        verification_passed = self.agent_tools.final_check_passed(check_result)
+        self.agent_tools.apply_todo_final_verification(
+            verification_passed,
+            check_result,
+        )
 
+        if verification_passed:
+            verification_instruction = (
+                "Automatic final verification passed. Completed todos with completion criteria "
+                "are now tied to this verification result. "
+            )
+        else:
+            verification_instruction = (
+                "Automatic final verification failed, and the Todo List now includes a failed "
+                "automatic verification item. Continue using tools to fix the failure and update "
+                "todos; if you cannot proceed, mark the relevant todo blocked with a clear reason. "
+            )
         self.conversation_history.append(
             {
                 "role": "user",
                 "content": (
                     "Automatic final verification for this local agent run:\n\n"
                     f"{check_result}\n\n"
+                    f"{verification_instruction}"
                     "If the verification output shows a problem, continue using tools to fix it. "
                     "Do not attribute pre-existing workspace changes to this run unless they are listed "
                     "as agent-edited files or agent mutating commands. "

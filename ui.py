@@ -955,9 +955,26 @@ def _render_todo_panel_ansi(todos, width, max_lines):
         elif status == "completed":
             marker = "[✓]"
             marker_colors = SUCCESS_COLOR
+        elif status == "blocked":
+            marker = "[!]"
+            marker_colors = WARN_COLOR
+        elif status == "failed":
+            marker = "[x]"
+            marker_colors = ERROR_COLOR
+
+        priority = str(todo.get("priority") or "").strip().upper()
+        prefix = f"{priority} " if priority and priority != "P2" else ""
+        suffix_parts = []
+        depends_on = todo.get("depends_on") or []
+        if depends_on:
+            suffix_parts.append("after " + ", ".join(str(item) for item in depends_on))
+        reason = str(todo.get("reason") or "").strip()
+        if reason and status in {"blocked", "failed"}:
+            suffix_parts.append(reason)
+        suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
 
         content = _truncate_cells(
-            str(todo.get("content") or ""),
+            prefix + str(todo.get("content") or "") + suffix,
             max(1, content_width - _input_text_width(marker) - 1),
         )
         lines.append(
@@ -1284,6 +1301,9 @@ class ChatTUISession:
                 {
                     "content": content,
                     "status": str(todo.get("status") or "pending").strip().lower(),
+                    "priority": str(todo.get("priority") or "").strip().lower(),
+                    "depends_on": _todo_string_list(todo.get("depends_on")),
+                    "reason": str(todo.get("reason") or "").strip(),
                 }
             )
         with self.lock:
@@ -1612,7 +1632,16 @@ class ChatTUISession:
             key = (
                 width,
                 max_lines,
-                tuple((todo.get("status"), todo.get("content")) for todo in todos),
+                tuple(
+                    (
+                        todo.get("status"),
+                        todo.get("priority"),
+                        todo.get("content"),
+                        tuple(todo.get("depends_on") or []),
+                        todo.get("reason"),
+                    )
+                    for todo in todos
+                ),
             )
             if key == self.todo_cache_key:
                 return PromptANSI(self.todo_cache_text)
@@ -1805,6 +1834,18 @@ def _truncate_cells(text, max_width):
         kept.append(character)
         current_width += width
     return "".join(kept).rstrip() + "..."
+
+
+def _todo_string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        values = [str(part).strip() for part in value]
+    else:
+        values = [str(value).strip()]
+    return [value for value in values if value]
 
 
 def _input_rich_render(text, style, width):

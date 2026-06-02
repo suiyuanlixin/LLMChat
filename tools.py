@@ -41,7 +41,8 @@ TOOL_DEFINITIONS = [
         "name": "update_todos",
         "description": (
             "Replace the current task plan with a full todo list. "
-            "Use this for multi-step agent work. At most one item may be in_progress."
+            "Use this for multi-step agent work. Supports dependencies, priorities, "
+            "completion criteria, and blocked/failed states. At most one item may be in_progress."
         ),
         "input_schema": {
             "type": "object",
@@ -60,12 +61,66 @@ TOOL_DEFINITIONS = [
                             },
                             "status": {
                                 "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                                "description": "Current task state.",
+                                "enum": [
+                                    "pending",
+                                    "in_progress",
+                                    "completed",
+                                    "blocked",
+                                    "failed",
+                                ],
+                                "description": (
+                                    "Current task state. blocked/failed require reason."
+                                ),
                             },
                             "id": {
                                 "type": "string",
-                                "description": "Optional stable id for the task.",
+                                "description": (
+                                    "Stable id for dependencies, such as inspect, implement, verify."
+                                ),
+                            },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["p0", "p1", "p2", "p3", "high", "medium", "low"],
+                                "description": (
+                                    "Task priority. p0 is urgent, p1 high, p2 normal, p3 low."
+                                ),
+                            },
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Todo ids that must be completed before this task can be "
+                                    "in_progress or completed."
+                                ),
+                            },
+                            "completion_criteria": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Observable conditions required before this todo may be "
+                                    "considered done."
+                                ),
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": (
+                                    "Required when status is blocked or failed. Explain the blocker "
+                                    "or failure plainly."
+                                ),
+                            },
+                            "verified": {
+                                "type": "boolean",
+                                "description": (
+                                    "Whether the completion criteria were verified by tool output. "
+                                    "Use only with completed todos."
+                                ),
+                            },
+                            "verification_note": {
+                                "type": "string",
+                                "description": (
+                                    "Short evidence summary when verified is true, such as the "
+                                    "test or diff check that passed."
+                                ),
                             },
                         },
                         "required": ["content", "status"],
@@ -615,7 +670,19 @@ class AgentTools:
         return self.todo_store.incomplete_summary()
 
     def has_incomplete_todos(self):
-        return self.todo_store.has_incomplete()
+        return self.todo_store.has_actionable_incomplete()
+
+    def has_unverified_completed_todos(self):
+        return self.todo_store.has_unverified_completed_criteria()
+
+    def todo_actionable_summary(self):
+        return self.todo_store.actionable_summary()
+
+    def apply_todo_final_verification(self, passed, check_result):
+        return self.todo_store.apply_final_verification(
+            passed,
+            _final_verification_note(check_result, passed),
+        )
 
     def clear_todos(self):
         self.todo_store.clear()
@@ -667,6 +734,9 @@ class AgentTools:
             + self._run_git_command(["diff", "--stat"] + diff_path_args, "(no tracked diff)")
         )
         return "\n\n".join(sections)
+
+    def final_check_passed(self, check_result):
+        return _final_check_passed(check_result)
 
     def execute(self, name, tool_input):
         if not self.enabled:
@@ -1200,6 +1270,52 @@ def normalize_workspace_dir(workspace_dir):
     if not path.is_dir():
         return None
     return path
+
+
+def _final_check_passed(check_result):
+    text = str(check_result or "")
+    diff_check = _section_after(text, "git diff --check")
+    if diff_check:
+        exit_codes = [int(value) for value in re.findall(r"Exit code:\s*(-?\d+)", diff_check)]
+        if exit_codes and any(code != 0 for code in exit_codes):
+            return False
+    if re.search(r"(?m)^ERROR:", text):
+        return False
+    return True
+
+
+def _final_verification_note(check_result, passed):
+    text = str(check_result or "")
+    if passed:
+        return "Automatic final verification passed."
+
+    diff_check = _section_after(text, "git diff --check")
+    source = diff_check or text
+    lines = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "Exit code:" in stripped or stripped.startswith("ERROR:") or "[stderr]" in stripped:
+            lines.append(stripped)
+        elif lines and len(lines) < 4:
+            lines.append(stripped)
+        if len(lines) >= 4:
+            break
+    if not lines:
+        return "Automatic final verification failed."
+    return " ".join(lines)
+
+
+def _section_after(text, heading):
+    marker_index = str(text or "").find(heading)
+    if marker_index < 0:
+        return ""
+    section = text[marker_index:]
+    next_section = section.find("\n\n", len(heading))
+    if next_section >= 0:
+        section = section[:next_section]
+    return section
 
 
 def _unified_diff_text(old_content, new_content, display_path):

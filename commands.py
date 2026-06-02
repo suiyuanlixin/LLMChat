@@ -294,7 +294,29 @@ def _format_todos_for_display(items):
             marker = "[-]"
         elif status == "completed":
             marker = "[✓]"
-        lines.append(f"{marker} {item.get('content') or ''}")
+        elif status == "blocked":
+            marker = "[!]"
+        elif status == "failed":
+            marker = "[x]"
+
+        details = []
+        priority = str(item.get("priority") or "").upper()
+        if priority:
+            details.append(priority)
+        if item.get("id"):
+            details.append(f"id: {item.get('id')}")
+        if item.get("depends_on"):
+            details.append("after: " + ", ".join(item.get("depends_on") or []))
+        if item.get("completion_criteria"):
+            details.append(
+                "done when: " + "; ".join(item.get("completion_criteria") or [])
+            )
+        if item.get("verified"):
+            details.append("verified")
+        if item.get("reason"):
+            details.append("reason: " + str(item.get("reason")))
+        suffix = f" ({'; '.join(details)})" if details else ""
+        lines.append(f"{marker} {item.get('content') or ''}{suffix}")
     return "\n".join(lines)
 
 
