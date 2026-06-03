@@ -8,7 +8,11 @@ from pathlib import Path
 
 from planning import TodoStore
 from skills import SkillRegistry
-from ui import get_agent_diff_confirmation, get_agent_plan_confirmation, get_user_input
+from ui import (
+    get_agent_confirmation,
+    get_agent_diff_confirmation,
+    get_agent_plan_confirmation,
+)
 from search import (
     DEFAULT_WEB_SEARCH_DEPTH,
     DEFAULT_WEB_SEARCH_ENABLE,
@@ -1343,8 +1347,7 @@ class AgentTools:
         if self._auto_approves(risk_reason):
             return True
         self._before_visible_output()
-        answer = get_user_input(f"{title}\n{detail}\nContinue? (Y/N, Default: N): ")
-        return answer.strip().lower() in {"y", "yes"}
+        return get_agent_confirmation(title, detail)
 
     def _plan_action_gate(self, name, tool_input):
         if not self.todo_store.needs_action_approval():

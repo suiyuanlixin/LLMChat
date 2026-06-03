@@ -1091,6 +1091,8 @@ class ChatTUISession:
         self.input_enabled = False
         self.pending_prompt_text = ""
         self.pending_prompt_rendered = False
+        self.confirmation_active = False
+        self.confirmation_selected = False
         self.lock = threading.RLock()
         self.input_queue = queue.Queue()
         self.dashboard_cache_key = None
@@ -1109,7 +1111,9 @@ class ChatTUISession:
             scrollbar=False,
             wrap_lines=True,
             height=1,
-            read_only=Condition(lambda: not self.input_enabled),
+            read_only=Condition(
+                lambda: not self.input_enabled or self.confirmation_active
+            ),
             input_processors=[_TUIPlaceholderProcessor(self)],
             style="class:input",
         )
@@ -1385,6 +1389,31 @@ class ChatTUISession:
             prompt_rendered=True,
         )
 
+    def request_confirmation(self, prompt_renderable=None, default=False):
+        while True:
+            try:
+                self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        with self.lock:
+            self.pending_prompt_text = ""
+            self.pending_prompt_rendered = True
+            self.confirmation_active = True
+            self.confirmation_selected = bool(default)
+            self.input_enabled = True
+
+        self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
+        self._render_confirmation_line()
+        self._resize_input()
+        self.layout.focus(self.input_area)
+        self.invalidate()
+
+        result = self.input_queue.get()
+        if isinstance(result, BaseException):
+            raise result
+        return bool(result)
+
     def request_input(
         self,
         prompt_text="",
@@ -1403,6 +1432,7 @@ class ChatTUISession:
         with self.lock:
             self.pending_prompt_text = str(prompt_text or "")
             self.pending_prompt_rendered = bool(prompt_rendered)
+            self.confirmation_active = False
             self.input_enabled = True
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
@@ -1477,6 +1507,9 @@ class ChatTUISession:
 
         @bindings.add("enter")
         def _(event):
+            if self.confirmation_active:
+                self._submit_confirmation()
+                return
             if (
                 self.input_enabled
                 and os.name == "nt"
@@ -1505,6 +1538,30 @@ class ChatTUISession:
             if not self.input_area.text:
                 self._wake_input(EOFError())
 
+        confirm_filter = Condition(lambda: self.confirmation_active)
+
+        @bindings.add("left", eager=True, filter=confirm_filter)
+        @bindings.add("up", eager=True, filter=confirm_filter)
+        @bindings.add("s-tab", eager=True, filter=confirm_filter)
+        def _(event):
+            self._set_confirmation_selected(True)
+
+        @bindings.add("right", eager=True, filter=confirm_filter)
+        @bindings.add("down", eager=True, filter=confirm_filter)
+        @bindings.add("tab", eager=True, filter=confirm_filter)
+        def _(event):
+            self._set_confirmation_selected(False)
+
+        @bindings.add("y", eager=True, filter=confirm_filter)
+        def _(event):
+            self._set_confirmation_selected(True)
+            self._submit_confirmation()
+
+        @bindings.add("n", eager=True, filter=confirm_filter)
+        def _(event):
+            self._set_confirmation_selected(False)
+            self._submit_confirmation()
+
         @bindings.add("pageup", eager=True, is_global=True)
         def _(event):
             self.scroll_messages(self._message_page_lines())
@@ -1522,6 +1579,9 @@ class ChatTUISession:
     def _submit_input(self):
         if not self.input_enabled:
             return
+        if self.confirmation_active:
+            self._submit_confirmation()
+            return
 
         value = self.input_area.text
         with self.lock:
@@ -1530,6 +1590,7 @@ class ChatTUISession:
             self.input_enabled = False
             self.pending_prompt_text = ""
             self.pending_prompt_rendered = False
+            self.confirmation_active = False
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
         self._resize_input()
@@ -1537,10 +1598,69 @@ class ChatTUISession:
         self.input_queue.put(value)
         self.invalidate()
 
+    def _submit_confirmation(self):
+        if not self.input_enabled or not self.confirmation_active:
+            return
+
+        with self.lock:
+            selected = bool(self.confirmation_selected)
+            self.input_enabled = False
+            self.confirmation_active = False
+            self.pending_prompt_text = ""
+            self.pending_prompt_rendered = False
+
+        self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
+        self._resize_input()
+        self.input_queue.put(selected)
+        self.invalidate()
+
+    def _set_confirmation_selected(self, selected):
+        with self.lock:
+            if not self.confirmation_active:
+                return
+            self.confirmation_selected = bool(selected)
+        self._render_confirmation_line()
+        self.invalidate()
+
+    def _render_confirmation_line(self):
+        with self.lock:
+            selected = bool(self.confirmation_selected)
+
+        renderable = _confirmation_line_renderable(selected)
+        ansi = _render_console_print_to_ansi(
+            self._columns(),
+            renderable,
+            end="\n",
+            soft_wrap=True,
+        )
+        self._replace_confirmation_line(ansi)
+
+    def _replace_confirmation_line(self, ansi):
+        width = self._columns()
+        with self.lock:
+            if self.message_blocks and self.message_blocks[-1][0] == "confirmation":
+                self.message_blocks[-1] = ("confirmation", ansi)
+            else:
+                self.message_blocks.append(("confirmation", ansi))
+
+            self.message_blocks_have_dynamic = any(
+                block and block[0] == "diff" for block in self.message_blocks
+            )
+            self.message_blocks_width = width if self.message_blocks_have_dynamic else None
+            self.messages_ansi = self._render_message_blocks_locked(width)
+            self.messages_plain = _strip_ansi(self.messages_ansi)
+            self.message_plain_newline_count = self.messages_plain.count("\n")
+            self.message_fragments = list(to_formatted_text(PromptANSI(self.messages_ansi)))
+            self._mark_message_render_lines_dirty_locked()
+            self._trim_messages()
+            self._clamp_message_scroll_offset_locked()
+        self.invalidate()
+
     def _wake_input(self, exception):
         if self.input_enabled:
             self.input_queue.put(exception)
         self.input_enabled = False
+        self.confirmation_active = False
         self.invalidate()
 
     def _echo_submitted_input(self, value, prompt_text, prompt_rendered):
@@ -2350,6 +2470,149 @@ def get_user_input(prompt_text, multiline=False):
     return console.input(prompt).strip()
 
 
+def get_continue_confirmation():
+    if _tui_session is not None:
+        return _tui_session.request_confirmation(default=False)
+
+    console.print(_confirmation_line_prompt(), end="")
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return _read_terminal_confirmation(default=False)
+
+    answer = console.input(" [y/N]: ")
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def get_agent_confirmation(title, detail):
+    detail = str(detail or "").rstrip()
+    detail_line = f"{detail}\n" if detail else ""
+    console.print(
+        Text.assemble(
+            "\n",
+            gradient_text("[-]", *INFO_COLOR),
+            gradient_text(f" {title}\n", *TEXT_COLOR),
+            gradient_text(detail_line, *TEXT_COLOR),
+        ),
+        end="",
+    )
+    return get_continue_confirmation()
+
+
+def _confirmation_line_prompt():
+    return Text.assemble(
+        gradient_text("Continue? ", *TEXT_COLOR),
+        gradient_text("(use arrows, Enter): ", *THINK_COLOR),
+    )
+
+
+def _confirmation_line_renderable(selected):
+    selected = bool(selected)
+    yes_colors = SUCCESS_COLOR if selected else TEXT_COLOR
+    no_colors = TEXT_COLOR if selected else SUCCESS_COLOR
+    return Text.assemble(
+        _confirmation_line_prompt(),
+        " ",
+        gradient_text("[Yes]" if selected else "Yes", *yes_colors),
+        "  ",
+        gradient_text("No" if selected else "[No]", *no_colors),
+    )
+
+
+def _read_terminal_confirmation(default=False):
+    selected = bool(default)
+    selector = _confirmation_selector_text(selected)
+    sys.stdout.write(selector)
+    sys.stdout.flush()
+
+    while True:
+        key = _read_terminal_confirmation_key()
+        if key in {"left", "up", "s-tab", "yes"}:
+            selected = True
+        elif key in {"right", "down", "tab", "no"}:
+            selected = False
+        elif key == "enter":
+            break
+        elif key == "interrupt":
+            raise KeyboardInterrupt()
+        else:
+            continue
+
+        next_selector = _confirmation_selector_text(selected)
+        if next_selector != selector:
+            sys.stdout.write("\b" * len(selector) + next_selector)
+            sys.stdout.flush()
+            selector = next_selector
+        if key in {"yes", "no"}:
+            break
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return selected
+
+
+def _confirmation_selector_text(selected):
+    yes = "[Yes]" if selected else "Yes"
+    no = "No" if selected else "[No]"
+    return f" {yes}  {no}"
+
+
+def _read_terminal_confirmation_key():
+    if os.name == "nt":
+        ch = msvcrt.getwch()
+        if ch in {"\x03"}:
+            return "interrupt"
+        if ch in {"\r", "\n"}:
+            return "enter"
+        if ch in {"\t"}:
+            return "tab"
+        value = ch.lower()
+        if value == "y":
+            return "yes"
+        if value == "n":
+            return "no"
+        if ch in WINDOWS_SPECIAL_KEY_PREFIXES:
+            code = msvcrt.getwch()
+            return {
+                "K": "left",
+                "M": "right",
+                "H": "up",
+                "P": "down",
+            }.get(code, "")
+        return ""
+
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x03":
+            return "interrupt"
+        if ch in {"\r", "\n"}:
+            return "enter"
+        if ch == "\t":
+            return "tab"
+        value = ch.lower()
+        if value == "y":
+            return "yes"
+        if value == "n":
+            return "no"
+        if ch == "\x1b" and select.select([sys.stdin], [], [], 0.05)[0]:
+            seq = sys.stdin.read(2)
+            return {
+                "[D": "left",
+                "[C": "right",
+                "[A": "up",
+                "[B": "down",
+                "[Z": "s-tab",
+            }.get(seq, "")
+        return ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 def get_agent_plan_confirmation(todos, next_tool=""):
     snapshot = _tui_session.snapshot_messages() if _tui_session is not None else None
     size = shutil.get_terminal_size(fallback=(80, 24))
@@ -2395,15 +2658,11 @@ def get_agent_plan_confirmation(todos, next_tool=""):
                     max(1, len(normalized_todos)),
                 )
             )
-        answer = console.input(
-            Text.assemble(
-                gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
-            )
-        )
+        approved = get_continue_confirmation()
     finally:
         if _tui_session is not None and snapshot is not None:
             _tui_session.restore_messages(snapshot)
-    return answer.strip().lower() in {"y", "yes"}
+    return approved
 
 
 def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content):
@@ -2418,12 +2677,7 @@ def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content
     )
     console.print(background_block(f"Old:\n{old_content}", ERROR_COLOR[0]))
     console.print(background_block(f"New:\n{new_content}", SUCCESS_COLOR[0]))
-    answer = console.input(
-        Text.assemble(
-            gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
-        )
-    )
-    return answer.strip().lower() in {"y", "yes"}
+    return get_continue_confirmation()
 
 
 def get_agent_patch_confirmation(file_path, start_line, end_line, old_content, new_content):
@@ -2440,12 +2694,7 @@ def get_agent_patch_confirmation(file_path, start_line, end_line, old_content, n
     )
     console.print(background_block(f"Old lines:\n{old_content}", ERROR_COLOR[0]))
     console.print(background_block(f"New lines:\n{new_content}", SUCCESS_COLOR[0]))
-    answer = console.input(
-        Text.assemble(
-            gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
-        )
-    )
-    return answer.strip().lower() in {"y", "yes"}
+    return get_continue_confirmation()
 
 
 def get_agent_diff_confirmation(title, file_path, diff_content):
@@ -2458,9 +2707,4 @@ def get_agent_diff_confirmation(title, file_path, diff_content):
         end="",
     )
     console.print(diff_background_block(diff_content))
-    answer = console.input(
-        Text.assemble(
-            gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
-        )
-    )
-    return answer.strip().lower() in {"y", "yes"}
+    return get_continue_confirmation()
