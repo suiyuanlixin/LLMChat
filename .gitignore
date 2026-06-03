@@ -5,3 +5,4 @@ memory/
 config.json
 prompt.md
 skills/
+.llmchat/plans/

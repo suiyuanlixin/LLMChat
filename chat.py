@@ -95,12 +95,17 @@ Rules:
 - Work only inside the configured workspace and use tools for local file facts.
 - For multi-step tasks, create and maintain a task plan with update_todos before acting.
 - Call update_todos with the full current todo list whenever task status changes.
+- After a plan is approved, keep existing todo ids in later update_todos calls until they are completed, blocked, or failed; do not drop or replace approved todos just to revise the plan.
 - Give each todo a stable id when dependencies matter. Use depends_on to block later work until prerequisites are completed.
 - Use priority p0/p1/p2/p3 to reflect urgency. Prefer p0/p1 tasks when budget is tight.
+- Treat planning and acting as separate phases. A new plan requires approval before non-planning tools run; approved plans can be updated in place while work continues.
+- Before plan approval, leave planned work pending; do not mark a todo in_progress or completed until tools have actually run after approval.
 - Keep at most one todo in_progress. Mark the active step in_progress before working on it.
-- Use completion_criteria for tasks that need observable proof, and set verified=true with a verification_note only after tool output proves the criteria.
+- Use structured completion_criteria for tasks that need observable proof. Prefer objects like {{"type":"test","target":"pytest path","expected":"exit code 0"}}.
+- Set verified=true with a verification_note only after tool output proves the criteria.
 - Use blocked with a clear reason when progress requires user input or an external change.
 - Use failed with a clear reason when verification fails or an attempted approach is invalid; do not mark it completed just to finish.
+- Keep the plan high quality: avoid vague tasks, avoid too many P0 todos, include criteria for P0/P1 work, and keep dependencies explicit.
 - Mark completed steps completed, and do not give the final answer while any todo is pending or in_progress.
 - Skip update_todos for simple one-step answers or direct questions that do not need a plan.
 - Explore before editing: list directories, search, and read relevant line ranges first.
@@ -272,6 +277,7 @@ class LLMChat:
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
+        self.resume_existing_todos = False
         self.configure(
             api_type,
             base_url,
@@ -506,6 +512,7 @@ class LLMChat:
             "show_thinking": self.agent_show_thinking,
             "summary_model": self.agent_summary_model,
             "skills": self.agent_tools.skills_status(),
+            "plan": self.agent_tools.todo_status(),
         }
 
     def get_todo_status(self):
@@ -513,6 +520,36 @@ class LLMChat:
 
     def clear_todos(self):
         self.agent_tools.clear_todos()
+        self.resume_existing_todos = False
+
+    def approve_todos(self, note=""):
+        changed = self.agent_tools.approve_todos(note)
+        if changed:
+            self.resume_existing_todos = True
+        return changed
+
+    def reject_todos(self, reason=""):
+        return self.agent_tools.reject_todos(reason)
+
+    def retry_todo(self, todo_id, reason=""):
+        changed = self.agent_tools.retry_todo(todo_id, reason)
+        if changed:
+            self.agent_final_check_done = False
+            self.resume_existing_todos = True
+        return changed
+
+    def unblock_todo(self, todo_id, reason=""):
+        changed = self.agent_tools.unblock_todo(todo_id, reason)
+        if changed:
+            self.agent_final_check_done = False
+            self.resume_existing_todos = True
+        return changed
+
+    def get_todo_quality_report(self):
+        return self.agent_tools.todo_quality_report()
+
+    def get_todo_history(self, limit=20):
+        return self.agent_tools.todo_history(limit)
 
     def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
         original_history = self._history_snapshot()
@@ -596,7 +633,12 @@ class LLMChat:
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
-        self.agent_tools.begin_agent_session()
+        self.agent_tools.begin_agent_session(clear_todos=not self.resume_existing_todos)
+        self.resume_existing_todos = False
+        self.agent_tools.set_budget_context(
+            self.max_agent_tool_calls,
+            self.agent_tool_calls,
+        )
         try:
             if self.api_type == API_TYPE_ANTHROPIC:
                 return self._finalize_agent_response(self._anthropic_agent_response())
@@ -1877,6 +1919,12 @@ class LLMChat:
         return self.agent_tool_calls + requested_tool_calls > self.max_agent_tool_calls
 
     def _agent_tool_budget_message(self):
+        summary = self.agent_tools.todo_budget_summary()
+        if summary:
+            return (
+                f"Agent stopped after {self.max_agent_tool_calls} tool calls.\n"
+                f"{summary}"
+            )
         return f"Agent stopped after {self.max_agent_tool_calls} tool calls."
 
     def _print_agent_round(self, round_index):
@@ -2812,6 +2860,13 @@ class LLMChat:
 
     def _append_agent_final_check_if_needed(self):
         if self.agent_tools.has_incomplete_todos():
+            budget_summary = self.agent_tools.todo_budget_summary()
+            quality_report = self.agent_tools.todo_quality_report()
+            extra_guidance = ""
+            if budget_summary:
+                extra_guidance += f"\n\n{budget_summary}"
+            if quality_report:
+                extra_guidance += f"\n\n{quality_report}"
             self.conversation_history.append(
                 {
                     "role": "user",
@@ -2823,6 +2878,7 @@ class LLMChat:
                         "todos, and update the todo list as each item changes. Only provide the "
                         "final response after all pending/in-progress todos are completed, blocked, "
                         "or failed with a clear reason."
+                        f"{extra_guidance}"
                     ),
                 }
             )
@@ -2873,6 +2929,10 @@ class LLMChat:
 
     def _execute_agent_tool(self, name, tool_input):
         self.agent_tool_calls += 1
+        self.agent_tools.set_budget_context(
+            self.max_agent_tool_calls,
+            self.agent_tool_calls,
+        )
         change_count_before = self.agent_tools.session_change_count()
         todo_revision_before = self.agent_tools.todo_revision()
         tool_result = self.agent_tools.execute(name, tool_input)

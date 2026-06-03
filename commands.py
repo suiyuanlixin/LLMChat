@@ -1,3 +1,5 @@
+import json
+
 from ui import print_error, print_success, print_warn, print_info
 from config import (
     parse_agent_approval_mode,
@@ -31,7 +33,7 @@ COMMANDS = {
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
     "/comp": "Compact the current conversation context immediately.",
-    "/plan": "Inspect or clear current agent todos (Example: /plan clear).",
+    "/plan": "Inspect, approve, recover, or clear current agent todos (Example: /plan check).",
     "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
     "/search": "Toggle, inspect or configure web search (Example: /search on).",
     "/skills": "Toggle, inspect or configure agent skills (Example: /skills workspace on).",
@@ -262,13 +264,75 @@ def handle_comp(chat, args):
 
 
 def handle_plan(chat, args):
-    action = str(args or "").strip().lower()
+    raw_args = str(args or "").strip()
+    parts = raw_args.split(maxsplit=2)
+    action = parts[0].lower() if parts else ""
     if action in {"clear", "reset"}:
         chat.clear_todos()
         print_success("Todos cleared.")
         return True
+
+    if action == "approve":
+        tail = raw_args.split(maxsplit=1)
+        note = tail[1] if len(tail) > 1 else ""
+        if chat.approve_todos(note):
+            print_success("Plan approved.")
+        else:
+            print_info("No plan approval change needed.")
+        return True
+
+    if action in {"reject", "deny"}:
+        tail = raw_args.split(maxsplit=1)
+        reason = tail[1] if len(tail) > 1 else ""
+        if chat.reject_todos(reason):
+            print_warn("Plan rejected.")
+        else:
+            print_info("No current plan to reject.")
+        return True
+
+    if action == "check":
+        print_info(chat.get_todo_quality_report())
+        return True
+
+    if action in {"history", "log", "events"}:
+        limit = 20
+        if len(parts) >= 2:
+            try:
+                limit = max(1, int(parts[1]))
+            except ValueError:
+                print_error("Usage: /plan history [limit]")
+                return True
+        events = chat.get_todo_history(limit)
+        if not events:
+            print_info("No plan events.")
+            return True
+        print_info("Plan events:\n" + _format_plan_events(events))
+        return True
+
+    if action in {"retry", "unblock"}:
+        if len(parts) < 2:
+            print_error(f"Usage: /plan {action} <todo-id> [reason]")
+            return True
+        todo_id = parts[1]
+        reason = parts[2] if len(parts) >= 3 else ""
+        try:
+            if action == "retry":
+                chat.retry_todo(todo_id, reason)
+                print_success(f"Todo retried: {todo_id}")
+            else:
+                chat.unblock_todo(todo_id, reason)
+                print_success(f"Todo unblocked: {todo_id}")
+        except ValueError as error:
+            print_error(str(error))
+        return True
+
     if action:
-        print_error("Usage: /plan | /plan clear")
+        print_error(
+            "Usage: /plan | /plan check | /plan history [limit] | "
+            "/plan approve [note] | /plan reject [reason] | "
+            "/plan retry <todo-id> [reason] | /plan unblock <todo-id> [reason] | "
+            "/plan clear"
+        )
         return True
 
     status = chat.get_todo_status()
@@ -278,6 +342,9 @@ def handle_plan(chat, args):
         return True
 
     summary = _format_todos_for_display(items)
+    meta = _format_plan_meta(status)
+    if meta:
+        summary = summary + "\n\n" + meta
     if status.get("all_completed"):
         print_info("No active todos. Last completed plan:\n" + summary)
     else:
@@ -293,7 +360,7 @@ def _format_todos_for_display(items):
         if status == "in_progress":
             marker = "[-]"
         elif status == "completed":
-            marker = "[✓]"
+            marker = "[" + chr(0x2713) + "]"
         elif status == "blocked":
             marker = "[!]"
         elif status == "failed":
@@ -309,7 +376,8 @@ def _format_todos_for_display(items):
             details.append("after: " + ", ".join(item.get("depends_on") or []))
         if item.get("completion_criteria"):
             details.append(
-                "done when: " + "; ".join(item.get("completion_criteria") or [])
+                "done when: "
+                + _format_completion_criteria(item.get("completion_criteria") or [])
             )
         if item.get("verified"):
             details.append("verified")
@@ -318,6 +386,78 @@ def _format_todos_for_display(items):
         suffix = f" ({'; '.join(details)})" if details else ""
         lines.append(f"{marker} {item.get('content') or ''}{suffix}")
     return "\n".join(lines)
+
+
+def _format_completion_criteria(criteria):
+    parts = []
+    for criterion in criteria:
+        if isinstance(criterion, str):
+            parts.append(criterion)
+            continue
+        if not isinstance(criterion, dict):
+            parts.append(str(criterion))
+            continue
+        criterion_type = criterion.get("type") or "manual"
+        target = criterion.get("target") or ""
+        expected = criterion.get("expected") or ""
+        if target and expected:
+            parts.append(f"{criterion_type}:{target} => {expected}")
+        else:
+            parts.append(expected or f"{criterion_type}:{target}")
+    return "; ".join(parts)
+
+
+def _format_plan_meta(status):
+    lines = []
+    approval_state = status.get("approval_state")
+    if approval_state:
+        approval = approval_state.replace("_", " ")
+        note = status.get("approval_note") or ""
+        lines.append(f"Approval: {approval}{(': ' + note) if note else ''}")
+
+    budget = status.get("budget") or {}
+    if budget:
+        lines.append(
+            "Budget: "
+            f"{budget.get('remaining_tool_calls')}/{budget.get('max_tool_calls')} "
+            "tool calls remaining"
+        )
+        next_items = budget.get("next") or []
+        if next_items:
+            lines.append(
+                "Next: "
+                + ", ".join(
+                    f"{item.get('priority', '').upper()} {item.get('id')}"
+                    for item in next_items
+                )
+            )
+
+    warnings = status.get("quality_warnings") or []
+    if warnings:
+        lines.append("Quality warnings:")
+        lines.extend(f"- {warning}" for warning in warnings)
+    if status.get("plan_path"):
+        lines.append(f"Plan file: {status.get('plan_path')}")
+    if status.get("events_path"):
+        lines.append(f"Event log: {status.get('events_path')}")
+    return "\n".join(lines)
+
+
+def _format_plan_events(events):
+    lines = []
+    for event in events:
+        timestamp = event.get("ts") or ""
+        event_type = event.get("type") or "event"
+        payload = event.get("payload") or {}
+        lines.append(f"- {timestamp} {event_type}: {_short_json(payload)}")
+    return "\n".join(lines)
+
+
+def _short_json(value, limit=220):
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
 
 
 def handle_search(chat, args):

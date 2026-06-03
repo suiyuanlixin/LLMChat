@@ -938,7 +938,7 @@ def _render_dashboard_ansi(model_name, workspace_dir, width):
     return output.getvalue().rstrip("\n")
 
 
-def _render_todo_panel_ansi(todos, width, max_lines):
+def _todo_panel_renderable(todos, width, max_lines):
     width = max(10, int(width or 80))
     max_lines = max(1, int(max_lines or 1))
     content_width = max(1, width - 2)
@@ -992,15 +992,19 @@ def _render_todo_panel_ansi(todos, width, max_lines):
             body_parts.append("\n")
 
     title = Text.assemble(gradient_text("Todo List", *INFO_TEXT_COLOR))
+    return Panel(
+        Text.assemble(*body_parts),
+        padding=0,
+        title=title,
+        title_align="left",
+        border_style="bold #6d8da8",
+    )
+
+
+def _render_todo_panel_ansi(todos, width, max_lines):
     return _render_console_print_to_ansi(
         width,
-        Panel(
-            Text.assemble(*body_parts),
-            padding=0,
-            title=title,
-            title_align="left",
-            border_style="bold #6d8da8",
-        ),
+        _todo_panel_renderable(todos, width, max_lines),
     ).rstrip("\n")
 
 
@@ -1095,6 +1099,9 @@ class ChatTUISession:
         self.todo_items = []
         self.todo_cache_key = None
         self.todo_cache_text = ""
+        self.last_terminal_size = None
+        self.resize_watch_stop = threading.Event()
+        self.resize_watch_thread = None
 
         self.input_area = TextArea(
             multiline=True,
@@ -1194,6 +1201,7 @@ class ChatTUISession:
 
     def run(self, worker):
         def start_worker():
+            self._start_resize_watcher()
             worker_thread = threading.Thread(
                 target=self._run_worker,
                 args=(worker,),
@@ -1210,9 +1218,11 @@ class ChatTUISession:
             except Exception:
                 pass
         finally:
+            self._stop_resize_watcher()
             self.input_enabled = False
 
     def stop(self):
+        self._stop_resize_watcher()
         self._wake_input(EOFError())
         try:
             self.app.exit()
@@ -1264,6 +1274,41 @@ class ChatTUISession:
             self.message_fragments.extend(to_formatted_text(PromptANSI(text)))
             self._mark_message_render_lines_dirty_locked()
             self._trim_messages()
+            self._clamp_message_scroll_offset_locked()
+        self.invalidate()
+
+    def snapshot_messages(self):
+        with self.lock:
+            return {
+                "messages_ansi": self.messages_ansi,
+                "messages_plain": self.messages_plain,
+                "message_blocks": list(self.message_blocks),
+                "message_blocks_have_dynamic": self.message_blocks_have_dynamic,
+                "message_blocks_width": self.message_blocks_width,
+                "message_plain_newline_count": self.message_plain_newline_count,
+                "message_fragments": list(self.message_fragments),
+                "message_render_line_lengths": list(self.message_render_line_lengths),
+                "message_content_line_lengths": list(self.message_content_line_lengths),
+            }
+
+    def restore_messages(self, snapshot):
+        if not snapshot:
+            return
+        with self.lock:
+            self.messages_ansi = snapshot["messages_ansi"]
+            self.messages_plain = snapshot["messages_plain"]
+            self.message_blocks = list(snapshot["message_blocks"])
+            self.message_blocks_have_dynamic = snapshot["message_blocks_have_dynamic"]
+            self.message_blocks_width = snapshot["message_blocks_width"]
+            self.message_plain_newline_count = snapshot["message_plain_newline_count"]
+            self.message_fragments = list(snapshot["message_fragments"])
+            self.message_render_line_lengths = list(
+                snapshot["message_render_line_lengths"]
+            )
+            self.message_content_line_lengths = list(
+                snapshot["message_content_line_lengths"]
+            )
+            self._mark_message_render_lines_dirty_locked()
             self._clamp_message_scroll_offset_locked()
         self.invalidate()
 
@@ -1556,6 +1601,40 @@ class ChatTUISession:
             self.message_scroll_offset = 0
         self.invalidate()
 
+    def _start_resize_watcher(self):
+        if self.resize_watch_thread and self.resize_watch_thread.is_alive():
+            return
+        self.resize_watch_stop.clear()
+        self.last_terminal_size = self._terminal_size()
+        self.resize_watch_thread = threading.Thread(
+            target=self._watch_terminal_resize,
+            daemon=True,
+        )
+        self.resize_watch_thread.start()
+
+    def _stop_resize_watcher(self):
+        self.resize_watch_stop.set()
+
+    def _watch_terminal_resize(self):
+        while not self.resize_watch_stop.wait(0.2):
+            size = self._terminal_size()
+            if size == self.last_terminal_size:
+                continue
+            self._handle_terminal_resize(size)
+
+    def _handle_terminal_resize(self, size):
+        with self.lock:
+            self.last_terminal_size = size
+            self.dashboard_cache_key = None
+            self.todo_cache_key = None
+            if self.message_blocks_have_dynamic:
+                self._rebuild_message_cache(size[0])
+            else:
+                self._mark_message_render_lines_dirty_locked()
+            self._clamp_message_scroll_offset_locked()
+        self._resize_input()
+        self.invalidate()
+
     def _message_page_lines(self):
         render_info = getattr(self.message_window, "render_info", None)
         if render_info is not None:
@@ -1677,18 +1756,14 @@ class ChatTUISession:
         return BOTTOM_INPUT_BORDER * self._columns()
 
     def _columns(self):
-        try:
-            return max(10, int(self.app.output.get_size().columns))
-        except Exception:
-            size = shutil.get_terminal_size(fallback=(80, 24))
-            return max(10, int(size.columns))
+        return self._terminal_size()[0]
 
     def _rows(self):
-        try:
-            return max(5, int(self.app.output.get_size().rows))
-        except Exception:
-            size = shutil.get_terminal_size(fallback=(80, 24))
-            return max(5, int(size.lines))
+        return self._terminal_size()[1]
+
+    def _terminal_size(self):
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        return max(10, int(size.columns)), max(5, int(size.lines))
 
     def _trim_messages(self):
         if len(self.messages_ansi) <= MAX_TUI_MESSAGE_CHARS:
@@ -2273,6 +2348,62 @@ def get_user_input(prompt_text, multiline=False):
     if multiline and os.name == "nt" and sys.stdin.isatty() and sys.stdout.isatty():
         return _read_bottom_multiline_input(prompt_text).strip()
     return console.input(prompt).strip()
+
+
+def get_agent_plan_confirmation(todos, next_tool=""):
+    snapshot = _tui_session.snapshot_messages() if _tui_session is not None else None
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    width = max(40, size.columns)
+    normalized_todos = []
+    for todo in todos or []:
+        if not isinstance(todo, dict):
+            continue
+        content = str(todo.get("content") or "").strip()
+        if not content:
+            continue
+        normalized_todos.append(
+            {
+                "content": content,
+                "status": str(todo.get("status") or "pending").strip().lower(),
+                "priority": str(todo.get("priority") or "").strip().lower(),
+                "depends_on": _todo_string_list(todo.get("depends_on")),
+                "reason": str(todo.get("reason") or "").strip(),
+            }
+        )
+
+    try:
+        console.print(
+            Text.assemble(
+                "\n",
+                gradient_text("[-]", *INFO_COLOR),
+                gradient_text(" Approve current agent plan?\n", *TEXT_COLOR),
+            ),
+            end="",
+        )
+        if next_tool:
+            console.print(
+                Text.assemble(
+                    gradient_text(f"Next tool: {next_tool}\n", *THINK_COLOR),
+                ),
+                end="",
+            )
+        if normalized_todos:
+            console.print(
+                _todo_panel_renderable(
+                    normalized_todos,
+                    width,
+                    max(1, len(normalized_todos)),
+                )
+            )
+        answer = console.input(
+            Text.assemble(
+                gradient_text("Continue? (Y/N, Default: N): ", *TEXT_COLOR),
+            )
+        )
+    finally:
+        if _tui_session is not None and snapshot is not None:
+            _tui_session.restore_messages(snapshot)
+    return answer.strip().lower() in {"y", "yes"}
 
 
 def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content):

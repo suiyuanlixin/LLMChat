@@ -8,7 +8,7 @@ from pathlib import Path
 
 from planning import TodoStore
 from skills import SkillRegistry
-from ui import get_agent_diff_confirmation, get_user_input
+from ui import get_agent_diff_confirmation, get_agent_plan_confirmation, get_user_input
 from search import (
     DEFAULT_WEB_SEARCH_DEPTH,
     DEFAULT_WEB_SEARCH_ENABLE,
@@ -35,14 +35,15 @@ AGENT_APPROVAL_AUTO = "auto"
 
 SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
 
-
 TOOL_DEFINITIONS = [
     {
         "name": "update_todos",
         "description": (
             "Replace the current task plan with a full todo list. "
             "Use this for multi-step agent work. Supports dependencies, priorities, "
-            "completion criteria, and blocked/failed states. At most one item may be in_progress."
+            "completion criteria, and blocked/failed states. Keep existing approved "
+            "todo ids until they are completed, blocked, or failed. At most one item "
+            "may be in_progress."
         ),
         "input_schema": {
             "type": "object",
@@ -50,7 +51,9 @@ TOOL_DEFINITIONS = [
                 "todos": {
                     "type": "array",
                     "description": (
-                        "The complete current todo list. Use an empty array to clear todos."
+                        "The complete current todo list. Preserve existing approved "
+                        "todos in this array until they are completed, blocked, or failed. "
+                        "Use an empty array only when intentionally clearing an inactive plan."
                     ),
                     "items": {
                         "type": "object",
@@ -95,10 +98,54 @@ TOOL_DEFINITIONS = [
                             },
                             "completion_criteria": {
                                 "type": "array",
-                                "items": {"type": "string"},
+                                "items": {
+                                    "oneOf": [
+                                        {"type": "string"},
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "id": {
+                                                    "type": "string",
+                                                    "description": "Optional stable criterion id.",
+                                                },
+                                                "type": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "build",
+                                                        "command",
+                                                        "diff_check",
+                                                        "file_change",
+                                                        "file_exists",
+                                                        "lint",
+                                                        "manual",
+                                                        "review",
+                                                        "test",
+                                                        "tool_output",
+                                                    ],
+                                                    "description": "Kind of evidence required.",
+                                                },
+                                                "target": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Command, file, diff check, or tool output "
+                                                        "that should prove the condition."
+                                                    ),
+                                                },
+                                                "expected": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Observable expected result, such as an exit "
+                                                        "code, file state, or output phrase."
+                                                    ),
+                                                },
+                                            },
+                                        },
+                                    ]
+                                },
                                 "description": (
                                     "Observable conditions required before this todo may be "
-                                    "considered done."
+                                    "considered done. Prefer structured objects with type, "
+                                    "target, and expected."
                                 ),
                             },
                             "reason": {
@@ -501,6 +548,7 @@ class AgentTools:
         web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
         web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
         todo_update_callback=None,
+        plan_approval_output_callback=None,
         skills_enabled=True,
         skills_app_enabled=True,
         skills_workspace_enabled=False,
@@ -509,7 +557,13 @@ class AgentTools:
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
-        self.todo_store = TodoStore(on_change=todo_update_callback)
+        self.plan_approval_output_callback = plan_approval_output_callback
+        self.todo_store = TodoStore(
+            on_change=todo_update_callback,
+            plan_dir=_plan_dir_for_workspace(self.workspace_dir),
+        )
+        self.max_tool_calls = None
+        self.used_tool_calls = 0
         self.skill_registry = SkillRegistry(
             enabled=skills_enabled,
             app_enabled=skills_app_enabled,
@@ -527,7 +581,7 @@ class AgentTools:
             web_search_depth,
             web_search_topic,
         )
-        self.begin_agent_session()
+        self.begin_agent_session(clear_todos=False)
 
     @property
     def enabled(self):
@@ -535,6 +589,11 @@ class AgentTools:
 
     def set_workspace_dir(self, workspace_dir):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
+        self.todo_store.set_plan_dir(
+            _plan_dir_for_workspace(self.workspace_dir),
+            load=True,
+        )
+        self.skill_registry.configure(workspace_dir=self.workspace_dir)
 
     def set_approval_mode(self, approval_mode):
         mode = str(approval_mode or AGENT_APPROVAL_CONFIRM).strip().lower()
@@ -547,6 +606,13 @@ class AgentTools:
 
     def set_todo_update_callback(self, callback):
         self.todo_store.set_on_change(callback)
+
+    def set_budget_context(self, max_tool_calls=None, used_tool_calls=0):
+        if max_tool_calls is None:
+            self.max_tool_calls = None
+        else:
+            self.max_tool_calls = max(1, int(max_tool_calls))
+        self.used_tool_calls = max(0, int(used_tool_calls or 0))
 
     def set_skills_enabled(self, enabled):
         self.skill_registry.configure(enabled=enabled)
@@ -639,8 +705,9 @@ class AgentTools:
         payload = {"query": query, **kwargs}
         return self._web_search(payload)
 
-    def begin_agent_session(self):
-        self.todo_store.clear()
+    def begin_agent_session(self, clear_todos=True):
+        if clear_todos:
+            self.todo_store.clear()
         self.session_changed_files = []
         self._session_changed_file_set = set()
         self.session_mutating_commands = []
@@ -661,7 +728,10 @@ class AgentTools:
         return self.todo_store.revision
 
     def todo_status(self):
-        return self.todo_store.status()
+        return self.todo_store.status(
+            max_tool_calls=self.max_tool_calls,
+            used_tool_calls=self.used_tool_calls,
+        )
 
     def todo_summary(self, include_completed=True):
         return self.todo_store.summary(include_completed=include_completed)
@@ -677,6 +747,33 @@ class AgentTools:
 
     def todo_actionable_summary(self):
         return self.todo_store.actionable_summary()
+
+    def todo_quality_report(self):
+        return self.todo_store.quality_report(
+            max_tool_calls=self.max_tool_calls,
+            used_tool_calls=self.used_tool_calls,
+        )
+
+    def todo_budget_summary(self):
+        return self.todo_store.budget_summary(
+            max_tool_calls=self.max_tool_calls,
+            used_tool_calls=self.used_tool_calls,
+        )
+
+    def todo_history(self, limit=20):
+        return self.todo_store.history_tail(limit)
+
+    def approve_todos(self, note=""):
+        return self.todo_store.approve_plan(note=note, source="user")
+
+    def reject_todos(self, reason=""):
+        return self.todo_store.reject_plan(reason=reason, source="user")
+
+    def retry_todo(self, todo_id, reason=""):
+        return self.todo_store.retry_todo(todo_id, reason=reason)
+
+    def unblock_todo(self, todo_id, reason=""):
+        return self.todo_store.unblock_todo(todo_id, reason=reason)
 
     def apply_todo_final_verification(self, passed, check_result):
         return self.todo_store.apply_final_verification(
@@ -768,6 +865,9 @@ class AgentTools:
             handler = handlers.get(name)
             if handler is None:
                 raise AgentToolError(f"Unknown tool: {name}")
+            plan_gate_result = self._plan_action_gate(name, tool_input)
+            if plan_gate_result is not None:
+                return plan_gate_result
             return handler(tool_input)
         except Exception as error:
             return _error_result(str(error))
@@ -775,7 +875,10 @@ class AgentTools:
     def _update_todos(self, tool_input):
         todos = tool_input.get("todos")
         self.todo_store.update(todos)
-        return self.todo_store.tool_result()
+        return self.todo_store.tool_result(
+            max_tool_calls=self.max_tool_calls,
+            used_tool_calls=self.used_tool_calls,
+        )
 
     def _read_file(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
@@ -1243,10 +1346,65 @@ class AgentTools:
         answer = get_user_input(f"{title}\n{detail}\nContinue? (Y/N, Default: N): ")
         return answer.strip().lower() in {"y", "yes"}
 
+    def _plan_action_gate(self, name, tool_input):
+        if not self.todo_store.needs_action_approval():
+            return self._active_todo_gate(name)
+        if name == "update_todos":
+            return None
+
+        if self.todo_store.approval_state == "rejected":
+            return _error_result(
+                "Current plan was rejected. Revise the plan with update_todos, "
+                "or ask the user to run /plan approve before using more tools."
+            )
+
+        if self.approval_mode == AGENT_APPROVAL_AUTO:
+            self.todo_store.approve_plan(
+                note="Auto approval mode approved the current plan.",
+                source="auto",
+            )
+            return self._active_todo_gate(name)
+
+        self._before_plan_approval_output()
+        if get_agent_plan_confirmation(self.todo_store.to_dicts()):
+            self.todo_store.approve_plan(
+                note="User approved the current plan before action.",
+                source="user",
+            )
+            return self._active_todo_gate(name)
+
+        self.todo_store.reject_plan(
+            reason="User rejected the current plan before action.",
+            source="user",
+        )
+        return _error_result(
+            "User rejected the current plan. Revise the plan before using more tools."
+        )
+
+    def _active_todo_gate(self, name):
+        if name == "update_todos":
+            return None
+        if not self.todo_store.requires_active_todo():
+            return None
+        active = self.todo_store.active_item()
+        if active is not None:
+            return None
+        return _error_result(
+            "Before using more tools, call update_todos and mark exactly one ready "
+            "todo as in_progress. This keeps the Todo List synchronized with the "
+            "work being executed."
+        )
+
     def _before_visible_output(self):
         if self.visible_output_callback:
             self.visible_output_callback()
         self.output_needs_separator = True
+
+    def _before_plan_approval_output(self):
+        if self.plan_approval_output_callback:
+            self.plan_approval_output_callback()
+        elif self.visible_output_callback:
+            self.visible_output_callback()
 
     def _auto_approves(self, risk_reason):
         if self.approval_mode != AGENT_APPROVAL_AUTO:
@@ -1270,6 +1428,12 @@ def normalize_workspace_dir(workspace_dir):
     if not path.is_dir():
         return None
     return path
+
+
+def _plan_dir_for_workspace(workspace_dir):
+    if workspace_dir is None:
+        return None
+    return Path(workspace_dir) / ".llmchat" / "plans"
 
 
 def _final_check_passed(check_result):
