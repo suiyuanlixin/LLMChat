@@ -33,7 +33,7 @@ def save_conversation(conversation_history, model_name):
         return False
 
     save_data = {
-        "version": "2.5.0",
+        "version": "3.0.0",
         "model": model_name,
         "created_at": datetime.now().isoformat(),
         "conversation": conversation_history,

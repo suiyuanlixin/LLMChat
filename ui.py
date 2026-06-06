@@ -73,7 +73,7 @@ class _ConsoleProxy:
 
 console = _ConsoleProxy()
 
-VERSION = "2.5.0"
+VERSION = "3.0.0"
 
 SUCCESS_COLOR = ["#67b6a6", "#92ded2"]
 INFO_COLOR = ["#6d8da8", "#97cbe3"]
