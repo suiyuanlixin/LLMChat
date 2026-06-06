@@ -41,6 +41,8 @@ from prompt_toolkit.widgets import TextArea
 _console_override = threading.local()
 _dashboard_capture = threading.local()
 _tui_session = None
+_stream_thinking_header_deferred = False
+_stream_thinking_header_leading_newline = True
 
 
 class _ConsoleProxy:
@@ -336,6 +338,7 @@ def _display_content_block(block):
 
 
 def print_message(symbol, content, color):
+    _discard_deferred_stream_thinking_header()
     console.print(
         Text.assemble(
             "\n",
@@ -362,6 +365,7 @@ def print_info(content):
 
 
 def print_thinking(content):
+    _discard_deferred_stream_thinking_header()
     console.print(
         Text.assemble(
             "\n",
@@ -371,38 +375,63 @@ def print_thinking(content):
     )
 
 
-def print_stream_thinking(content, leading_newline=True):
-    prefix = "\n" if leading_newline else ""
-    if _tui_session is not None:
-        console.print(
-            Text.assemble(
-                prefix,
-                gradient_text("[*] Thinking: ", *THINK_COLOR),
-            ),
-            end="",
-        )
-        if content:
-            _tui_session.append_stream_text(content, f"bold {STREAM_THINK_COLOR}")
-        return
+def _defer_stream_thinking_header(leading_newline=True):
+    global _stream_thinking_header_deferred
+    global _stream_thinking_header_leading_newline
+    _stream_thinking_header_deferred = True
+    _stream_thinking_header_leading_newline = bool(leading_newline)
 
+
+def _discard_deferred_stream_thinking_header():
+    global _stream_thinking_header_deferred
+    _stream_thinking_header_deferred = False
+
+
+def _render_stream_thinking_header(leading_newline=True):
+    prefix = "\n" if leading_newline else ""
     console.print(
         Text.assemble(
             prefix,
             gradient_text("[*] Thinking: ", *THINK_COLOR),
-            Text(content, style=f"bold {STREAM_THINK_COLOR}"),
         ),
         end="",
     )
+
+
+def _flush_deferred_stream_thinking_header():
+    global _stream_thinking_header_deferred
+    if not _stream_thinking_header_deferred:
+        return
+    leading_newline = _stream_thinking_header_leading_newline
+    _stream_thinking_header_deferred = False
+    _render_stream_thinking_header(leading_newline)
+
+
+def _append_stream_thinking_text(content):
+    if _tui_session is not None:
+        _tui_session.append_stream_text(content, f"bold {STREAM_THINK_COLOR}")
+        return
+    console.print(Text(content, style=f"bold {STREAM_THINK_COLOR}"), end="")
+
+
+def print_stream_thinking(content, leading_newline=True):
+    if not content:
+        _defer_stream_thinking_header(leading_newline)
+        return
+
+    _discard_deferred_stream_thinking_header()
+    _render_stream_thinking_header(leading_newline)
+    _append_stream_thinking_text(content)
 
 
 def print_stream_thinking_continue(content):
     # Collapse multiple \n into single \n
     while "\n\n" in content:
         content = content.replace("\n\n", "\n")
-    if _tui_session is not None:
-        _tui_session.append_stream_text(content, f"bold {STREAM_THINK_COLOR}")
+    if not content:
         return
-    console.print(Text(content, style=f"bold {STREAM_THINK_COLOR}"), end="")
+    _flush_deferred_stream_thinking_header()
+    _append_stream_thinking_text(content)
 
 
 def clear_current_line():
@@ -429,6 +458,7 @@ def clear_current_lines(line_count):
 
 
 def print_stream_response_start(model_name):
+    _discard_deferred_stream_thinking_header()
     console.print(
         Text.assemble(
             "\n",

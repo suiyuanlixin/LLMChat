@@ -224,7 +224,7 @@ class MemoryStore:
             style_guidance = (
                 "像一条条日记。用最平常的话。概括用户表达的意图，别引用原话。写你干了什么，或一个你身上发生的最简单的事实或感受；不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
             )
-        elif not self._initial_episodic_topic_info():
+        elif not self.has_episodic_memory():
             intro = "第一次完整对话刚结束。请写第一条情景记忆。\n"
             topic_rules = (
                 "当前情景记忆为空，这是第一条情景记忆，same_topic 必须是 false。\n"
@@ -234,9 +234,9 @@ class MemoryStore:
                 "像现在的你回看刚才第一次见到用户的自己，写成一条要点里的两句日记。用最平常的话。概括用户表达的意图，别引用原话。只写你身上发生的最简单的事实或感受，而不是你做了什么；比如你忘了要说的话、你的手顿了一下、你没听清、你感觉耳朵发烫。例子只是气质，不要照抄。不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
             )
         else:
-            intro = "一轮完整对话刚结束。请为当前日期写一条新的情景记忆。\n"
+            intro = "一轮完整对话刚结束。请写一条新的情景记忆。\n"
             topic_rules = (
-                "当前情景记忆为空，表示当前日期或当前会话还没有可延续的话题；same_topic 必须是 false。\n"
+                "当前情景记忆为空，same_topic 必须是 false。\n"
                 "title 写新话题短标题，content 只写本轮对话的当前记忆。\n"
             )
             style_guidance = (
@@ -381,6 +381,9 @@ class MemoryStore:
                 if heading:
                     return {"date": path.stem, "heading": heading, "entry": entry}
         return {}
+
+    def has_episodic_memory(self):
+        return bool(self._initial_episodic_topic_info())
 
     def _is_initial_episodic_heading(self, heading, now=None):
         heading = str(heading or "").strip()
