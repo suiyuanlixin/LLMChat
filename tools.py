@@ -3,7 +3,13 @@ import difflib
 import json
 import os
 import re
+import socket
 import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from planning import TodoStore
@@ -318,7 +324,11 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "bash",
-        "description": "Run a shell command inside the configured workspace. Commands with obvious file writes or deletes require user confirmation.",
+        "description": (
+            "Run a shell command inside the configured workspace. The command must exit; "
+            "do not start foreground dev/static servers. Commands with obvious file writes "
+            "or deletes require user confirmation."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -328,6 +338,37 @@ TOOL_DEFINITIONS = [
                 }
             },
             "required": ["command"],
+        },
+    },
+    {
+        "name": "local_http_check",
+        "description": (
+            "Start a temporary Python static HTTP server inside the workspace, request one "
+            "or more local paths, then terminate the server before returning. Use this for "
+            "static-site todos like 'start static service + curl check 200' instead of "
+            "running a foreground server with bash."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "root": {
+                    "type": "string",
+                    "description": "Workspace-relative directory to serve. Defaults to the workspace root.",
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "URL paths to request, such as ['/', '/settings']. Defaults to ['/'].",
+                },
+                "expected_status": {
+                    "type": "integer",
+                    "description": "Expected HTTP status for every path. Defaults to 200.",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Total startup/request timeout in seconds, between 1 and 60. Defaults to 10.",
+                },
+            },
         },
     },
     {
@@ -858,6 +899,7 @@ class AgentTools:
                 "apply_patch": self._apply_patch,
                 "apply_unified_patch": self._apply_unified_patch,
                 "bash": self._bash,
+                "local_http_check": self._local_http_check,
                 "git_status": self._git_status,
                 "git_diff": self._git_diff,
                 "grep": self._grep,
@@ -1084,6 +1126,13 @@ class AgentTools:
         risk_level, risk_reason = _command_risk(command)
         if risk_level == "blocked":
             raise AgentToolError(f"Command blocked: {risk_reason}")
+        foreground_server_reason = _foreground_server_command_reason(command)
+        if foreground_server_reason:
+            return _error_result(
+                f"{foreground_server_reason}. The bash tool only runs commands that exit. "
+                "For local HTTP checks, use a bounded script that starts the server as a "
+                "subprocess, performs the request, and terminates the server before exiting."
+            )
         if risk_level == "confirm" and not self._confirm(
             "Allow agent to run a command?",
             f"{risk_reason}\n{command}",
@@ -1091,16 +1140,21 @@ class AgentTools:
         ):
             return _error_result("User rejected bash command.")
 
-        completed = subprocess.run(
-            command,
-            cwd=str(self.workspace_dir),
-            shell=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=COMMAND_TIMEOUT_SECONDS,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(self.workspace_dir),
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            if risk_level == "confirm" and risk_reason != "script or shell execution detected":
+                self._record_mutating_command(command)
+            return _timeout_result(command, error, COMMAND_TIMEOUT_SECONDS)
         if risk_level == "confirm" and risk_reason != "script or shell execution detected":
             self._record_mutating_command(command)
         output = completed.stdout or ""
@@ -1112,6 +1166,73 @@ class AgentTools:
             combined = "(no output)"
         combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
         return f"Exit code: {completed.returncode}\n{combined}"
+
+    def _local_http_check(self, tool_input):
+        root = self._resolve_path(str(tool_input.get("root") or "."))
+        if not root.is_dir():
+            raise AgentToolError(f"root is not a directory: {self._display_path(root)}")
+
+        paths = _http_check_paths(tool_input.get("paths"))
+        expected_status = _bounded_int(
+            tool_input.get("expected_status"),
+            200,
+            100,
+            599,
+            "expected_status",
+        )
+        timeout_seconds = _bounded_int(
+            tool_input.get("timeout_seconds"),
+            10,
+            1,
+            60,
+            "timeout_seconds",
+        )
+        port = _free_local_port()
+        command = [
+            sys.executable or "python",
+            "-m",
+            "http.server",
+            str(port),
+            "--bind",
+            "127.0.0.1",
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        try:
+            _wait_for_local_port(process, port, timeout_seconds)
+            lines = [
+                f"Served {self._display_path(root)} at http://127.0.0.1:{port}",
+                f"Expected status: {expected_status}",
+            ]
+            passed = True
+            deadline = time.monotonic() + timeout_seconds
+            for path in paths:
+                remaining = max(0.5, min(5, deadline - time.monotonic()))
+                url_path = _normalize_http_path(path)
+                url = f"http://127.0.0.1:{port}{url_path}"
+                status, detail = _request_http_status(url, remaining)
+                ok = status == expected_status
+                passed = passed and ok
+                status_text = str(status) if status is not None else "no response"
+                suffix = "OK" if ok else "FAILED"
+                if detail:
+                    lines.append(f"{suffix} {url_path} -> {status_text} ({detail})")
+                else:
+                    lines.append(f"{suffix} {url_path} -> {status_text}")
+            result = "\n".join(lines)
+            if not passed:
+                return _error_result(result)
+            return "Local HTTP check passed.\n" + result
+        finally:
+            _terminate_process(process)
 
     def _git_status(self, tool_input):
         return self._run_git_command(["status", "--short"], "(working tree clean)")
@@ -1644,6 +1765,37 @@ def _truncate(text, max_chars):
     return text[:max_chars]
 
 
+def _single_line(text, max_chars):
+    value = " ".join(str(text or "").split())
+    return _truncate(value, max_chars)
+
+
+def _timeout_result(command, error, timeout_seconds):
+    output = _timeout_stream(error.stdout)
+    error_output = _timeout_stream(error.stderr)
+    combined = output
+    if error_output:
+        combined = f"{combined}\n[stderr]\n{error_output}" if combined else f"[stderr]\n{error_output}"
+    message = (
+        f"Command timed out after {timeout_seconds} seconds: "
+        f"{_truncate(str(command or ''), 240)}"
+    )
+    if combined:
+        message += "\nPartial output before timeout:\n" + _truncate(
+            combined,
+            MAX_TOOL_OUTPUT_CHARS,
+        )
+    return _error_result(message)
+
+
+def _timeout_stream(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _format_lines(lines, start_line, line_numbers=True):
     if not line_numbers:
         return "\n".join(lines)
@@ -1673,6 +1825,130 @@ def _absolute_path_candidates(command):
     drive_paths = re.findall(r"[a-zA-Z]:[\\/][^\s\"'<>|]+", command)
     unc_paths = re.findall(r"\\\\[^\s\"'<>|]+", command)
     return drive_paths + unc_paths
+
+
+def _http_check_paths(value):
+    if value is None:
+        return ["/"]
+    if isinstance(value, str):
+        paths = [value]
+    elif isinstance(value, (list, tuple)):
+        paths = [str(item) for item in value]
+    else:
+        raise AgentToolError("paths must be an array of strings.")
+    normalized = []
+    for path in paths:
+        path = str(path or "").strip()
+        if not path:
+            continue
+        normalized.append(path)
+    return normalized or ["/"]
+
+
+def _normalize_http_path(path):
+    value = str(path or "/").strip() or "/"
+    if not value.startswith("/"):
+        value = "/" + value
+    return urllib.parse.quote(value, safe="/:?&=#%+-._~")
+
+
+def _free_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_local_port(process, port, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            _, stderr = _communicate_process(process, 0.2)
+            detail = _single_line(stderr, 300) if stderr else "no stderr"
+            raise AgentToolError(f"local HTTP server exited early: {detail}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                return
+        except OSError as error:
+            last_error = str(error)
+            time.sleep(0.1)
+    raise AgentToolError(
+        f"local HTTP server did not accept connections within {timeout_seconds} seconds"
+        + (f": {last_error}" if last_error else "")
+    )
+
+
+def _request_http_status(url, timeout_seconds):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "LLMChat-local-http-check"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(0.5, timeout_seconds)) as response:
+            return int(response.status), ""
+    except urllib.error.HTTPError as error:
+        return int(error.code), str(error.reason or "")
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return None, str(error)
+
+
+def _terminate_process(process):
+    if process is None:
+        return
+    if process.poll() is None:
+        process.terminate()
+        try:
+            _communicate_process(process, 2)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+    try:
+        _communicate_process(process, 2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _communicate_process(process, timeout):
+    return process.communicate(timeout=timeout)
+
+
+def _foreground_server_command_reason(command):
+    lowered = str(command or "").lower()
+    patterns = [
+        (
+            r"(?:^|[;&|]\s*)(?:python|python3|py)\s+-m\s+http\.server\b",
+            "python -m http.server starts a foreground static server",
+        ),
+        (
+            r"(?:^|[;&|]\s*)(?:npx\s+)?(?:http-server|live-server)\b",
+            "static server command starts a foreground process",
+        ),
+        (
+            r"(?:^|[;&|]\s*)(?:npx\s+)?serve(?:\.cmd)?\b",
+            "serve starts a foreground static server",
+        ),
+        (
+            r"(?:^|[;&|]\s*)(?:npx\s+)?vite(?:\.cmd)?\b",
+            "vite starts a foreground dev server",
+        ),
+        (
+            r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start|serve|preview)\b",
+            "package script appears to start a foreground dev/static server",
+        ),
+        (
+            r"(?:^|[;&|]\s*)next\s+dev\b",
+            "next dev starts a foreground dev server",
+        ),
+        (
+            r"(?:^|[;&|]\s*)astro\s+dev\b",
+            "astro dev starts a foreground dev server",
+        ),
+    ]
+    for pattern, reason in patterns:
+        if re.search(pattern, lowered):
+            return reason
+    return ""
 
 
 def _command_risk(command):

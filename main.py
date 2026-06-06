@@ -180,6 +180,7 @@ def run_chat_loop(config, workspace_dir, workspace_error=None, agent_auto_disabl
             compaction_keep_recent_messages=config.compaction_keep_recent_messages,
             compaction_compact_model=config.compaction_compact_model,
             memory_model=config.memory_model,
+            debug=config.debug,
             web_search_enabled=config.web_search_enable,
             web_search_provider=config.web_search_provider,
             web_search_api_key=config.web_search_api_key,

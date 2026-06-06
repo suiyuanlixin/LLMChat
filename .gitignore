@@ -5,4 +5,6 @@ memory/
 config.json
 prompt.md
 skills/
+.clawhub/
+.skillhub/
 .llmchat/plans/

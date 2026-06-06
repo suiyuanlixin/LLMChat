@@ -45,6 +45,7 @@ DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75
 DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
 DEFAULT_COMPACTION_COMPACT_MODEL = ""
 DEFAULT_MEMORY_MODEL = ""
+DEFAULT_DEBUG = False
 AGENT_THINKING_OFF = "off"
 AGENT_THINKING_SUMMARY = "summary"
 AGENT_THINKING_FULL = "full"
@@ -89,6 +90,7 @@ class AppConfig:
     compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
     memory_model: str = DEFAULT_MEMORY_MODEL
+    debug: bool = DEFAULT_DEBUG
     web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
     web_search_provider: str = DEFAULT_WEB_SEARCH_PROVIDER
     web_search_api_key: str = ""
@@ -124,6 +126,7 @@ class AppConfig:
             "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
             "compaction_compact_model": self.compaction_compact_model,
             "memory_model": self.memory_model,
+            "debug": self.debug,
             "web_search_enable": self.web_search_enable,
             "web_search_provider": self.web_search_provider,
             "web_search_api_key": self.web_search_api_key,
@@ -144,6 +147,7 @@ class AppConfig:
             "thinking_mode": self.thinking_mode,
             "reasoning_effort": self.reasoning_effort,
             "context_window_tokens": self.context_window_tokens,
+            "debug": self.debug,
             "agent_mode": {
                 "enable": self.agent_mode,
                 "max_rounds": self.max_agent_rounds,
@@ -545,6 +549,10 @@ def _sanitize_config(config):
         memory_config.get("memory_model", DEFAULT_MEMORY_MODEL)
         or ""
     ).strip()
+    config["debug"] = _parse_bool(
+        config.get("debug", memory_config.get("debug")),
+        DEFAULT_DEBUG,
+    )
 
     config["web_search_enable"] = _parse_bool(
         web_search_config.get("enable"),
@@ -722,6 +730,19 @@ def _prompt_compaction_trigger_ratio(prompt, default_value):
             print_error(str(error))
 
 
+def _prompt_bool(prompt, default_value):
+    while True:
+        value = get_user_input(prompt).strip()
+        if not value:
+            return bool(default_value)
+        normalized = value.lower()
+        if normalized in {"true", "1", "yes", "on", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "n"}:
+            return False
+        print_error("Please enter true/false, yes/no, on/off, or leave empty.")
+
+
 def load_config():
     config = _load_existing_config()
     if config.api_key or not requires_api_key(config.api_type):
@@ -782,6 +803,7 @@ def load_config():
         compaction_keep_recent_messages=DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES,
         compaction_compact_model=DEFAULT_COMPACTION_COMPACT_MODEL,
         memory_model=DEFAULT_MEMORY_MODEL,
+        debug=DEFAULT_DEBUG,
         web_search_enable=DEFAULT_WEB_SEARCH_ENABLE,
         web_search_provider=DEFAULT_WEB_SEARCH_PROVIDER,
         web_search_api_key="",
@@ -903,6 +925,10 @@ def update_config():
         ).strip()
         or config.memory_model
     )
+    new_debug = _prompt_bool(
+        f"Debug mode true/false (Current: {config.debug}): ",
+        config.debug,
+    )
     new_compaction_trigger_ratio = _prompt_compaction_trigger_ratio(
         f"Auto compact trigger ratio (Current: {config.compaction_trigger_ratio}): ",
         config.compaction_trigger_ratio,
@@ -935,6 +961,7 @@ def update_config():
         compaction_keep_recent_messages=config.compaction_keep_recent_messages,
         compaction_compact_model=new_compaction_compact_model,
         memory_model=new_memory_model,
+        debug=new_debug,
         web_search_enable=config.web_search_enable,
         web_search_provider=config.web_search_provider,
         web_search_api_key=config.web_search_api_key,

@@ -114,6 +114,7 @@ Rules:
 - Prefer apply_unified_patch for contextual edits, apply_patch for simple line-range edits, and edit_file for exact small replacements.
 - Use git_status and git_diff to understand existing and resulting workspace changes.
 - After editing, run a lightweight verification command when it is safe and relevant.
+- For local HTTP/static checks, use local_http_check when serving static files; never run a dev/static server as a foreground bash command. If custom server logic is unavoidable, use a bounded script that starts the server, checks the URL, and terminates it before exiting.
 - Do not claim the task is complete until you have inspected the resulting diff or verification output.
 - In the final summary, distinguish files you edited in this run from pre-existing workspace changes.
 - If a tool fails, explain the failure and try a different precise approach instead of repeating the same call.
@@ -216,6 +217,7 @@ class LLMChat:
         compaction_keep_recent_messages=12,
         compaction_compact_model="",
         memory_model="",
+        debug=False,
         web_search_enabled=True,
         web_search_provider="tavily",
         web_search_api_key="",
@@ -224,7 +226,8 @@ class LLMChat:
         web_search_topic="general",
     ):
         _ensure_user_prompt_file()
-        self.memory_store = MemoryStore()
+        self.debug = bool(debug)
+        self.memory_store = MemoryStore(debug=self.debug)
         self.memory_lock = threading.Lock()
         self.session_memory_lock = threading.Lock()
         self.session_episodic_heading = ""
@@ -476,6 +479,10 @@ class LLMChat:
     def set_memory_model(self, model):
         self.memory_model = str(model or "").strip()
 
+    def set_debug(self, enabled):
+        self.debug = bool(enabled)
+        self.memory_store.set_debug(self.debug)
+
     def _memory_model_name(self):
         return self.memory_model or self.model
 
@@ -483,6 +490,7 @@ class LLMChat:
         return {
             "configured_model": self.memory_model,
             "effective_model": self._memory_model_name(),
+            "debug": self.debug,
         }
 
     def set_workspace_dir(self, workspace_dir):

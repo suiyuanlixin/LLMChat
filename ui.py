@@ -853,6 +853,7 @@ BOTTOM_INPUT_PLACEHOLDER = "Type a message..."
 ANSI = "\x1b["
 MAX_TUI_MESSAGE_CHARS = 400000
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MOUSE_ESCAPE_LEAK_PATTERN = re.compile(r"(?:\x1b\[|\[\[?|\[)<\d+;\d+;\d+[mM]")
 TUI_MOUSE_SCROLL_LINES = 4
 TUI_PAGE_SCROLL_MARGIN = 2
 
@@ -1180,7 +1181,7 @@ class ChatTUISession:
             layout=self.layout,
             key_bindings=self._key_bindings(),
             full_screen=True,
-            mouse_support=Condition(self._mouse_support_enabled),
+            mouse_support=False,
             color_depth=ColorDepth.TRUE_COLOR,
             input=app_input,
             output=app_output,
@@ -1205,6 +1206,7 @@ class ChatTUISession:
 
     def run(self, worker):
         def start_worker():
+            self._disable_terminal_mouse_support_now()
             self._start_resize_watcher()
             worker_thread = threading.Thread(
                 target=self._run_worker,
@@ -1223,10 +1225,12 @@ class ChatTUISession:
                 pass
         finally:
             self._stop_resize_watcher()
+            self._disable_terminal_mouse_support_now()
             self.input_enabled = False
 
     def stop(self):
         self._stop_resize_watcher()
+        self._disable_terminal_mouse_support_now()
         self._wake_input(EOFError())
         try:
             self.app.exit()
@@ -1458,8 +1462,7 @@ class ChatTUISession:
             pass
 
     def _mouse_support_enabled(self):
-        with self.lock:
-            return not self.terminal_select_mode
+        return False
 
     def _toggle_terminal_select_mode(self):
         with self.lock:
@@ -1611,6 +1614,7 @@ class ChatTUISession:
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
         self._resize_input()
+        self._render_confirmation_line(selected=selected, confirmed=True)
         self.input_queue.put(selected)
         self.invalidate()
 
@@ -1622,11 +1626,12 @@ class ChatTUISession:
         self._render_confirmation_line()
         self.invalidate()
 
-    def _render_confirmation_line(self):
-        with self.lock:
-            selected = bool(self.confirmation_selected)
+    def _render_confirmation_line(self, selected=None, confirmed=False):
+        if selected is None:
+            with self.lock:
+                selected = bool(self.confirmation_selected)
 
-        renderable = _confirmation_line_renderable(selected)
+        renderable = _confirmation_line_renderable(selected, confirmed=confirmed)
         ansi = _render_console_print_to_ansi(
             self._columns(),
             renderable,
@@ -1864,8 +1869,26 @@ class ChatTUISession:
         return max(1, min(10, height))
 
     def _input_changed(self):
+        if self._strip_mouse_escape_leaks_from_input():
+            return
         self._resize_input()
         self.invalidate()
+
+    def _strip_mouse_escape_leaks_from_input(self):
+        if not hasattr(self, "input_area"):
+            return False
+        text = self.input_area.text
+        cleaned = MOUSE_ESCAPE_LEAK_PATTERN.sub("", text)
+        if cleaned == text:
+            return False
+        cursor_position = min(self.input_area.buffer.cursor_position, len(cleaned))
+        self.input_area.buffer.set_document(
+            Document(cleaned, cursor_position),
+            bypass_readonly=True,
+        )
+        self._resize_input()
+        self.invalidate()
+        return True
 
     def _resize_input(self):
         if not hasattr(self, "input_area"):
@@ -2474,10 +2497,10 @@ def get_continue_confirmation():
     if _tui_session is not None:
         return _tui_session.request_confirmation(default=False)
 
-    console.print(_confirmation_line_prompt(), end="")
     if sys.stdin.isatty() and sys.stdout.isatty():
         return _read_terminal_confirmation(default=False)
 
+    console.print(_confirmation_line_prompt(), end="")
     answer = console.input(" [y/N]: ")
     return answer.strip().lower() in {"y", "yes"}
 
@@ -2504,10 +2527,11 @@ def _confirmation_line_prompt():
     )
 
 
-def _confirmation_line_renderable(selected):
+def _confirmation_line_renderable(selected, confirmed=False):
     selected = bool(selected)
-    yes_colors = SUCCESS_COLOR if selected else TEXT_COLOR
-    no_colors = TEXT_COLOR if selected else SUCCESS_COLOR
+    confirmed = bool(confirmed)
+    yes_colors = SUCCESS_COLOR if selected and confirmed else TEXT_COLOR
+    no_colors = SUCCESS_COLOR if not selected and confirmed else TEXT_COLOR
     return Text.assemble(
         _confirmation_line_prompt(),
         " ",
@@ -2518,9 +2542,10 @@ def _confirmation_line_renderable(selected):
 
 
 def _read_terminal_confirmation(default=False):
+    _enable_ansi_input_rendering()
     selected = bool(default)
-    selector = _confirmation_selector_text(selected)
-    sys.stdout.write(selector)
+    line = _confirmation_line_ansi(selected)
+    sys.stdout.write(line)
     sys.stdout.flush()
 
     while True:
@@ -2536,23 +2561,30 @@ def _read_terminal_confirmation(default=False):
         else:
             continue
 
-        next_selector = _confirmation_selector_text(selected)
-        if next_selector != selector:
-            sys.stdout.write("\b" * len(selector) + next_selector)
+        next_line = _confirmation_line_ansi(selected)
+        if next_line != line:
+            sys.stdout.write("\r\x1b[2K" + next_line)
             sys.stdout.flush()
-            selector = next_selector
+            line = next_line
         if key in {"yes", "no"}:
             break
 
+    confirmed_line = _confirmation_line_ansi(selected, confirmed=True)
+    if confirmed_line != line:
+        sys.stdout.write("\r\x1b[2K" + confirmed_line)
     sys.stdout.write("\n")
     sys.stdout.flush()
     return selected
 
 
-def _confirmation_selector_text(selected):
-    yes = "[Yes]" if selected else "Yes"
-    no = "No" if selected else "[No]"
-    return f" {yes}  {no}"
+def _confirmation_line_ansi(selected, confirmed=False):
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    return _render_console_print_to_ansi(
+        width,
+        _confirmation_line_renderable(selected, confirmed=confirmed),
+        end="",
+        soft_wrap=True,
+    )
 
 
 def _read_terminal_confirmation_key():

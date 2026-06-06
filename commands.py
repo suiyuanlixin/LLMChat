@@ -1,6 +1,7 @@
 import json
+import shlex
 
-from ui import print_error, print_success, print_warn, print_info
+from ui import get_continue_confirmation, print_error, print_success, print_warn, print_info
 from config import (
     parse_agent_approval_mode,
     parse_agent_rounds,
@@ -20,6 +21,12 @@ from config import (
     update_config,
 )
 from session import save_conversation, load_conversation
+from installer import (
+    SkillInstallError,
+    install_registry_skill,
+    registry_inspect,
+    registry_search,
+)
 
 COMMANDS = {
     "/help": "Display a list of available commands and their descriptions.",
@@ -131,6 +138,7 @@ def _apply_config(chat, config):
             config.compaction_trigger_ratio,
         )
         chat.set_memory_model(config.memory_model)
+        chat.set_debug(config.debug)
         chat.set_web_search_config(
             config.web_search_enable,
             config.web_search_provider,
@@ -606,10 +614,12 @@ def handle_memory(chat, args):
         )
         configured_model = memory_model_status.get("configured_model") or "None"
         effective_model = memory_model_status.get("effective_model") or getattr(chat, "model", "")
+        debug = "on" if memory_model_status.get("debug") else "off"
         print_info(
             "Persistent memory files:\n"
             f"{store.paths_summary()}\n\n"
             f"Memory model: {effective_model} (configured: {configured_model}).\n\n"
+            f"Debug diagnostics: {debug}.\n\n"
             "Usage: /memory core | /memory prefs | /memory today | "
             "/memory date YYYY-MM-DD | /memory search <query> | "
             "/memory history"
@@ -750,18 +760,35 @@ def _format_skills_status(skills):
         f"App directory: {directories.get('app') or 'skills'}.\n"
         f"Workspace directory: {directories.get('workspace') or 'no workspace'}.\n"
         f"Auto catalog: {auto_catalog}. Max chars: {skills.get('max_skill_chars', 0)}.\n"
-        "Usage: /skills on|off|reload|app on|off|workspace on|off|catalog on|off|max-chars <num>"
+        "Usage: /skills on|off|reload|app on|off|workspace on|off|catalog on|off|max-chars <num>\n"
+        "Install: /skills search clawhub|skillhub <query> | "
+        "/skills inspect clawhub:<slug>|skillhub:<owner>/<name> | "
+        "/skills install clawhub:<slug>|skillhub:<owner>/<name> "
+        "[--workspace|--app] [--dry-run] [--force]"
     )
 
 
 def handle_skills(chat, args):
     status = chat.get_agent_status().get("skills") or {}
-    parts = args.split() if args else []
+    try:
+        parts = shlex.split(args) if args else []
+    except ValueError as error:
+        print_error(f"Invalid /skills arguments: {error}")
+        return True
     if not parts:
         print_info(_format_skills_status(status))
         return True
 
     action = parts[0].lower().strip()
+    if action == "search":
+        return _handle_skills_search(parts)
+
+    if action == "inspect":
+        return _handle_skills_inspect(chat, parts)
+
+    if action == "install":
+        return _handle_skills_install(chat, parts)
+
     if action in {"on", "off"} and len(parts) == 1:
         enabled = action == "on"
         chat.set_skills_config(enabled=enabled)
@@ -822,9 +849,272 @@ def handle_skills(chat, args):
         return True
 
     print_error(
-        "Usage: /skills on|off|reload|app on|off|workspace on|off|catalog on|off|max-chars <num>"
+        "Usage: /skills on|off|reload|app on|off|workspace on|off|catalog on|off|max-chars <num>\n"
+        "Install: /skills search clawhub|skillhub <query> | "
+        "/skills inspect clawhub:<slug>|skillhub:<owner>/<name> | "
+        "/skills install clawhub:<slug>|skillhub:<owner>/<name> "
+        "[--workspace|--app] [--dry-run] [--force]"
     )
     return True
+
+
+def _handle_skills_search(parts):
+    if len(parts) < 3 or parts[1].lower() not in {"clawhub", "skillhub"}:
+        print_error("Usage: /skills search clawhub|skillhub <query> [--limit <num>]")
+        return True
+    provider = parts[1].lower()
+    try:
+        query_parts, options = _split_skill_options(parts[2:])
+    except SkillInstallError as error:
+        print_error(str(error))
+        return True
+    limit = _option_int(options, "limit", 10, 1, 25)
+    if limit is None:
+        return True
+    query = " ".join(query_parts).strip()
+    if not query:
+        print_error("Usage: /skills search clawhub|skillhub <query> [--limit <num>]")
+        return True
+    try:
+        results = registry_search(
+            provider,
+            query,
+            limit=limit,
+            registry=options.get("registry"),
+        )
+    except SkillInstallError as error:
+        print_error(str(error))
+        return True
+    if not results:
+        print_info(f"No {_provider_title(provider)} skills found.")
+        return True
+    lines = [f"{_provider_title(provider)} skills:"]
+    for item in results:
+        owner = f" by {item['owner']}" if item.get("owner") else ""
+        description = f" - {item['description']}" if item.get("description") else ""
+        lines.append(f"- {provider}:{item['slug']} ({item['title']}{owner}){description}")
+    print_info("\n".join(lines))
+    return True
+
+
+def _handle_skills_inspect(chat, parts):
+    try:
+        provider, slug, option_parts = _parse_skill_ref(parts, 1)
+        options = _parse_skill_install_options(option_parts)
+        target_dir = _skills_target_dir(chat, options["target"])
+        info = registry_inspect(
+            provider,
+            slug,
+            version=options.get("version"),
+            registry=options.get("registry"),
+        )
+    except SkillInstallError as error:
+        print_error(str(error))
+        return True
+
+    files = info.get("files") or []
+    warnings = info.get("warnings") or []
+    lines = [
+        f"{_provider_title(provider)} skill: {info.get('title') or info['slug']} ({info['slug']})",
+        f"Version: {info.get('version') or 'latest'}",
+        f"Owner: {info.get('owner') or 'unknown'}",
+        f"Target: {options['target']}",
+        f"Install dir: {target_dir / _local_skill_dir_name(provider, info['slug'])}",
+    ]
+    description = str(info.get("description") or "").strip()
+    if description:
+        lines.append(f"Description: {description}")
+    homepage = str(info.get("homepage") or "").strip()
+    if homepage:
+        lines.append(f"Homepage: {homepage}")
+    if files:
+        shown = files[:20]
+        suffix = f"\n  ... {len(files) - len(shown)} more" if len(files) > len(shown) else ""
+        lines.append("Files:\n  " + "\n  ".join(shown) + suffix)
+    if warnings:
+        lines.append("Warnings:\n  " + "\n  ".join(warnings))
+    print_info("\n".join(lines))
+    return True
+
+
+def _handle_skills_install(chat, parts):
+    try:
+        provider, slug, option_parts = _parse_skill_ref(parts, 1)
+        options = _parse_skill_install_options(option_parts)
+        target_dir = _skills_target_dir(chat, options["target"])
+        preview = install_registry_skill(
+            provider,
+            slug,
+            target_dir,
+            target=options["target"],
+            version=options.get("version"),
+            registry=options.get("registry"),
+            force=options["force"],
+            dry_run=True,
+        )
+    except SkillInstallError as error:
+        print_error(str(error))
+        return True
+
+    _print_skill_install_preview(preview, provider)
+    if options["dry_run"]:
+        print_success("Dry run complete. No files were written.")
+        return True
+
+    if not options["yes"]:
+        print_warn(f"Install this {_provider_title(provider)} skill?")
+        if not get_continue_confirmation():
+            print_warn("Skill installation cancelled.")
+            return True
+        if options["target"] == "app":
+            print_warn("App skills affect all workspaces that load the program skills directory.")
+            if not get_continue_confirmation():
+                print_warn("Skill installation cancelled.")
+                return True
+
+    try:
+        result = install_registry_skill(
+            provider,
+            slug,
+            target_dir,
+            target=options["target"],
+            version=options.get("version"),
+            registry=options.get("registry"),
+            force=options["force"],
+            dry_run=False,
+        )
+    except SkillInstallError as error:
+        print_error(str(error))
+        return True
+
+    chat.agent_tools.skill_registry.reload()
+    print_success(
+        f"Installed {provider}:{result.slug} to {result.install_dir} "
+        f"({len(result.files)} files). Skills reloaded."
+    )
+    _warn_if_installed_source_disabled(chat, options["target"])
+    return True
+
+
+def _parse_skill_ref(parts, index):
+    if len(parts) <= index:
+        raise SkillInstallError(
+            "Usage: /skills install clawhub:<slug>|skillhub:<owner>/<name> [--workspace|--app]"
+        )
+    source = parts[index].strip()
+    lowered = source.lower()
+    if lowered in {"clawhub", "skillhub"}:
+        if len(parts) <= index + 1:
+            raise SkillInstallError(f"Missing {_provider_title(lowered)} skill slug.")
+        return lowered, f"{lowered}:{parts[index + 1]}", parts[index + 2 :]
+    if lowered.startswith("clawhub:"):
+        return "clawhub", source, parts[index + 1 :]
+    if lowered.startswith("skillhub:"):
+        return "skillhub", source, parts[index + 1 :]
+    raise SkillInstallError("Only clawhub:<slug> and skillhub:<owner>/<name> refs are supported.")
+
+
+def _parse_skill_install_options(parts):
+    _, options = _split_skill_options(parts)
+    target = options.get("target") or "workspace"
+    if options.get("app"):
+        target = "app"
+    if options.get("workspace"):
+        target = "workspace"
+    if target not in {"app", "workspace"}:
+        raise SkillInstallError("--target must be app or workspace.")
+    return {
+        "target": target,
+        "version": options.get("version"),
+        "registry": options.get("registry"),
+        "dry_run": bool(options.get("dry-run") or options.get("dry_run")),
+        "force": bool(options.get("force")),
+        "yes": bool(options.get("yes") or options.get("y")),
+    }
+
+
+def _split_skill_options(parts):
+    values = []
+    options = {}
+    index = 0
+    while index < len(parts):
+        item = parts[index]
+        if not item.startswith("--"):
+            values.append(item)
+            index += 1
+            continue
+        key = item[2:].strip().lower().replace("_", "-")
+        if key in {"app", "workspace", "dry-run", "dry_run", "force", "yes", "y"}:
+            options[key] = True
+            index += 1
+            continue
+        if key in {"target", "version", "registry", "limit"}:
+            if index + 1 >= len(parts):
+                raise SkillInstallError(f"Missing value for --{key}.")
+            options[key] = parts[index + 1]
+            index += 2
+            continue
+        raise SkillInstallError(f"Unknown option: --{key}")
+    return values, options
+
+
+def _option_int(options, key, default, minimum, maximum):
+    value = options.get(key)
+    if value is None:
+        return default
+    try:
+        number = int(value)
+    except ValueError:
+        print_error(f"--{key} must be an integer.")
+        return None
+    if number < minimum or number > maximum:
+        print_error(f"--{key} must be between {minimum} and {maximum}.")
+        return None
+    return number
+
+
+def _skills_target_dir(chat, target):
+    registry = chat.agent_tools.skill_registry
+    if target == "app":
+        return registry.app_skills_dir
+    workspace_dir = registry.workspace_skills_dir
+    if workspace_dir is None:
+        raise SkillInstallError(
+            "No workspace directory is active. Use --app or start LLMChat with a workspace."
+        )
+    return workspace_dir
+
+
+def _print_skill_install_preview(result, provider):
+    lines = [
+        f"Ready to install {provider}:{result.slug}",
+        f"Target: {result.target}",
+        f"Install dir: {result.install_dir}",
+        f"Version: {result.version}",
+        f"Files: {len(result.files)}",
+    ]
+    if result.warnings:
+        lines.append("Warnings:\n  " + "\n  ".join(result.warnings))
+    print_info("\n".join(lines))
+
+
+def _warn_if_installed_source_disabled(chat, target):
+    skills = chat.get_agent_status().get("skills") or {}
+    sources = skills.get("sources") or {}
+    if not sources.get(target):
+        print_warn(
+            f"{target} skills source is currently off. Run /skills {target} on to load it."
+        )
+
+
+def _provider_title(provider):
+    return "SkillHub" if provider == "skillhub" else "ClawHub"
+
+
+def _local_skill_dir_name(provider, slug):
+    if provider == "skillhub":
+        return str(slug).rsplit("/", 1)[-1]
+    return str(slug)
 
 
 def handle_agent(chat, args):

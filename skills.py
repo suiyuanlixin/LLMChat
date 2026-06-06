@@ -39,6 +39,7 @@ class SkillRegistry:
         self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir else None
         self.max_chars = max(1000, int(max_chars or MAX_SKILL_CHARS))
         self._skills = None
+        self._ensure_enabled_workspace_skills_dir()
 
     @property
     def workspace_skills_dir(self):
@@ -67,6 +68,7 @@ class SkillRegistry:
             self.auto_catalog = bool(auto_catalog)
         if max_chars is not None:
             self.max_chars = max(1000, int(max_chars or MAX_SKILL_CHARS))
+        self._ensure_enabled_workspace_skills_dir()
         self.reload()
 
     def reload(self):
@@ -225,6 +227,11 @@ class SkillRegistry:
             workspace_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
+
+    def _ensure_enabled_workspace_skills_dir(self):
+        workspace_dir = self.workspace_skills_dir
+        if self.workspace_enabled and workspace_dir:
+            self._ensure_workspace_skills_dir(workspace_dir)
 
     def _source_summary(self):
         workspace_dir = self.workspace_skills_dir
