@@ -43,7 +43,14 @@ GIT_TIMEOUT_SECONDS = 30
 AGENT_APPROVAL_CONFIRM = "confirm"
 AGENT_APPROVAL_AUTO = "auto"
 
-SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
+SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+}
 
 TOOL_DEFINITIONS = [
     {
@@ -93,7 +100,15 @@ TOOL_DEFINITIONS = [
                             },
                             "priority": {
                                 "type": "string",
-                                "enum": ["p0", "p1", "p2", "p3", "high", "medium", "low"],
+                                "enum": [
+                                    "p0",
+                                    "p1",
+                                    "p2",
+                                    "p3",
+                                    "high",
+                                    "medium",
+                                    "low",
+                                ],
                                 "description": (
                                     "Task priority. p0 is urgent, p1 high, p2 normal, p3 low."
                                 ),
@@ -832,13 +847,14 @@ class AgentTools:
     def session_summary(self):
         parts = []
         if self.session_changed_files:
-            parts.append(
-                "Changed files: " + ", ".join(self.session_changed_files)
-            )
+            parts.append("Changed files: " + ", ".join(self.session_changed_files))
         if self.session_mutating_commands:
             parts.append(
                 "Mutating commands: "
-                + "; ".join(_truncate(command, 180) for command in self.session_mutating_commands)
+                + "; ".join(
+                    _truncate(command, 180)
+                    for command in self.session_mutating_commands
+                )
             )
         return "\n".join(parts)
 
@@ -855,17 +871,23 @@ class AgentTools:
 
         if self.session_changed_files:
             sections.append(
-                "Agent-edited files:\n" + "\n".join(f"- {path}" for path in self.session_changed_files)
+                "Agent-edited files:\n"
+                + "\n".join(f"- {path}" for path in self.session_changed_files)
             )
         if self.session_mutating_commands:
             sections.append(
                 "Agent mutating commands:\n"
-                + "\n".join(f"- {_truncate(command, 220)}" for command in self.session_mutating_commands)
+                + "\n".join(
+                    f"- {_truncate(command, 220)}"
+                    for command in self.session_mutating_commands
+                )
             )
 
         sections.append(
             f"git diff --check ({diff_scope}):\n"
-            + self._run_git_command(["diff", "--check"] + diff_path_args, "(no whitespace errors)")
+            + self._run_git_command(
+                ["diff", "--check"] + diff_path_args, "(no whitespace errors)"
+            )
         )
         sections.append(
             "git status --short:\n"
@@ -873,7 +895,9 @@ class AgentTools:
         )
         sections.append(
             f"git diff --stat ({diff_scope}):\n"
-            + self._run_git_command(["diff", "--stat"] + diff_path_args, "(no tracked diff)")
+            + self._run_git_command(
+                ["diff", "--stat"] + diff_path_args, "(no tracked diff)"
+            )
         )
         return "\n\n".join(sections)
 
@@ -929,7 +953,9 @@ class AgentTools:
     def _read_file(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
         if not file_path.is_file():
-            raise AgentToolError(f"File does not exist: {self._display_path(file_path)}")
+            raise AgentToolError(
+                f"File does not exist: {self._display_path(file_path)}"
+            )
 
         content = file_path.read_text(encoding="utf-8", errors="replace")
         lines = content.splitlines()
@@ -940,9 +966,13 @@ class AgentTools:
         start_line = _optional_positive_int(tool_input, "start_line") or 1
         end_line = _optional_positive_int(tool_input, "end_line") or total_lines
         if start_line > total_lines:
-            raise AgentToolError(f"start_line exceeds file length ({total_lines} lines).")
+            raise AgentToolError(
+                f"start_line exceeds file length ({total_lines} lines)."
+            )
         if end_line < start_line:
-            raise AgentToolError("end_line must be greater than or equal to start_line.")
+            raise AgentToolError(
+                "end_line must be greater than or equal to start_line."
+            )
         end_line = min(end_line, total_lines)
 
         line_numbers = _optional_bool(tool_input, "line_numbers", True)
@@ -989,7 +1019,9 @@ class AgentTools:
                 if len(entries) >= MAX_LIST_ENTRIES:
                     break
         else:
-            children = sorted(root.iterdir(), key=lambda path: (path.is_file(), path.name.lower()))
+            children = sorted(
+                root.iterdir(), key=lambda path: (path.is_file(), path.name.lower())
+            )
             for child in children:
                 if child.name in SKIP_DIRS:
                     continue
@@ -1001,13 +1033,19 @@ class AgentTools:
         if not entries:
             return f"Directory: {self._display_path(root)}\n(empty directory)"
         suffix = "\n[truncated]" if len(entries) >= MAX_LIST_ENTRIES else ""
-        return f"Directory: {self._display_path(root)}\n\n" + "\n".join(entries) + suffix
+        return (
+            f"Directory: {self._display_path(root)}\n\n" + "\n".join(entries) + suffix
+        )
 
     def _write_file(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
         content = _required_string(tool_input, "content", allow_empty=True)
         action = "overwrite" if file_path.exists() else "create"
-        old_content = file_path.read_text(encoding="utf-8", errors="replace") if file_path.exists() else ""
+        old_content = (
+            file_path.read_text(encoding="utf-8", errors="replace")
+            if file_path.exists()
+            else ""
+        )
         diff = _unified_diff_text(old_content, content, self._display_path(file_path))
 
         if not self._confirm_diff(
@@ -1030,7 +1068,9 @@ class AgentTools:
         replace_all = _optional_bool(tool_input, "replace_all", False)
 
         if not file_path.is_file():
-            raise AgentToolError(f"File does not exist: {self._display_path(file_path)}")
+            raise AgentToolError(
+                f"File does not exist: {self._display_path(file_path)}"
+            )
 
         content = file_path.read_text(encoding="utf-8", errors="replace")
         occurrences = content.count(old_string)
@@ -1055,7 +1095,9 @@ class AgentTools:
 
         file_path.write_text(updated, encoding="utf-8")
         self._record_changed_file(file_path)
-        return f"Edited {self._display_path(file_path)} ({replace_count} replacement(s))."
+        return (
+            f"Edited {self._display_path(file_path)} ({replace_count} replacement(s))."
+        )
 
     def _apply_patch(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
@@ -1064,19 +1106,29 @@ class AgentTools:
         new_content = _required_string(tool_input, "new_content", allow_empty=True)
 
         if not file_path.is_file():
-            raise AgentToolError(f"File does not exist: {self._display_path(file_path)}")
+            raise AgentToolError(
+                f"File does not exist: {self._display_path(file_path)}"
+            )
         if end_line < start_line:
-            raise AgentToolError("end_line must be greater than or equal to start_line.")
+            raise AgentToolError(
+                "end_line must be greater than or equal to start_line."
+            )
 
         content = file_path.read_text(encoding="utf-8", errors="replace")
         lines = content.splitlines()
         if start_line > len(lines) or end_line > len(lines):
-            raise AgentToolError(f"Line range exceeds file length ({len(lines)} lines).")
+            raise AgentToolError(
+                f"Line range exceeds file length ({len(lines)} lines)."
+            )
 
         old_lines = lines[start_line - 1 : end_line]
         new_lines = new_content.splitlines()
         old_display = _format_lines(old_lines, start_line, True)
-        new_display = _format_lines(new_lines, start_line, True) if new_lines else "(delete selected lines)"
+        new_display = (
+            _format_lines(new_lines, start_line, True)
+            if new_lines
+            else "(delete selected lines)"
+        )
         updated_lines = lines[: start_line - 1] + new_lines + lines[end_line:]
         newline = _detect_newline(content)
         updated = newline.join(updated_lines)
@@ -1094,14 +1146,18 @@ class AgentTools:
 
         file_path.write_text(updated, encoding="utf-8")
         self._record_changed_file(file_path)
-        return f"Patched {self._display_path(file_path)} (lines {start_line}-{end_line})."
+        return (
+            f"Patched {self._display_path(file_path)} (lines {start_line}-{end_line})."
+        )
 
     def _apply_unified_patch(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
         patch = _required_string(tool_input, "patch")
 
         if not file_path.is_file():
-            raise AgentToolError(f"File does not exist: {self._display_path(file_path)}")
+            raise AgentToolError(
+                f"File does not exist: {self._display_path(file_path)}"
+            )
 
         content = file_path.read_text(encoding="utf-8", errors="replace")
         updated = _apply_unified_diff_to_content(content, patch)
@@ -1152,16 +1208,26 @@ class AgentTools:
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as error:
-            if risk_level == "confirm" and risk_reason != "script or shell execution detected":
+            if (
+                risk_level == "confirm"
+                and risk_reason != "script or shell execution detected"
+            ):
                 self._record_mutating_command(command)
             return _timeout_result(command, error, COMMAND_TIMEOUT_SECONDS)
-        if risk_level == "confirm" and risk_reason != "script or shell execution detected":
+        if (
+            risk_level == "confirm"
+            and risk_reason != "script or shell execution detected"
+        ):
             self._record_mutating_command(command)
         output = completed.stdout or ""
         error_output = completed.stderr or ""
         combined = output
         if error_output:
-            combined = f"{combined}\n[stderr]\n{error_output}" if combined else f"[stderr]\n{error_output}"
+            combined = (
+                f"{combined}\n[stderr]\n{error_output}"
+                if combined
+                else f"[stderr]\n{error_output}"
+            )
         if not combined:
             combined = "(no output)"
         combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
@@ -1275,7 +1341,9 @@ class AgentTools:
         except re.error as error:
             raise AgentToolError(f"Invalid regex: {error}") from error
 
-        files = [search_path] if search_path.is_file() else self._iter_files(search_path)
+        files = (
+            [search_path] if search_path.is_file() else self._iter_files(search_path)
+        )
         matches = []
         for file_path in files:
             if len(matches) >= MAX_GREP_MATCHES:
@@ -1283,7 +1351,9 @@ class AgentTools:
             if not fnmatch.fnmatch(file_path.name, include):
                 continue
             try:
-                lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                lines = file_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
             except Exception:
                 continue
             for line_number, line in enumerate(lines, 1):
@@ -1302,7 +1372,9 @@ class AgentTools:
     def _glob(self, tool_input):
         pattern = _required_string(tool_input, "pattern")
         if _has_parent_reference(pattern):
-            raise AgentToolError("Glob pattern cannot contain parent directory references.")
+            raise AgentToolError(
+                "Glob pattern cannot contain parent directory references."
+            )
         if _looks_absolute(pattern):
             root = self._resolve_path(pattern)
             matches = [root] if root.exists() else []
@@ -1338,10 +1410,15 @@ class AgentTools:
         if not self.web_search_enabled:
             raise AgentToolError("Web search is disabled. Use /search on to enable it.")
         if self.web_search_provider != DEFAULT_WEB_SEARCH_PROVIDER:
-            raise AgentToolError(f"Unsupported web search provider: {self.web_search_provider}")
+            raise AgentToolError(
+                f"Unsupported web search provider: {self.web_search_provider}"
+            )
 
         query = _required_string(tool_input, "query")
-        max_results = _optional_positive_int(tool_input, "max_results") or self.web_search_max_results
+        max_results = (
+            _optional_positive_int(tool_input, "max_results")
+            or self.web_search_max_results
+        )
         search_depth = str(tool_input.get("search_depth") or self.web_search_depth)
         topic = str(tool_input.get("topic") or self.web_search_topic)
         time_range = str(tool_input.get("time_range") or "")
@@ -1433,7 +1510,11 @@ class AgentTools:
         error_output = completed.stderr or ""
         combined = output
         if error_output:
-            combined = f"{combined}\n[stderr]\n{error_output}" if combined else f"[stderr]\n{error_output}"
+            combined = (
+                f"{combined}\n[stderr]\n{error_output}"
+                if combined
+                else f"[stderr]\n{error_output}"
+            )
         if not combined:
             combined = empty_message
         combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
@@ -1441,7 +1522,9 @@ class AgentTools:
 
     def _validate_command_scope(self, command):
         if _has_parent_reference(command):
-            raise AgentToolError("Bash command cannot contain parent directory references.")
+            raise AgentToolError(
+                "Bash command cannot contain parent directory references."
+            )
         outside_paths = []
         for candidate in _absolute_path_candidates(command):
             try:
@@ -1455,7 +1538,9 @@ class AgentTools:
                 + ", ".join(outside_paths[:3])
             )
         if re.search(r"(?i)(\$env:|%[^%\s]+%|\$home|~)", command):
-            raise AgentToolError("Bash command cannot reference environment or home paths.")
+            raise AgentToolError(
+                "Bash command cannot reference environment or home paths."
+            )
 
     def _confirm_diff(self, title, file_path, diff_content, risk_reason):
         if self._auto_approves(risk_reason):
@@ -1557,14 +1642,16 @@ def normalize_workspace_dir(workspace_dir):
 def _plan_dir_for_workspace(workspace_dir):
     if workspace_dir is None:
         return None
-    return Path(workspace_dir) / ".llmchat" / "plans"
+    return Path(workspace_dir) / ".omniagent" / "plans"
 
 
 def _final_check_passed(check_result):
     text = str(check_result or "")
     diff_check = _section_after(text, "git diff --check")
     if diff_check:
-        exit_codes = [int(value) for value in re.findall(r"Exit code:\s*(-?\d+)", diff_check)]
+        exit_codes = [
+            int(value) for value in re.findall(r"Exit code:\s*(-?\d+)", diff_check)
+        ]
         if exit_codes and any(code != 0 for code in exit_codes):
             return False
     if re.search(r"(?m)^ERROR:", text):
@@ -1584,7 +1671,11 @@ def _final_verification_note(check_result, passed):
         stripped = line.strip()
         if not stripped:
             continue
-        if "Exit code:" in stripped or stripped.startswith("ERROR:") or "[stderr]" in stripped:
+        if (
+            "Exit code:" in stripped
+            or stripped.startswith("ERROR:")
+            or "[stderr]" in stripped
+        ):
             lines.append(stripped)
         elif lines and len(lines) < 4:
             lines.append(stripped)
@@ -1775,7 +1866,11 @@ def _timeout_result(command, error, timeout_seconds):
     error_output = _timeout_stream(error.stderr)
     combined = output
     if error_output:
-        combined = f"{combined}\n[stderr]\n{error_output}" if combined else f"[stderr]\n{error_output}"
+        combined = (
+            f"{combined}\n[stderr]\n{error_output}"
+            if combined
+            else f"[stderr]\n{error_output}"
+        )
     message = (
         f"Command timed out after {timeout_seconds} seconds: "
         f"{_truncate(str(command or ''), 240)}"
@@ -1818,7 +1913,11 @@ def _has_parent_reference(value):
 
 def _looks_absolute(value):
     text = str(value)
-    return bool(re.match(r"^[a-zA-Z]:[\\/]", text) or text.startswith("\\\\") or text.startswith("/"))
+    return bool(
+        re.match(r"^[a-zA-Z]:[\\/]", text)
+        or text.startswith("\\\\")
+        or text.startswith("/")
+    )
 
 
 def _absolute_path_candidates(command):
@@ -1881,11 +1980,13 @@ def _wait_for_local_port(process, port, timeout_seconds):
 def _request_http_status(url, timeout_seconds):
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "LLMChat-local-http-check"},
+        headers={"User-Agent": "OmniAgent-local-http-check"},
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(0.5, timeout_seconds)) as response:
+        with urllib.request.urlopen(
+            request, timeout=max(0.5, timeout_seconds)
+        ) as response:
             return int(response.status), ""
     except urllib.error.HTTPError as error:
         return int(error.code), str(error.reason or "")
@@ -1956,8 +2057,14 @@ def _command_risk(command):
     blocked_patterns = [
         (r"(^|\s)git\s+reset\s+--hard\b", "git reset --hard is blocked"),
         (r"(^|\s)git\s+clean\b", "git clean is blocked"),
-        (r"(^|\s)(format|shutdown|restart-computer|stop-computer)\b", "system-level command is blocked"),
-        (r"(^|\s)(invoke-expression|iex|set-executionpolicy)\b", "dynamic PowerShell execution is blocked"),
+        (
+            r"(^|\s)(format|shutdown|restart-computer|stop-computer)\b",
+            "system-level command is blocked",
+        ),
+        (
+            r"(^|\s)(invoke-expression|iex|set-executionpolicy)\b",
+            "dynamic PowerShell execution is blocked",
+        ),
         (
             r"(^|\s)(rm|del|erase|rmdir|rd|remove-item|ri)\b[^\n]*(?:-recurse|-r|-rf|-fr|/s)\b",
             "recursive delete command is blocked",
@@ -1973,7 +2080,10 @@ def _command_risk(command):
             r"(^|\s)(mv|move|cp|copy|xcopy|robocopy|move-item|copy-item)\b",
             "file move/copy command detected",
         ),
-        (r"(^|\s)(mkdir|md|new-item|ni|touch)\b", "directory/file creation command detected"),
+        (
+            r"(^|\s)(mkdir|md|new-item|ni|touch)\b",
+            "directory/file creation command detected",
+        ),
         (
             r"(^|\s)(set-content|add-content|out-file|tee|tee-object)\b",
             "file write command detected",
@@ -1981,8 +2091,14 @@ def _command_risk(command):
         (r"(^|\s)sed\s+(-i|--in-place)\b", "in-place file edit command detected"),
         (r">\s*[^&|]", "shell redirection detected"),
         (r">>\s*[^&|]", "shell append redirection detected"),
-        (r"(^|\s)git\s+(checkout|reset|clean|apply|am|merge|rebase|commit|add|rm|mv)\b", "mutating git command detected"),
-        (r"(^|\s)(npm|pnpm|yarn)\s+(install|add|remove|update)\b", "package manager mutation detected"),
+        (
+            r"(^|\s)git\s+(checkout|reset|clean|apply|am|merge|rebase|commit|add|rm|mv)\b",
+            "mutating git command detected",
+        ),
+        (
+            r"(^|\s)(npm|pnpm|yarn)\s+(install|add|remove|update)\b",
+            "package manager mutation detected",
+        ),
         (r"(^|\s)pip\s+install\b", "package installation detected"),
         (
             r"(^|\s)(python|python3|py|node|deno|ruby|perl|powershell|pwsh|cmd|bash|sh)\b",

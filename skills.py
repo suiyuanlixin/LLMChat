@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 APP_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
-WORKSPACE_SKILLS_RELATIVE_DIR = Path(".llmchat") / "skills"
+WORKSPACE_SKILLS_RELATIVE_DIR = Path(".omniagent") / "skills"
 MAX_SKILL_CHARS = 12000
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SKILL_SOURCES = {"app", "workspace"}
@@ -63,7 +63,9 @@ class SkillRegistry:
         if workspace_enabled is not None:
             self.workspace_enabled = bool(workspace_enabled)
         if workspace_dir is not None:
-            self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir else None
+            self.workspace_dir = (
+                Path(workspace_dir).resolve() if workspace_dir else None
+            )
         if auto_catalog is not None:
             self.auto_catalog = bool(auto_catalog)
         if max_chars is not None:
@@ -87,9 +89,7 @@ class SkillRegistry:
         ]
         for skill in skills:
             trigger_text = (
-                f" Triggers: {', '.join(skill.triggers)}."
-                if skill.triggers
-                else ""
+                f" Triggers: {', '.join(skill.triggers)}." if skill.triggers else ""
             )
             lines.append(
                 f"- {skill.key} [{skill.source}]: {skill.description}{trigger_text}"
@@ -105,7 +105,9 @@ class SkillRegistry:
             return "Skills are disabled."
         skills = self.list_skills()
         if not skills:
-            return "No skills found in enabled skill sources.\n" + self._source_summary()
+            return (
+                "No skills found in enabled skill sources.\n" + self._source_summary()
+            )
         return "\n".join(
             f"- {skill.key} [{skill.source}]: {skill.description}"
             + (f" (triggers: {', '.join(skill.triggers)})" if skill.triggers else "")
@@ -270,9 +272,7 @@ class SkillRegistry:
                     source=source,
                     description=description,
                     triggers=[
-                        str(item).strip()
-                        for item in triggers
-                        if str(item).strip()
+                        str(item).strip() for item in triggers if str(item).strip()
                     ],
                     path=entry.resolve(),
                 )
@@ -300,7 +300,9 @@ class SkillRegistry:
         try:
             candidate.relative_to(skill_dir)
         except ValueError as error:
-            raise ValueError(f"Skill file is outside the skill directory: {rel_path}") from error
+            raise ValueError(
+                f"Skill file is outside the skill directory: {rel_path}"
+            ) from error
         if not candidate.is_file():
             raise ValueError(f"Skill file does not exist: {rel_path}")
         return candidate

@@ -17,7 +17,7 @@ from ui import (
     clean_display_text,
 )
 from config import load_config
-from chat import LLMChat
+from chat import OmniAgent
 from commands import process_command
 from tools import MAX_READ_CHARS, normalize_workspace_dir
 
@@ -123,7 +123,9 @@ def _read_external_file_reference(path_text):
 
     truncated = content[:MAX_READ_CHARS]
     if len(content) > MAX_READ_CHARS:
-        truncated += f"\n\n[referenced file truncated after {MAX_READ_CHARS} characters]"
+        truncated += (
+            f"\n\n[referenced file truncated after {MAX_READ_CHARS} characters]"
+        )
     return path, truncated
 
 
@@ -146,13 +148,17 @@ def attach_external_file_references(user_input):
     return f"{user_input}\n\n" + "\n\n".join(blocks)
 
 
-def run_chat_loop(config, workspace_dir, workspace_error=None, agent_auto_disabled=False):
+def run_chat_loop(
+    config, workspace_dir, workspace_error=None, agent_auto_disabled=False
+):
     if workspace_error:
         print_error(workspace_error)
     if agent_auto_disabled:
-        print_warn("Agent mode requires a startup workspace directory and has been turned off.")
+        print_warn(
+            "Agent mode requires a startup workspace directory and has been turned off."
+        )
     try:
-        chat = LLMChat(
+        chat = OmniAgent(
             model=config.model,
             api_key=config.api_key,
             api_type=config.api_type,
@@ -213,8 +219,15 @@ def run_chat_loop(config, workspace_dir, workspace_error=None, agent_auto_disabl
                 print_error(str(error))
                 continue
 
-            response = chat.send_message(user_input, stream_print_thinking, stream_print_response)
-            handle_response(response, chat.model, chat.stream_mode and not chat.agent_mode, chat.thinking_mode)
+            response = chat.send_message(
+                user_input, stream_print_thinking, stream_print_response
+            )
+            handle_response(
+                response,
+                chat.model,
+                chat.stream_mode and not chat.agent_mode,
+                chat.thinking_mode,
+            )
             if response and not response.get("agent_stopped"):
                 chat.update_session_episodic_memory()
 

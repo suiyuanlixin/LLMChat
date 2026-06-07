@@ -69,12 +69,34 @@ TEXT_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
-SCRIPT_EXTENSIONS = {".bat", ".cmd", ".js", ".mjs", ".ps1", ".psm1", ".py", ".sh", ".ts"}
+SCRIPT_EXTENSIONS = {
+    ".bat",
+    ".cmd",
+    ".js",
+    ".mjs",
+    ".ps1",
+    ".psm1",
+    ".py",
+    ".sh",
+    ".ts",
+}
 SUSPICIOUS_PATTERNS = [
-    (re.compile(r"\b(?:process\.env|os\.environ|getenv)\b", re.I), "reads environment variables"),
-    (re.compile(r"\b(?:\.env|id_rsa|ssh[/\\]|appdata|credential|token)\b", re.I), "references local secrets or credentials"),
-    (re.compile(r"\b(?:curl|wget|invoke-webrequest|irm|fetch|requests\.)\b", re.I), "performs network requests"),
-    (re.compile(r"\b(?:eval|exec|invoke-expression|iex)\b", re.I), "uses dynamic code execution"),
+    (
+        re.compile(r"\b(?:process\.env|os\.environ|getenv)\b", re.I),
+        "reads environment variables",
+    ),
+    (
+        re.compile(r"\b(?:\.env|id_rsa|ssh[/\\]|appdata|credential|token)\b", re.I),
+        "references local secrets or credentials",
+    ),
+    (
+        re.compile(r"\b(?:curl|wget|invoke-webrequest|irm|fetch|requests\.)\b", re.I),
+        "performs network requests",
+    ),
+    (
+        re.compile(r"\b(?:eval|exec|invoke-expression|iex)\b", re.I),
+        "uses dynamic code execution",
+    ),
 ]
 
 
@@ -142,15 +164,13 @@ def registry_search(provider, query, limit=10, registry=None):
         owner = _field(item, "owner", "ownerHandle", "publisher", "author")
         description = _field(item, "description", "summary", "readmeSummary") or ""
         downloads = _field(item, "downloads", "installCount", "installs", "score")
-        rows.append(
-            {
-                "slug": str(slug),
-                "title": str(title),
-                "owner": str(owner or ""),
-                "description": _single_line(description, 180),
-                "downloads": downloads,
-            }
-        )
+        rows.append({
+            "slug": str(slug),
+            "title": str(title),
+            "owner": str(owner or ""),
+            "description": _single_line(description, 180),
+            "downloads": downloads,
+        })
     return rows
 
 
@@ -172,9 +192,15 @@ def registry_inspect(provider, slug, version=None, registry=None):
         _api_url(provider, registry, f"/api/v1/skills/{_url_path_slug(slug)}", params),
         provider,
     )
-    skill = data.get("skill") if isinstance(data, dict) and isinstance(data.get("skill"), dict) else data
+    skill = (
+        data.get("skill")
+        if isinstance(data, dict) and isinstance(data.get("skill"), dict)
+        else data
+    )
     if not isinstance(skill, dict):
-        raise SkillInstallError(f"Invalid {PROVIDERS[provider]['label']} response for {slug}.")
+        raise SkillInstallError(
+            f"Invalid {PROVIDERS[provider]['label']} response for {slug}."
+        )
 
     tag_or_version = str(version or "latest")
     skill_md = _fetch_skill_file(provider, slug, "SKILL.md", tag_or_version, registry)
@@ -183,7 +209,8 @@ def registry_inspect(provider, slug, version=None, registry=None):
         files.insert(0, "SKILL.md")
     return {
         "slug": slug,
-        "version": _field(skill, "version", "latestVersion", "latest_version") or tag_or_version,
+        "version": _field(skill, "version", "latestVersion", "latest_version")
+        or tag_or_version,
         "title": _field(skill, "displayName", "display_name", "title", "name") or slug,
         "owner": _field(skill, "owner", "ownerHandle", "publisher", "author") or "",
         "description": _field(skill, "description", "summary", "readmeSummary") or "",
@@ -277,7 +304,9 @@ def install_registry_skill(
         )
 
     skills_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir = Path(tempfile.mkdtemp(prefix=f".{local_name}.install-", dir=str(skills_dir)))
+    temp_dir = Path(
+        tempfile.mkdtemp(prefix=f".{local_name}.install-", dir=str(skills_dir))
+    )
     try:
         for rel_path, content in bundle["contents"].items():
             target_path = temp_dir / rel_path
@@ -345,7 +374,9 @@ def _http_json(url, provider):
             f"{_single_line(detail, 240)}"
         ) from error
     except (OSError, json.JSONDecodeError) as error:
-        raise SkillInstallError(f"{PROVIDERS[provider]['label']} request failed: {error}") from error
+        raise SkillInstallError(
+            f"{PROVIDERS[provider]['label']} request failed: {error}"
+        ) from error
 
 
 def _http_bytes(url, max_bytes, provider):
@@ -353,7 +384,9 @@ def _http_bytes(url, max_bytes, provider):
         with urllib.request.urlopen(_request(url, provider), timeout=30) as response:
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > max_bytes:
-                raise SkillInstallError(f"Download is too large ({content_length} bytes).")
+                raise SkillInstallError(
+                    f"Download is too large ({content_length} bytes)."
+                )
             data = response.read(max_bytes + 1)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace") if error.fp else ""
@@ -362,7 +395,9 @@ def _http_bytes(url, max_bytes, provider):
             f"{_single_line(detail, 240)}"
         ) from error
     except OSError as error:
-        raise SkillInstallError(f"{PROVIDERS[provider]['label']} download failed: {error}") from error
+        raise SkillInstallError(
+            f"{PROVIDERS[provider]['label']} download failed: {error}"
+        ) from error
     if len(data) > max_bytes:
         raise SkillInstallError(f"Download exceeds {max_bytes} bytes.")
     return data
@@ -370,7 +405,7 @@ def _http_bytes(url, max_bytes, provider):
 
 def _request(url, provider):
     provider = _normalize_provider(provider)
-    headers = {"User-Agent": "LLMChat-skill-installer"}
+    headers = {"User-Agent": "OmniAgent-skill-installer"}
     token = os.getenv(PROVIDERS[provider]["token_env"])
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -411,16 +446,23 @@ def _download_skill_archive(provider, slug, version, registry):
 
     urls = [
         _api_url(provider, registry, "/api/v1/download", params),
-        _api_url(provider, registry, f"/api/v1/download/{urllib.parse.quote(slug, safe='')}", None),
+        _api_url(
+            provider,
+            registry,
+            f"/api/v1/download/{urllib.parse.quote(slug, safe='')}",
+            None,
+        ),
         _api_url(provider, registry, f"/api/v1/download/{_url_path_slug(slug)}", None),
     ]
     if provider == "skillhub":
-        urls.extend(
-            [
-                _api_url(provider, registry, f"/skills/{_url_path_slug(slug)}/download", None),
-                _api_url(provider, registry, f"/api/skills/{_url_path_slug(slug)}/download", None),
-            ]
-        )
+        urls.extend([
+            _api_url(
+                provider, registry, f"/skills/{_url_path_slug(slug)}/download", None
+            ),
+            _api_url(
+                provider, registry, f"/api/skills/{_url_path_slug(slug)}/download", None
+            ),
+        ])
 
     errors = []
     for url in urls:
@@ -452,7 +494,9 @@ def _validated_skill_archive(data):
     try:
         archive = zipfile.ZipFile(BytesIO(data))
     except zipfile.BadZipFile as error:
-        raise SkillInstallError("Downloaded skill is not a valid zip archive.") from error
+        raise SkillInstallError(
+            "Downloaded skill is not a valid zip archive."
+        ) from error
 
     infos = [info for info in archive.infolist() if not info.is_dir()]
     if len(infos) > MAX_ARCHIVE_FILES:
@@ -490,7 +534,9 @@ def _validated_skill_archive(data):
         contents[key] = content
         files.append(key)
         if _is_text_file(out_rel):
-            texts[key] = content[:MAX_TEXT_PREVIEW_CHARS].decode("utf-8", errors="replace")
+            texts[key] = content[:MAX_TEXT_PREVIEW_CHARS].decode(
+                "utf-8", errors="replace"
+            )
 
     if "SKILL.md" not in contents:
         raise SkillInstallError("Skill archive root does not contain SKILL.md.")
@@ -520,7 +566,9 @@ def _validate_skill_file(path, info):
     if info.file_size > MAX_ARCHIVE_FILE_BYTES:
         raise SkillInstallError(f"Skill file is too large: {path}")
     if not _is_text_file(path):
-        raise SkillInstallError(f"Skill archive contains unsupported non-text file: {path}")
+        raise SkillInstallError(
+            f"Skill archive contains unsupported non-text file: {path}"
+        )
     mode = (info.external_attr >> 16) & 0o170000
     if mode == 0o120000:
         raise SkillInstallError(f"Skill archive contains a symlink: {path}")
@@ -534,7 +582,9 @@ def _is_text_file(path):
 
 def _security_warnings_from_texts(texts, files):
     warnings = []
-    script_files = [path for path in files if Path(path).suffix.lower() in SCRIPT_EXTENSIONS]
+    script_files = [
+        path for path in files if Path(path).suffix.lower() in SCRIPT_EXTENSIONS
+    ]
     if script_files:
         warnings.append("contains script files: " + ", ".join(script_files[:8]))
     for path, text in texts.items():
@@ -605,7 +655,9 @@ def _update_lock(
         "archive_sha256": archive_sha256,
         "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
-    lock_path.write_text(json.dumps(lock, indent=2, ensure_ascii=False), encoding="utf-8")
+    lock_path.write_text(
+        json.dumps(lock, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def _registry_value(provider, registry):
@@ -629,7 +681,9 @@ def _ensure_child(parent, child):
     try:
         child.relative_to(parent)
     except ValueError as error:
-        raise SkillInstallError(f"Install path is outside skills directory: {child}") from error
+        raise SkillInstallError(
+            f"Install path is outside skills directory: {child}"
+        ) from error
 
 
 def _extract_items(data):

@@ -1,7 +1,13 @@
 import json
 import shlex
 
-from ui import get_continue_confirmation, print_error, print_success, print_warn, print_info
+from ui import (
+    get_continue_confirmation,
+    print_error,
+    print_success,
+    print_warn,
+    print_info,
+)
 from config import (
     parse_agent_approval_mode,
     parse_agent_rounds,
@@ -30,7 +36,7 @@ from installer import (
 
 COMMANDS = {
     "/help": "Display a list of available commands and their descriptions.",
-    "/quit": "Exit the chat.",
+    "/quit": "Exit OmniAgent.",
     "/clear": "Clear the conversation history.",
     "/save": "Save the current conversation history to a JSON file.",
     "/load": "Load a previous conversation from JSON file.",
@@ -50,7 +56,7 @@ COMMANDS = {
 
 def show_help():
     command_list = "\n".join(f"{cmd:<8} {desc}" for cmd, desc in COMMANDS.items())
-    additional = "Ctrl+C   Force exit the chat."
+    additional = "Ctrl+C   Force exit OmniAgent."
     print_warn(f"All commands: \n{command_list}\n{additional}")
 
 
@@ -150,7 +156,9 @@ def _apply_config(chat, config):
 
         if config.agent_mode and not chat.get_agent_status().get("workspace_dir"):
             chat.set_agent_mode(False)
-            print_warn("Agent mode requires a startup workspace directory and has been turned off.")
+            print_warn(
+                "Agent mode requires a startup workspace directory and has been turned off."
+            )
         else:
             chat.set_agent_mode(config.agent_mode)
     except Exception as error:
@@ -581,7 +589,7 @@ def _print_search_status(chat):
         available = "missing key"
     print_info(
         f"Web search: {current} ({available}).\n"
-        "Scope: normal chat auto-search and agent web_search tool.\n"
+        "Scope: normal interaction auto-search and agent web_search tool.\n"
         f"Provider: {status.get('provider')}.\n"
         f"Max results: {status.get('max_results')}.\n"
         f"Depth: {status.get('search_depth')}.\n"
@@ -613,7 +621,9 @@ def handle_memory(chat, args):
             else {}
         )
         configured_model = memory_model_status.get("configured_model") or "None"
-        effective_model = memory_model_status.get("effective_model") or getattr(chat, "model", "")
+        effective_model = memory_model_status.get("effective_model") or getattr(
+            chat, "model", ""
+        )
         debug = "on" if memory_model_status.get("debug") else "off"
         print_info(
             "Persistent memory files:\n"
@@ -649,14 +659,18 @@ def handle_memory(chat, args):
         if not value:
             print_error("Usage: /memory date YYYY-MM-DD")
             return True
-        _print_memory_section(f"Episodic memory for {value}", store.episodic_for_date(value))
+        _print_memory_section(
+            f"Episodic memory for {value}", store.episodic_for_date(value)
+        )
         return True
 
     if action == "search":
         if not value:
             print_error("Usage: /memory search <query>")
             return True
-        _print_memory_section(f"Episodic memory search: {value}", store.search_episodic(value))
+        _print_memory_section(
+            f"Episodic memory search: {value}", store.search_episodic(value)
+        )
         return True
 
     if action == "history":
@@ -726,7 +740,9 @@ def _handle_preference_memory_command(store, value):
         result = store.set_preference_level(query, level)
         moved = result.get("moved") or []
         if moved:
-            print_success(f"Moved preference to {result.get('level')}:\n" + "\n".join(moved))
+            print_success(
+                f"Moved preference to {result.get('level')}:\n" + "\n".join(moved)
+            )
         else:
             print_info("No matching preference lines found, or the level was invalid.")
         return True
@@ -820,7 +836,7 @@ def handle_skills(chat, args):
         if enabled and not (status.get("directories") or {}).get("workspace"):
             message += " No workspace directory is active."
         elif enabled and (status.get("counts") or {}).get("workspace", 0) == 0:
-            message += " No workspace skills loaded; add .llmchat/skills/<name>/SKILL.md if needed."
+            message += " No workspace skills loaded; add .omniagent/skills/<name>/SKILL.md if needed."
         print_success(message)
         return True
 
@@ -892,7 +908,9 @@ def _handle_skills_search(parts):
     for item in results:
         owner = f" by {item['owner']}" if item.get("owner") else ""
         description = f" - {item['description']}" if item.get("description") else ""
-        lines.append(f"- {provider}:{item['slug']} ({item['title']}{owner}){description}")
+        lines.append(
+            f"- {provider}:{item['slug']} ({item['title']}{owner}){description}"
+        )
     print_info("\n".join(lines))
     return True
 
@@ -929,7 +947,9 @@ def _handle_skills_inspect(chat, parts):
         lines.append(f"Homepage: {homepage}")
     if files:
         shown = files[:20]
-        suffix = f"\n  ... {len(files) - len(shown)} more" if len(files) > len(shown) else ""
+        suffix = (
+            f"\n  ... {len(files) - len(shown)} more" if len(files) > len(shown) else ""
+        )
         lines.append("Files:\n  " + "\n  ".join(shown) + suffix)
     if warnings:
         lines.append("Warnings:\n  " + "\n  ".join(warnings))
@@ -967,7 +987,9 @@ def _handle_skills_install(chat, parts):
             print_warn("Skill installation cancelled.")
             return True
         if options["target"] == "app":
-            print_warn("App skills affect all workspaces that load the program skills directory.")
+            print_warn(
+                "App skills affect all workspaces that load the program skills directory."
+            )
             if not get_continue_confirmation():
                 print_warn("Skill installation cancelled.")
                 return True
@@ -1011,7 +1033,9 @@ def _parse_skill_ref(parts, index):
         return "clawhub", source, parts[index + 1 :]
     if lowered.startswith("skillhub:"):
         return "skillhub", source, parts[index + 1 :]
-    raise SkillInstallError("Only clawhub:<slug> and skillhub:<owner>/<name> refs are supported.")
+    raise SkillInstallError(
+        "Only clawhub:<slug> and skillhub:<owner>/<name> refs are supported."
+    )
 
 
 def _parse_skill_install_options(parts):
@@ -1080,7 +1104,7 @@ def _skills_target_dir(chat, target):
     workspace_dir = registry.workspace_skills_dir
     if workspace_dir is None:
         raise SkillInstallError(
-            "No workspace directory is active. Use --app or start LLMChat with a workspace."
+            "No workspace directory is active. Use --app or start OmniAgent with a workspace."
         )
     return workspace_dir
 
@@ -1123,7 +1147,9 @@ def handle_agent(chat, args):
     if args is None:
         current = "on" if status["enabled"] else "off"
         running = "running" if status.get("running") else "idle"
-        budget = f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
+        budget = (
+            f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
+        )
         approval = status.get("approval_mode", "confirm")
         show_thinking = status.get("show_thinking", "summary")
         summary_model = status.get("summary_model") or "local"
@@ -1149,7 +1175,9 @@ def handle_agent(chat, args):
     if mode == "on" and len(parts) == 1:
         if not status["workspace_dir"]:
             chat.set_agent_mode(False)
-            print_error("Agent mode requires a startup workspace directory. Example: python main.py <workspace>")
+            print_error(
+                "Agent mode requires a startup workspace directory. Example: python main.py <workspace>"
+            )
             return True
         chat.set_agent_mode(True)
         save_config_field("agent_mode", True)
@@ -1182,13 +1210,13 @@ def handle_agent(chat, args):
             return True
 
         chat.set_agent_limits(max_rounds, max_tool_calls)
-        save_config_fields(
-            {
-                "max_agent_rounds": max_rounds,
-                "max_agent_tool_calls": max_tool_calls,
-            }
+        save_config_fields({
+            "max_agent_rounds": max_rounds,
+            "max_agent_tool_calls": max_tool_calls,
+        })
+        print_success(
+            f"Agent budget set to {max_rounds} rounds / {max_tool_calls} tool calls."
         )
-        print_success(f"Agent budget set to {max_rounds} rounds / {max_tool_calls} tool calls.")
     elif mode in {"approve", "approval"}:
         if len(parts) == 1:
             print_info(

@@ -243,10 +243,14 @@ def _build_diff_background_table(content, width=None):
             old_line = int(hunk_match.group(1))
             new_line = int(hunk_match.group(3))
             rendered_line = _diff_numbered_line(line, None, number_width)
-        elif line.startswith("+") and not line.startswith("+++") and new_line is not None:
+        elif (
+            line.startswith("+") and not line.startswith("+++") and new_line is not None
+        ):
             rendered_line = _diff_numbered_line(line, new_line, number_width)
             new_line += 1
-        elif line.startswith("-") and not line.startswith("---") and old_line is not None:
+        elif (
+            line.startswith("-") and not line.startswith("---") and old_line is not None
+        ):
             rendered_line = _diff_numbered_line(line, old_line, number_width)
             old_line += 1
         elif line.startswith(" ") and old_line is not None and new_line is not None:
@@ -529,9 +533,7 @@ def _get_last_record_text(line_number):
     if not os.path.exists(record_dir):
         files = []
     else:
-        files = sorted(
-            [f for f in os.listdir(record_dir) if f.endswith(".json")]
-        )
+        files = sorted([f for f in os.listdir(record_dir) if f.endswith(".json")])
 
     if not files:
         if line_number == 1:
@@ -569,9 +571,7 @@ def _get_last_record_text(line_number):
     model = ""
     msg_count = ""
     try:
-        with open(
-            os.path.join(record_dir, filename), "r", encoding="utf-8"
-        ) as f:
+        with open(os.path.join(record_dir, filename), "r", encoding="utf-8") as f:
             data = json.load(f)
         version = data.get("version", "")
         model = data.get("model", "").upper()
@@ -598,7 +598,7 @@ def show_dashboard(model_name, workspace_dir=None):
     if not _is_dashboard_capture():
         console.print()
     title = Text.assemble(
-        gradient_text("LLM Chat", *INFO_TEXT_COLOR),
+        gradient_text("OmniAgent", *INFO_TEXT_COLOR),
         gradient_text(f" v{VERSION}", *TEXT_COLOR),
     )
     billing_text = f"{model_name.upper() + ' · API Usage Billing':^37}"
@@ -1022,7 +1022,7 @@ def _todo_panel_renderable(todos, width, max_lines):
         if index < len(lines) - 1:
             body_parts.append("\n")
 
-    title = Text.assemble(gradient_text("Todo List", *INFO_TEXT_COLOR))
+    title = Text.assemble(gradient_text("TodoList", *INFO_TEXT_COLOR))
     return Panel(
         Text.assemble(*body_parts),
         padding=0,
@@ -1044,13 +1044,10 @@ class _TUIPlaceholderProcessor(Processor):
         self.session = session
 
     def apply_transformation(self, transformation_input):
-        if (
-            transformation_input.lineno == 0
-            and not self.session.input_area.text
-        ):
-            return Transformation(
-                [("class:input.placeholder", BOTTOM_INPUT_PLACEHOLDER)]
-            )
+        if transformation_input.lineno == 0 and not self.session.input_area.text:
+            return Transformation([
+                ("class:input.placeholder", BOTTOM_INPUT_PLACEHOLDER)
+            ])
         return Transformation(transformation_input.fragments)
 
 
@@ -1074,7 +1071,7 @@ def _patch_windows_output_full_width(output):
         return
 
     target = getattr(output, "win32_output", output)
-    if getattr(target, "_llmchat_full_width_patched", False):
+    if getattr(target, "_omniagent_full_width_patched", False):
         return
     if not hasattr(target, "get_win32_screen_buffer_info"):
         return
@@ -1095,7 +1092,7 @@ def _patch_windows_output_full_width(output):
             return original_get_size()
 
     target.get_size = get_size_full_width
-    target._llmchat_full_width_patched = True
+    target._omniagent_full_width_patched = True
 
 
 class ChatTUISession:
@@ -1196,34 +1193,30 @@ class ChatTUISession:
             height=1,
             always_hide_cursor=True,
         )
-        self.root = HSplit(
-            [
-                self.dashboard_window,
-                self.message_window,
-                self.todo_container,
-                self.input_top_border,
-                self.input_area,
-                self.input_bottom_border,
-            ]
-        )
+        self.root = HSplit([
+            self.dashboard_window,
+            self.message_window,
+            self.todo_container,
+            self.input_top_border,
+            self.input_area,
+            self.input_bottom_border,
+        ])
         self.layout = Layout(self.root, focused_element=self.input_area)
         self.app = Application(
             layout=self.layout,
             key_bindings=self._key_bindings(),
             full_screen=True,
-            mouse_support=False,
+            mouse_support=Condition(self._mouse_support_enabled),
             color_depth=ColorDepth.TRUE_COLOR,
             input=app_input,
             output=app_output,
             max_render_postpone_time=0,
-            style=Style.from_dict(
-                {
-                    "input": f"bold {STREAM_RESPONSE_COLOR}",
-                    "input.border": f"bold {STREAM_RESPONSE_COLOR}",
-                    "input.placeholder": f"bold {STREAM_THINK_COLOR}",
-                    "text-area": f"bold {STREAM_RESPONSE_COLOR}",
-                }
-            ),
+            style=Style.from_dict({
+                "input": f"bold {STREAM_RESPONSE_COLOR}",
+                "input.border": f"bold {STREAM_RESPONSE_COLOR}",
+                "input.placeholder": f"bold {STREAM_THINK_COLOR}",
+                "text-area": f"bold {STREAM_RESPONSE_COLOR}",
+            }),
         )
         _patch_windows_output_full_width(self.app.output)
 
@@ -1236,7 +1229,6 @@ class ChatTUISession:
 
     def run(self, worker):
         def start_worker():
-            self._disable_terminal_mouse_support_now()
             self._start_resize_watcher()
             worker_thread = threading.Thread(
                 target=self._run_worker,
@@ -1380,15 +1372,13 @@ class ChatTUISession:
             content = str(todo.get("content") or "").strip()
             if not content:
                 continue
-            normalized.append(
-                {
-                    "content": content,
-                    "status": str(todo.get("status") or "pending").strip().lower(),
-                    "priority": str(todo.get("priority") or "").strip().lower(),
-                    "depends_on": _todo_string_list(todo.get("depends_on")),
-                    "reason": str(todo.get("reason") or "").strip(),
-                }
-            )
+            normalized.append({
+                "content": content,
+                "status": str(todo.get("status") or "pending").strip().lower(),
+                "priority": str(todo.get("priority") or "").strip().lower(),
+                "depends_on": _todo_string_list(todo.get("depends_on")),
+                "reason": str(todo.get("reason") or "").strip(),
+            })
         with self.lock:
             self.todo_items = normalized
             self.todo_cache_key = None
@@ -1492,7 +1482,8 @@ class ChatTUISession:
             pass
 
     def _mouse_support_enabled(self):
-        return False
+        with self.lock:
+            return not self.terminal_select_mode
 
     def _toggle_terminal_select_mode(self):
         with self.lock:
@@ -1546,9 +1537,7 @@ class ChatTUISession:
             if (
                 self.input_enabled
                 and os.name == "nt"
-                and (
-                    _key_down(VK_SHIFT) != _key_down(VK_CONTROL)
-                )
+                and (_key_down(VK_SHIFT) != _key_down(VK_CONTROL))
             ):
                 event.current_buffer.insert_text("\n")
                 return
@@ -1681,11 +1670,15 @@ class ChatTUISession:
             self.message_blocks_have_dynamic = any(
                 block and block[0] == "diff" for block in self.message_blocks
             )
-            self.message_blocks_width = width if self.message_blocks_have_dynamic else None
+            self.message_blocks_width = (
+                width if self.message_blocks_have_dynamic else None
+            )
             self.messages_ansi = self._render_message_blocks_locked(width)
             self.messages_plain = _strip_ansi(self.messages_ansi)
             self.message_plain_newline_count = self.messages_plain.count("\n")
-            self.message_fragments = list(to_formatted_text(PromptANSI(self.messages_ansi)))
+            self.message_fragments = list(
+                to_formatted_text(PromptANSI(self.messages_ansi))
+            )
             self._mark_message_render_lines_dirty_locked()
             self._trim_messages()
             self._clamp_message_scroll_offset_locked()
@@ -1727,9 +1720,9 @@ class ChatTUISession:
         with self.lock:
             self._ensure_message_render_cache_locked(width)
             fragments = list(self.message_fragments) or [("", "")]
-            self.message_content_line_lengths = (
-                list(self.message_render_line_lengths) or [0]
-            )
+            self.message_content_line_lengths = list(
+                self.message_render_line_lengths
+            ) or [0]
         return fragments or [("", "")]
 
     def _message_cursor_position(self):
@@ -1794,7 +1787,9 @@ class ChatTUISession:
         render_info = getattr(self.message_window, "render_info", None)
         if render_info is not None:
             return max(1, int(render_info.window_height) - TUI_PAGE_SCROLL_MARGIN)
-        return max(1, self._rows() - self._dashboard_height() - self._input_height() - 2)
+        return max(
+            1, self._rows() - self._dashboard_height() - self._input_height() - 2
+        )
 
     def _message_max_scroll_offset_locked(self):
         return max(0, self.message_plain_newline_count)
@@ -1810,10 +1805,7 @@ class ChatTUISession:
 
     def _ensure_message_render_cache_locked(self, width=None):
         width = max(1, int(width or self._columns()))
-        if (
-            self.message_blocks_have_dynamic
-            and self.message_blocks_width != width
-        ):
+        if self.message_blocks_have_dynamic and self.message_blocks_width != width:
             self._rebuild_message_cache(width)
         self._refresh_message_render_lines_if_needed_locked(
             self.message_fragments or [("", "")]
@@ -1856,7 +1848,10 @@ class ChatTUISession:
         return max(1, len(plain.splitlines()) or 1)
 
     def _todo_max_lines(self):
-        return max(1, min(8, self._rows() - self._dashboard_height() - self._input_height() - 6))
+        return max(
+            1,
+            min(8, self._rows() - self._dashboard_height() - self._input_height() - 6),
+        )
 
     def _todo_text(self):
         width = self._columns()
@@ -2041,9 +2036,7 @@ def _enable_ansi_input_rendering():
         return
 
     enable_virtual_terminal_processing = 0x0004
-    KERNEL32.SetConsoleMode(
-        STDOUT, mode.value | enable_virtual_terminal_processing
-    )
+    KERNEL32.SetConsoleMode(STDOUT, mode.value | enable_virtual_terminal_processing)
 
 
 def _bottom_terminal_size():
@@ -2676,7 +2669,6 @@ def _read_terminal_confirmation_key():
 
 
 def get_agent_plan_confirmation(todos, next_tool=""):
-    snapshot = _tui_session.snapshot_messages() if _tui_session is not None else None
     size = shutil.get_terminal_size(fallback=(80, 24))
     width = max(40, size.columns)
     normalized_todos = []
@@ -2686,16 +2678,16 @@ def get_agent_plan_confirmation(todos, next_tool=""):
         content = str(todo.get("content") or "").strip()
         if not content:
             continue
-        normalized_todos.append(
-            {
-                "content": content,
-                "status": str(todo.get("status") or "pending").strip().lower(),
-                "priority": str(todo.get("priority") or "").strip().lower(),
-                "depends_on": _todo_string_list(todo.get("depends_on")),
-                "reason": str(todo.get("reason") or "").strip(),
-            }
-        )
+        normalized_todos.append({
+            "content": content,
+            "status": str(todo.get("status") or "pending").strip().lower(),
+            "priority": str(todo.get("priority") or "").strip().lower(),
+            "depends_on": _todo_string_list(todo.get("depends_on")),
+            "reason": str(todo.get("reason") or "").strip(),
+        })
 
+    snapshot = None
+    approved = None
     try:
         console.print(
             Text.assemble(
@@ -2712,6 +2704,11 @@ def get_agent_plan_confirmation(todos, next_tool=""):
                 ),
                 end="",
             )
+        snapshot = (
+            _tui_session.snapshot_messages()
+            if _tui_session is not None and normalized_todos
+            else None
+        )
         if normalized_todos:
             console.print(
                 _todo_panel_renderable(
@@ -2724,6 +2721,11 @@ def get_agent_plan_confirmation(todos, next_tool=""):
     finally:
         if _tui_session is not None and snapshot is not None:
             _tui_session.restore_messages(snapshot)
+            if approved is not None:
+                _tui_session._render_confirmation_line(
+                    selected=approved,
+                    confirmed=True,
+                )
     return approved
 
 
@@ -2742,7 +2744,9 @@ def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content
     return get_continue_confirmation()
 
 
-def get_agent_patch_confirmation(file_path, start_line, end_line, old_content, new_content):
+def get_agent_patch_confirmation(
+    file_path, start_line, end_line, old_content, new_content
+):
     console.print(
         Text.assemble(
             "\n",

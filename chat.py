@@ -80,13 +80,13 @@ AGENT_SUMMARY_SYSTEM_PROMPT = (
 
 
 NORMAL_SYSTEM_PROMPT = (
-    "You are the built-in assistant for the LLMChat project, a terminal LLM "
-    "chat client. Help the user discuss, understand, configure, and improve "
+    "You are the built-in assistant for the OmniAgent project, a terminal LLM "
+    "agent workbench. Help the user discuss, understand, configure, and improve "
     "this project."
 )
 
 
-AGENT_PROJECT_PROMPT = """You are the built-in local file-editing agent for the LLMChat project, a terminal LLM chat client. Help the user inspect and modify this project safely."""
+AGENT_PROJECT_PROMPT = """You are the built-in local file-editing agent for the OmniAgent project, a terminal LLM agent workbench. Help the user inspect and modify this project safely."""
 
 
 AGENT_SYSTEM_PROMPT = f"""{AGENT_PROJECT_PROMPT}
@@ -187,7 +187,7 @@ def _with_persistent_memory(base_prompt, memory_store):
     return f"{base_prompt}\n\n{memory_block}"
 
 
-class LLMChat:
+class OmniAgent:
     def __init__(
         self,
         model,
@@ -339,7 +339,9 @@ class LLMChat:
             try:
                 import anthropic
             except ImportError as error:
-                raise RuntimeError("Anthropic SDK is not installed. Run: pip install anthropic") from error
+                raise RuntimeError(
+                    "Anthropic SDK is not installed. Run: pip install anthropic"
+                ) from error
 
             kwargs = {"api_key": api_key}
             if base_url:
@@ -350,7 +352,9 @@ class LLMChat:
             try:
                 from openai import OpenAI
             except ImportError as error:
-                raise RuntimeError("OpenAI SDK is not installed. Run: pip install openai") from error
+                raise RuntimeError(
+                    "OpenAI SDK is not installed. Run: pip install openai"
+                ) from error
 
             kwargs = {"api_key": api_key}
             if base_url:
@@ -361,7 +365,9 @@ class LLMChat:
             try:
                 from ollama import Client
             except ImportError as error:
-                raise RuntimeError("Ollama SDK is not installed. Run: pip install ollama") from error
+                raise RuntimeError(
+                    "Ollama SDK is not installed. Run: pip install ollama"
+                ) from error
 
             kwargs = {}
             if base_url:
@@ -373,7 +379,9 @@ class LLMChat:
         try:
             from zai import ZhipuAiClient
         except ImportError as error:
-            raise RuntimeError("ZhipuAI SDK is not installed. Run: pip install zai-sdk") from error
+            raise RuntimeError(
+                "ZhipuAI SDK is not installed. Run: pip install zai-sdk"
+            ) from error
 
         return ZhipuAiClient(api_key=api_key)
 
@@ -473,7 +481,9 @@ class LLMChat:
         if trigger_ratio is not None:
             ratio = float(trigger_ratio)
             if ratio <= 0 or ratio > 1:
-                raise ValueError("Auto compact trigger ratio must be greater than 0 and at most 1.")
+                raise ValueError(
+                    "Auto compact trigger ratio must be greater than 0 and at most 1."
+                )
             self.compaction_trigger_ratio = ratio
 
     def set_memory_model(self, model):
@@ -512,7 +522,9 @@ class LLMChat:
     def get_agent_status(self):
         return {
             "enabled": self.agent_mode,
-            "workspace_dir": str(self.agent_tools.workspace_dir) if self.agent_tools.enabled else None,
+            "workspace_dir": str(self.agent_tools.workspace_dir)
+            if self.agent_tools.enabled
+            else None,
             "running": self.agent_running,
             "max_rounds": self.max_agent_rounds,
             "max_tool_calls": self.max_agent_tool_calls,
@@ -559,7 +571,9 @@ class LLMChat:
     def get_todo_history(self, limit=20):
         return self.agent_tools.todo_history(limit)
 
-    def send_message(self, user_message, stream_callback_thinking=None, stream_callback_response=None):
+    def send_message(
+        self, user_message, stream_callback_thinking=None, stream_callback_response=None
+    ):
         original_history = self._history_snapshot()
         self.conversation_history.append({"role": "user", "content": user_message})
         self._record_preference_signal(user_message)
@@ -580,7 +594,9 @@ class LLMChat:
                     stream_callback_response,
                 )
             elif self.stream_mode:
-                response = self._stream_response(stream_callback_thinking, stream_callback_response, self.model)
+                response = self._stream_response(
+                    stream_callback_thinking, stream_callback_response, self.model
+                )
             elif self.api_type == API_TYPE_ANTHROPIC:
                 response = self.client.messages.create(
                     model=self.model,
@@ -619,7 +635,11 @@ class LLMChat:
                 self._restore_history(original_history)
                 self._separate_after_agent_thinking()
                 self._print_agent_stopped_by_user()
-                return {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
+                return {
+                    "thinking": "",
+                    "response": "Agent stopped by user.",
+                    "agent_stopped": True,
+                }
             raise
         except Exception as error:
             self._restore_history(original_history)
@@ -656,9 +676,11 @@ class LLMChat:
         except KeyboardInterrupt:
             self.agent_stop_requested = True
             self._print_agent_stopped_by_user()
-            return self._finalize_agent_response(
-                {"thinking": "", "response": "Agent stopped by user.", "agent_stopped": True}
-            )
+            return self._finalize_agent_response({
+                "thinking": "",
+                "response": "Agent stopped by user.",
+                "agent_stopped": True,
+            })
         finally:
             self.agent_running = False
 
@@ -669,7 +691,8 @@ class LLMChat:
             response["thinking_streamed"] = self.agent_thinking_streamed
             response["response_streamed"] = self.agent_response_streamed
             response["thinking_needs_separator"] = (
-                self.agent_thinking_needs_separator and not response.get("agent_stopped")
+                self.agent_thinking_needs_separator
+                and not response.get("agent_stopped")
             )
             return response
         if response and self.agent_thinking_streamed:
@@ -678,7 +701,8 @@ class LLMChat:
             response["thinking_streamed"] = True
             response["response_streamed"] = self.agent_response_streamed
             response["thinking_needs_separator"] = (
-                self.agent_thinking_needs_separator and not response.get("agent_stopped")
+                self.agent_thinking_needs_separator
+                and not response.get("agent_stopped")
             )
         elif response:
             response = dict(response)
@@ -710,23 +734,24 @@ class LLMChat:
 
             if self._agent_tool_budget_exceeded(len(tool_uses)):
                 message = self._agent_tool_budget_message()
-                self.conversation_history.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use.get("id", ""),
-                                "content": _error_text(message),
-                                "is_error": True,
-                            }
-                            for tool_use in tool_uses
-                        ],
-                    }
-                )
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.get("id", ""),
+                            "content": _error_text(message),
+                            "is_error": True,
+                        }
+                        for tool_use in tool_uses
+                    ],
+                })
                 self._separate_after_agent_thinking()
                 print_error(message)
-                return {"thinking": full_thinking, "response": final_response or message}
+                return {
+                    "thinking": full_thinking,
+                    "response": final_response or message,
+                }
 
             tool_results = []
             for tool_use in tool_uses:
@@ -736,14 +761,12 @@ class LLMChat:
                     tool_use.get("name", ""),
                     tool_use.get("input", {}),
                 )
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.get("id", ""),
-                        "content": tool_result,
-                        "is_error": tool_result.startswith("ERROR:"),
-                    }
-                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.get("id", ""),
+                    "content": tool_result,
+                    "is_error": tool_result.startswith("ERROR:"),
+                })
             self.conversation_history.append({"role": "user", "content": tool_results})
 
         message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
@@ -769,7 +792,9 @@ class LLMChat:
             self._record_context_usage(response)
 
             message = response.choices[0].message
-            assistant_message, thinking_content, text, tool_calls = self._chat_message_parts(message)
+            assistant_message, thinking_content, text, tool_calls = (
+                self._chat_message_parts(message)
+            )
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             self._show_agent_thinking(thinking_content)
@@ -794,12 +819,17 @@ class LLMChat:
                     )
                 self._separate_after_agent_thinking()
                 print_error(message)
-                return {"thinking": full_thinking, "response": final_response or message}
+                return {
+                    "thinking": full_thinking,
+                    "response": final_response or message,
+                }
 
             for tool_call in tool_calls:
                 if self._agent_should_stop():
                     return self._agent_stopped_response(full_thinking, final_response)
-                tool_result = self._execute_agent_tool(tool_call["name"], tool_call["arguments"])
+                tool_result = self._execute_agent_tool(
+                    tool_call["name"], tool_call["arguments"]
+                )
                 self.conversation_history.append(
                     self._chat_tool_result_message(
                         tool_call["id"],
@@ -856,7 +886,9 @@ class LLMChat:
             )
             self._record_context_usage(response)
             message = response.choices[0].message
-            assistant_message, thinking_content, text, tool_calls = self._chat_message_parts(message)
+            assistant_message, thinking_content, text, tool_calls = (
+                self._chat_message_parts(message)
+            )
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             final_response += text
@@ -901,7 +933,9 @@ class LLMChat:
             )
             self._record_context_usage(response)
             message = self._get_field(response, "message", {})
-            assistant_message, thinking_content, text, tool_calls = self._ollama_message_parts(message)
+            assistant_message, thinking_content, text, tool_calls = (
+                self._ollama_message_parts(message)
+            )
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             final_response += text
@@ -948,7 +982,9 @@ class LLMChat:
                 **self._anthropic_request_options(),
             )
             self._record_context_usage(response)
-            blocks = self._anthropic_content_blocks(self._get_field(response, "content", []))
+            blocks = self._anthropic_content_blocks(
+                self._get_field(response, "content", [])
+            )
             self.conversation_history.append({"role": "assistant", "content": blocks})
             thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
             full_thinking += thinking
@@ -968,14 +1004,12 @@ class LLMChat:
                     tool_use.get("name", ""),
                     tool_use.get("input", {}),
                 )
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.get("id", ""),
-                        "content": tool_result,
-                        "is_error": tool_result.startswith("ERROR:"),
-                    }
-                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.get("id", ""),
+                    "content": tool_result,
+                    "is_error": tool_result.startswith("ERROR:"),
+                })
             self.conversation_history.append({"role": "user", "content": tool_results})
 
         return self._normal_web_search_round_limit_response(
@@ -993,7 +1027,9 @@ class LLMChat:
             )
             if provider == "ollama":
                 self.conversation_history.append(
-                    self._ollama_tool_result_message(tool_call.get("name", ""), tool_result)
+                    self._ollama_tool_result_message(
+                        tool_call.get("name", ""), tool_result
+                    )
                 )
             else:
                 self.conversation_history.append(
@@ -1152,12 +1188,20 @@ class LLMChat:
             self._record_context_usage(None)
 
         full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
-        assistant_message = self._chat_stream_assistant_message(full_response, full_thinking)
+        assistant_message = self._chat_stream_assistant_message(
+            full_response, full_thinking
+        )
         assistant_tool_calls, tool_calls = self._chat_stream_tool_calls(tool_call_parts)
         if assistant_tool_calls:
             assistant_message["tool_calls"] = assistant_tool_calls
 
-        return assistant_message, full_thinking, full_response, tool_calls, response_started
+        return (
+            assistant_message,
+            full_thinking,
+            full_response,
+            tool_calls,
+            response_started,
+        )
 
     def _update_chat_stream_tool_call_parts(self, tool_call_parts, tool_call_deltas):
         for fallback_index, call in enumerate(tool_call_deltas or []):
@@ -1207,23 +1251,19 @@ class LLMChat:
             arguments = part.get("arguments", "")
             name = part.get("name", "")
             call_id = part.get("id", "")
-            assistant_tool_calls.append(
-                {
-                    "id": call_id,
-                    "type": part.get("type") or "function",
-                    "function": {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                }
-            )
-            tool_calls.append(
-                {
-                    "id": call_id,
+            assistant_tool_calls.append({
+                "id": call_id,
+                "type": part.get("type") or "function",
+                "function": {
                     "name": name,
-                    "arguments": self._parse_tool_arguments(arguments),
-                }
-            )
+                    "arguments": arguments,
+                },
+            })
+            tool_calls.append({
+                "id": call_id,
+                "name": name,
+                "arguments": self._parse_tool_arguments(arguments),
+            })
         return assistant_tool_calls, tool_calls
 
     def _stream_ollama_normal_web_search_response(
@@ -1264,7 +1304,9 @@ class LLMChat:
                     )
 
                 self.conversation_history.append(assistant_message)
-                self._append_normal_web_search_tool_results(tool_calls, provider="ollama")
+                self._append_normal_web_search_tool_results(
+                    tool_calls, provider="ollama"
+                )
 
             return self._stream_normal_web_search_round_limit_response(
                 _clean_reasoning_text(full_thinking),
@@ -1346,14 +1388,22 @@ class LLMChat:
         else:
             self._record_context_usage(None)
 
-        assistant_tool_calls, tool_calls = self._ollama_stream_tool_calls(tool_call_parts)
+        assistant_tool_calls, tool_calls = self._ollama_stream_tool_calls(
+            tool_call_parts
+        )
         full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
         assistant_message = self._ollama_assistant_message(
             full_response,
             _clean_reasoning_text(full_thinking),
             assistant_tool_calls,
         )
-        return assistant_message, full_thinking, full_response, tool_calls, response_started
+        return (
+            assistant_message,
+            full_thinking,
+            full_response,
+            tool_calls,
+            response_started,
+        )
 
     def _update_ollama_stream_tool_call_parts(self, tool_call_parts, raw_tool_calls):
         for fallback_index, call in enumerate(raw_tool_calls or []):
@@ -1388,7 +1438,9 @@ class LLMChat:
                 part["arguments"] = arguments
             elif isinstance(arguments, str):
                 existing = part.get("arguments")
-                part["arguments"] = (existing if isinstance(existing, str) else "") + arguments
+                part["arguments"] = (
+                    existing if isinstance(existing, str) else ""
+                ) + arguments
             elif arguments:
                 part["arguments"] = arguments
 
@@ -1404,18 +1456,14 @@ class LLMChat:
             }
             if len(tool_call_parts) > 1:
                 function_call["index"] = index
-            assistant_tool_calls.append(
-                {
-                    "type": part.get("type") or "function",
-                    "function": function_call,
-                }
-            )
-            tool_calls.append(
-                {
-                    "name": part.get("name", ""),
-                    "arguments": parsed_arguments,
-                }
-            )
+            assistant_tool_calls.append({
+                "type": part.get("type") or "function",
+                "function": function_call,
+            })
+            tool_calls.append({
+                "name": part.get("name", ""),
+                "arguments": parsed_arguments,
+            })
         return assistant_tool_calls, tool_calls
 
     def _stream_anthropic_normal_web_search_response(
@@ -1455,22 +1503,26 @@ class LLMChat:
                         thinking_started=thinking_started,
                     )
 
-                self.conversation_history.append({"role": "assistant", "content": blocks})
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": blocks,
+                })
                 tool_results = []
                 for tool_use in tool_uses:
                     tool_result = self._execute_normal_web_search_tool(
                         tool_use.get("name", ""),
                         tool_use.get("input", {}),
                     )
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.get("id", ""),
-                            "content": tool_result,
-                            "is_error": tool_result.startswith("ERROR:"),
-                        }
-                    )
-                self.conversation_history.append({"role": "user", "content": tool_results})
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.get("id", ""),
+                        "content": tool_result,
+                        "is_error": tool_result.startswith("ERROR:"),
+                    })
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": tool_results,
+                })
 
             return self._stream_normal_web_search_round_limit_response(
                 full_thinking,
@@ -1522,15 +1574,19 @@ class LLMChat:
                     initial_text = self._get_field(content_block, "text", "") or ""
                     block = {"type": "text", "text": ""}
                     if initial_text:
-                        content, full_response, raw_response = self._stream_content_delta(
-                            initial_text,
-                            full_response,
-                            raw_response,
+                        content, full_response, raw_response = (
+                            self._stream_content_delta(
+                                initial_text,
+                                full_response,
+                                raw_response,
+                            )
                         )
                         block["text"] = block.get("text", "") + content
-                        tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
-                            raw_response,
-                            tagged_thinking,
+                        tagged_reasoning, tagged_thinking = (
+                            self._stream_tagged_reasoning_delta(
+                                raw_response,
+                                tagged_thinking,
+                            )
                         )
                         if (
                             tagged_reasoning
@@ -1551,11 +1607,17 @@ class LLMChat:
                             if callback_response:
                                 callback_response(content)
                 elif block_type == "thinking":
-                    initial_thinking = self._get_field(content_block, "thinking", "") or ""
+                    initial_thinking = (
+                        self._get_field(content_block, "thinking", "") or ""
+                    )
                     block = {"type": "thinking", "thinking": initial_thinking}
                     if initial_thinking:
                         field_thinking += initial_thinking
-                        if callback_thinking and self.thinking_mode and not response_started:
+                        if (
+                            callback_thinking
+                            and self.thinking_mode
+                            and not response_started
+                        ):
                             callback_thinking(initial_thinking)
                     signature = self._get_field(content_block, "signature")
                     if signature:
@@ -1582,15 +1644,19 @@ class LLMChat:
                 if delta_type == "text_delta":
                     text_delta = self._get_field(delta, "text", "") or ""
                     if text_delta:
-                        content, full_response, raw_response = self._stream_content_delta(
-                            text_delta,
-                            full_response,
-                            raw_response,
+                        content, full_response, raw_response = (
+                            self._stream_content_delta(
+                                text_delta,
+                                full_response,
+                                raw_response,
+                            )
                         )
                         block["text"] = block.get("text", "") + content
-                        tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
-                            raw_response,
-                            tagged_thinking,
+                        tagged_reasoning, tagged_thinking = (
+                            self._stream_tagged_reasoning_delta(
+                                raw_response,
+                                tagged_thinking,
+                            )
                         )
                         if (
                             tagged_reasoning
@@ -1615,7 +1681,11 @@ class LLMChat:
                     if thinking_delta:
                         field_thinking += thinking_delta
                         block["thinking"] = block.get("thinking", "") + thinking_delta
-                        if callback_thinking and self.thinking_mode and not response_started:
+                        if (
+                            callback_thinking
+                            and self.thinking_mode
+                            and not response_started
+                        ):
                             callback_thinking(thinking_delta)
                 elif delta_type == "signature_delta":
                     block["signature"] = block.get("signature", "") + (
@@ -1693,13 +1763,17 @@ class LLMChat:
         response_started,
         stream_callback_response=None,
     ):
-        message = "Web search stopped after reaching the normal-mode search round limit."
+        message = (
+            "Web search stopped after reaching the normal-mode search round limit."
+        )
         if response_started or thinking:
             console.print()
         print_error(message)
         final_response = response or message
         if not response and stream_callback_response:
-            response_started = self._start_normal_stream_response(response_started, thinking)
+            response_started = self._start_normal_stream_response(
+                response_started, thinking
+            )
             stream_callback_response(message)
         return {
             "thinking": thinking,
@@ -1751,7 +1825,9 @@ class LLMChat:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
-        message = "Web search stopped after reaching the normal-mode search round limit."
+        message = (
+            "Web search stopped after reaching the normal-mode search round limit."
+        )
         print_error(message)
         return self._finalize_normal_web_search_response(
             thinking,
@@ -1781,7 +1857,9 @@ class LLMChat:
             self._record_context_usage(response)
 
             message = self._get_field(response, "message", {})
-            assistant_message, thinking_content, text, tool_calls = self._ollama_message_parts(message)
+            assistant_message, thinking_content, text, tool_calls = (
+                self._ollama_message_parts(message)
+            )
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             self._show_agent_thinking(thinking_content)
@@ -1805,12 +1883,17 @@ class LLMChat:
                     )
                 self._separate_after_agent_thinking()
                 print_error(message)
-                return {"thinking": full_thinking, "response": final_response or message}
+                return {
+                    "thinking": full_thinking,
+                    "response": final_response or message,
+                }
 
             for tool_call in tool_calls:
                 if self._agent_should_stop():
                     return self._agent_stopped_response(full_thinking, final_response)
-                tool_result = self._execute_agent_tool(tool_call["name"], tool_call["arguments"])
+                tool_result = self._execute_agent_tool(
+                    tool_call["name"], tool_call["arguments"]
+                )
                 self.conversation_history.append(
                     self._ollama_tool_result_message(tool_call["name"], tool_result)
                 )
@@ -2017,7 +2100,9 @@ class LLMChat:
         self.agent_thinking_needs_separator = True
         self.agent_summary_thinking_active = True
 
-    def _print_agent_thinking_summary(self, summary, leading_newline=True, replace_current_line=False):
+    def _print_agent_thinking_summary(
+        self, summary, leading_newline=True, replace_current_line=False
+    ):
         summary = _clean_summary_stream_delta(summary).strip()
         if not summary:
             return
@@ -2026,9 +2111,13 @@ class LLMChat:
             print_stream_thinking_continue(character)
             if console.is_terminal:
                 time.sleep(AGENT_SUMMARY_THINKING_CHAR_DELAY_SECONDS)
-        self.agent_summary_rendered_lines = self._agent_summary_rendered_line_count(summary)
+        self.agent_summary_rendered_lines = self._agent_summary_rendered_line_count(
+            summary
+        )
 
-    def _start_agent_thinking_summary_line(self, leading_newline=True, replace_current_line=False):
+    def _start_agent_thinking_summary_line(
+        self, leading_newline=True, replace_current_line=False
+    ):
         if replace_current_line:
             clear_current_lines(self.agent_summary_rendered_lines)
             print_stream_thinking("", leading_newline=False)
@@ -2067,11 +2156,15 @@ class LLMChat:
             if not delta:
                 return
             if not started:
-                self._start_agent_thinking_summary_line(leading_newline, replace_current_line)
+                self._start_agent_thinking_summary_line(
+                    leading_newline, replace_current_line
+                )
                 started = True
             summary_text += delta
             print_stream_thinking_continue(delta)
-            self.agent_summary_rendered_lines = self._agent_summary_rendered_line_count(summary_text)
+            self.agent_summary_rendered_lines = self._agent_summary_rendered_line_count(
+                summary_text
+            )
 
         try:
             if self.api_type == API_TYPE_ANTHROPIC:
@@ -2241,8 +2334,14 @@ class LLMChat:
         estimated_tokens = self._estimate_current_context_tokens()
         if self.last_context_input_tokens > 0:
             if estimated_tokens > self.last_context_input_tokens:
-                return estimated_tokens, f"{self.last_context_usage_source or 'api_usage'}+estimated"
-            return self.last_context_input_tokens, self.last_context_usage_source or "api_usage"
+                return (
+                    estimated_tokens,
+                    f"{self.last_context_usage_source or 'api_usage'}+estimated",
+                )
+            return (
+                self.last_context_input_tokens,
+                self.last_context_usage_source or "api_usage",
+            )
         return estimated_tokens, "estimated"
 
     def _compaction_token_threshold(self):
@@ -2253,7 +2352,9 @@ class LLMChat:
         if input_tokens is not None:
             self._set_context_input_tokens(input_tokens, source)
             return
-        self._set_context_input_tokens(self._estimate_current_context_tokens(), "estimated")
+        self._set_context_input_tokens(
+            self._estimate_current_context_tokens(), "estimated"
+        )
 
     def _set_context_input_tokens(self, input_tokens, source):
         try:
@@ -2303,7 +2404,9 @@ class LLMChat:
 
         recent_messages = self.conversation_history[-keep_recent:]
         source_messages = self.conversation_history[:-keep_recent]
-        existing_summary, source_messages = self._split_existing_compaction_summary(source_messages)
+        existing_summary, source_messages = self._split_existing_compaction_summary(
+            source_messages
+        )
         source_messages, recent_messages = self._fold_leading_tool_results_into_source(
             source_messages,
             recent_messages,
@@ -2386,7 +2489,9 @@ class LLMChat:
             "memory_update": memory_update,
         }
 
-    def _create_compaction_summary(self, existing_summary, source_messages, compact_model):
+    def _create_compaction_summary(
+        self, existing_summary, source_messages, compact_model
+    ):
         prompt = self._compaction_prompt(existing_summary, source_messages)
         system_prompt = _with_persistent_memory(
             COMPACTION_SYSTEM_PROMPT,
@@ -2433,7 +2538,9 @@ class LLMChat:
         message = response.choices[0].message
         return _clean_content_text(self._get_field(message, "content", "") or "")
 
-    def _schedule_memory_update_from_compaction(self, summary, source_messages, compact_model):
+    def _schedule_memory_update_from_compaction(
+        self, summary, source_messages, compact_model
+    ):
         compacted_messages = self._format_messages_for_compaction(source_messages)
         memory_model = self._memory_model_name()
         self._start_memory_background_task(
@@ -2517,7 +2624,10 @@ class LLMChat:
 
                 with self.memory_lock:
                     if generation != self.session_memory_generation:
-                        return {"changed": [], "reason": "Session memory update is stale."}
+                        return {
+                            "changed": [],
+                            "reason": "Session memory update is stale.",
+                        }
                     result = self.memory_store.upsert_session_episodic_memory(
                         episodic_memory,
                         current_heading=current_heading,
@@ -2743,9 +2853,8 @@ class LLMChat:
             return "", []
         first_message = messages[0]
         content = str(first_message.get("content", "") or "")
-        if (
-            first_message.get("role") == "user"
-            and content.startswith(COMPACTION_SUMMARY_PREFIX)
+        if first_message.get("role") == "user" and content.startswith(
+            COMPACTION_SUMMARY_PREFIX
         ):
             summary = content[len(COMPACTION_SUMMARY_PREFIX) :].strip()
             return summary, messages[1:]
@@ -2776,9 +2885,11 @@ class LLMChat:
         removed_count = 0
 
         for message in self.conversation_history:
-            filtered_message, removed, consumed_tool_ids = self._filter_orphan_tool_results(
-                message,
-                available_tool_ids,
+            filtered_message, removed, consumed_tool_ids = (
+                self._filter_orphan_tool_results(
+                    message,
+                    available_tool_ids,
+                )
             )
             removed_count += removed
             if filtered_message is None:
@@ -2859,12 +2970,14 @@ class LLMChat:
         run_summary = self.agent_tools.session_summary()
         history_text = assistant_text
         if run_summary:
-            history_text = f"{assistant_text}\n\n[Agent run summary]\n{run_summary}".strip()
+            history_text = (
+                f"{assistant_text}\n\n[Agent run summary]\n{run_summary}".strip()
+            )
 
-        self.conversation_history = (
-            self.conversation_history[:history_start]
-            + [user_message, {"role": "assistant", "content": history_text}]
-        )
+        self.conversation_history = self.conversation_history[:history_start] + [
+            user_message,
+            {"role": "assistant", "content": history_text},
+        ]
 
     def _append_agent_final_check_if_needed(self):
         if self.agent_tools.has_incomplete_todos():
@@ -2875,21 +2988,19 @@ class LLMChat:
                 extra_guidance += f"\n\n{budget_summary}"
             if quality_report:
                 extra_guidance += f"\n\n{quality_report}"
-            self.conversation_history.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Automatic task plan check for this local agent run:\n\n"
-                        f"{self.agent_tools.todo_actionable_summary()}\n\n"
-                        "There are still pending or in-progress todos. Continue using tools "
-                        "to finish the remaining work. Respect depends_on before starting later "
-                        "todos, and update the todo list as each item changes. Only provide the "
-                        "final response after all pending/in-progress todos are completed, blocked, "
-                        "or failed with a clear reason."
-                        f"{extra_guidance}"
-                    ),
-                }
-            )
+            self.conversation_history.append({
+                "role": "user",
+                "content": (
+                    "Automatic task plan check for this local agent run:\n\n"
+                    f"{self.agent_tools.todo_actionable_summary()}\n\n"
+                    "There are still pending or in-progress todos. Continue using tools "
+                    "to finish the remaining work. Respect depends_on before starting later "
+                    "todos, and update the todo list as each item changes. Only provide the "
+                    "final response after all pending/in-progress todos are completed, blocked, "
+                    "or failed with a clear reason."
+                    f"{extra_guidance}"
+                ),
+            })
             return True
 
         needs_verification = (
@@ -2918,21 +3029,19 @@ class LLMChat:
                 "automatic verification item. Continue using tools to fix the failure and update "
                 "todos; if you cannot proceed, mark the relevant todo blocked with a clear reason. "
             )
-        self.conversation_history.append(
-            {
-                "role": "user",
-                "content": (
-                    "Automatic final verification for this local agent run:\n\n"
-                    f"{check_result}\n\n"
-                    f"{verification_instruction}"
-                    "If the verification output shows a problem, continue using tools to fix it. "
-                    "Do not attribute pre-existing workspace changes to this run unless they are listed "
-                    "as agent-edited files or agent mutating commands. "
-                    "If the task is complete, provide the final response with a concise summary "
-                    "and mention what verification was performed."
-                ),
-            }
-        )
+        self.conversation_history.append({
+            "role": "user",
+            "content": (
+                "Automatic final verification for this local agent run:\n\n"
+                f"{check_result}\n\n"
+                f"{verification_instruction}"
+                "If the verification output shows a problem, continue using tools to fix it. "
+                "Do not attribute pre-existing workspace changes to this run unless they are listed "
+                "as agent-edited files or agent mutating commands. "
+                "If the task is complete, provide the final response with a concise summary "
+                "and mention what verification was performed."
+            ),
+        })
         return True
 
     def _execute_agent_tool(self, name, tool_input):
@@ -3111,7 +3220,11 @@ class LLMChat:
                 thinking = self._get_field(message, "thinking", "") or ""
                 if thinking:
                     field_thinking += thinking
-                    if callback_thinking and self.thinking_mode and not response_started:
+                    if (
+                        callback_thinking
+                        and self.thinking_mode
+                        and not response_started
+                    ):
                         callback_thinking(thinking)
 
                 content, full_response, raw_response = self._stream_content_delta(
@@ -3203,14 +3316,18 @@ class LLMChat:
                     if self._get_field(content_block, "type") == "text":
                         initial_text = self._get_field(content_block, "text", "") or ""
                         if initial_text:
-                            content, full_response, raw_response = self._stream_content_delta(
-                                initial_text,
-                                full_response,
-                                raw_response,
+                            content, full_response, raw_response = (
+                                self._stream_content_delta(
+                                    initial_text,
+                                    full_response,
+                                    raw_response,
+                                )
                             )
-                            tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
-                                raw_response,
-                                tagged_thinking,
+                            tagged_reasoning, tagged_thinking = (
+                                self._stream_tagged_reasoning_delta(
+                                    raw_response,
+                                    tagged_thinking,
+                                )
                             )
                             if (
                                 tagged_reasoning
@@ -3229,7 +3346,10 @@ class LLMChat:
                             )
                             if content:
                                 if not response_started:
-                                    if separator_thinking and not separator_thinking.endswith("\n"):
+                                    if (
+                                        separator_thinking
+                                        and not separator_thinking.endswith("\n")
+                                    ):
                                         console.print()
                                     print_stream_response_start(model_name)
                                     response_started = True
@@ -3247,19 +3367,27 @@ class LLMChat:
                     thinking = self._get_field(delta, "thinking", "") or ""
                     if thinking:
                         field_thinking += thinking
-                        if callback_thinking and self.thinking_mode and not response_started:
+                        if (
+                            callback_thinking
+                            and self.thinking_mode
+                            and not response_started
+                        ):
                             callback_thinking(thinking)
                 elif delta_type == "text_delta":
                     text = self._get_field(delta, "text", "") or ""
                     if text:
-                        content, full_response, raw_response = self._stream_content_delta(
-                            text,
-                            full_response,
-                            raw_response,
+                        content, full_response, raw_response = (
+                            self._stream_content_delta(
+                                text,
+                                full_response,
+                                raw_response,
+                            )
                         )
-                        tagged_reasoning, tagged_thinking = self._stream_tagged_reasoning_delta(
-                            raw_response,
-                            tagged_thinking,
+                        tagged_reasoning, tagged_thinking = (
+                            self._stream_tagged_reasoning_delta(
+                                raw_response,
+                                tagged_thinking,
+                            )
                         )
                         if (
                             tagged_reasoning
@@ -3278,14 +3406,20 @@ class LLMChat:
                         )
                         if content:
                             if not response_started:
-                                if separator_thinking and not separator_thinking.endswith("\n"):
+                                if (
+                                    separator_thinking
+                                    and not separator_thinking.endswith("\n")
+                                ):
                                     console.print()
                                 print_stream_response_start(model_name)
                                 response_started = True
                             if callback_response:
                                 callback_response(content)
 
-            self.conversation_history.append({"role": "assistant", "content": full_response})
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": full_response,
+            })
             if usage_input_tokens is not None:
                 self._set_context_input_tokens(usage_input_tokens, "api_usage")
             else:
@@ -3303,7 +3437,9 @@ class LLMChat:
         try:
             self._record_context_usage(response)
             message = response.choices[0].message
-            assistant_message, thinking_content, text, _ = self._chat_message_parts(message)
+            assistant_message, thinking_content, text, _ = self._chat_message_parts(
+                message
+            )
 
             self.conversation_history.append(assistant_message)
             return {"thinking": thinking_content, "response": text}
@@ -3315,7 +3451,9 @@ class LLMChat:
         try:
             self._record_context_usage(response)
             message = self._get_field(response, "message", {})
-            assistant_message, thinking_content, text, _ = self._ollama_message_parts(message)
+            assistant_message, thinking_content, text, _ = self._ollama_message_parts(
+                message
+            )
 
             self.conversation_history.append(assistant_message)
             return {"thinking": thinking_content, "response": text}
@@ -3328,7 +3466,10 @@ class LLMChat:
             self._record_context_usage(response)
             full_thinking, full_response = self._anthropic_response_parts(response)
 
-            self.conversation_history.append({"role": "assistant", "content": full_response})
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": full_response,
+            })
             return {"thinking": full_thinking, "response": full_response}
         except (AttributeError, TypeError) as error:
             print_error(f"Failed to parse response: {error}")
@@ -3362,16 +3503,17 @@ class LLMChat:
         for block in content or []:
             block_type = self._get_field(block, "type", "")
             if block_type == "text":
-                blocks.append({"type": "text", "text": self._get_field(block, "text", "") or ""})
+                blocks.append({
+                    "type": "text",
+                    "text": self._get_field(block, "text", "") or "",
+                })
             elif block_type == "tool_use":
-                blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": self._get_field(block, "id", "") or "",
-                        "name": self._get_field(block, "name", "") or "",
-                        "input": self._get_field(block, "input", {}) or {},
-                    }
-                )
+                blocks.append({
+                    "type": "tool_use",
+                    "id": self._get_field(block, "id", "") or "",
+                    "name": self._get_field(block, "name", "") or "",
+                    "input": self._get_field(block, "input", {}) or {},
+                })
             elif block_type == "thinking":
                 thinking_block = {
                     "type": "thinking",
@@ -3417,23 +3559,21 @@ class LLMChat:
                 arguments = self._get_field(function, "arguments", {}) or {}
                 parsed_arguments = self._parse_tool_arguments(arguments)
 
-                assistant_tool_calls.append(
-                    {
-                        "id": call_id,
-                        "type": self._get_field(call, "type", "function") or "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
-                        },
-                    }
-                )
-                tool_calls.append(
-                    {
-                        "id": call_id,
+                assistant_tool_calls.append({
+                    "id": call_id,
+                    "type": self._get_field(call, "type", "function") or "function",
+                    "function": {
                         "name": name,
-                        "arguments": parsed_arguments,
-                    }
-                )
+                        "arguments": arguments
+                        if isinstance(arguments, str)
+                        else json.dumps(arguments),
+                    },
+                })
+                tool_calls.append({
+                    "id": call_id,
+                    "name": name,
+                    "arguments": parsed_arguments,
+                })
             assistant_message["tool_calls"] = assistant_tool_calls
 
         return assistant_message, thinking_content, text, tool_calls
@@ -3461,18 +3601,14 @@ class LLMChat:
                 function_call["index"] = raw_index
             elif len(raw_tool_calls) > 1:
                 function_call["index"] = index
-            assistant_tool_calls.append(
-                {
-                    "type": self._get_field(call, "type", "function") or "function",
-                    "function": function_call,
-                }
-            )
-            tool_calls.append(
-                {
-                    "name": name,
-                    "arguments": parsed_arguments,
-                }
-            )
+            assistant_tool_calls.append({
+                "type": self._get_field(call, "type", "function") or "function",
+                "function": function_call,
+            })
+            tool_calls.append({
+                "name": name,
+                "arguments": parsed_arguments,
+            })
 
         assistant_message = self._ollama_assistant_message(
             text,
@@ -3503,7 +3639,9 @@ class LLMChat:
 
     def _ollama_messages(self, messages=None):
         converted = []
-        source_messages = messages if messages is not None else self.conversation_history
+        source_messages = (
+            messages if messages is not None else self.conversation_history
+        )
         for message in source_messages:
             role = message.get("role")
             if role not in {"system", "user", "assistant", "tool"}:
@@ -3532,13 +3670,19 @@ class LLMChat:
         return converted
 
     def _chat_agent_messages(self):
-        return [{"role": "system", "content": self._agent_system_prompt()}] + self.conversation_history
+        return [
+            {"role": "system", "content": self._agent_system_prompt()}
+        ] + self.conversation_history
 
     def _chat_messages(self, messages=None):
-        source_messages = messages if messages is not None else self.conversation_history
+        source_messages = (
+            messages if messages is not None else self.conversation_history
+        )
         if source_messages and source_messages[0].get("role") == "system":
             return source_messages
-        return [{"role": "system", "content": self._normal_system_prompt()}] + source_messages
+        return [
+            {"role": "system", "content": self._normal_system_prompt()}
+        ] + source_messages
 
     def _ollama_agent_messages(self):
         return self._ollama_messages(
@@ -3547,11 +3691,14 @@ class LLMChat:
         )
 
     def _ollama_normal_messages(self, messages=None):
-        source_messages = messages if messages is not None else self.conversation_history
+        source_messages = (
+            messages if messages is not None else self.conversation_history
+        )
         if source_messages and source_messages[0].get("role") == "system":
             return self._ollama_messages(source_messages)
         return self._ollama_messages(
-            [{"role": "system", "content": self._normal_system_prompt()}] + source_messages
+            [{"role": "system", "content": self._normal_system_prompt()}]
+            + source_messages
         )
 
     def _normal_system_prompt(self):
@@ -3567,7 +3714,9 @@ class LLMChat:
                 "\n联网搜索已开启。遇到近期、易变化、外部事实不足或需要来源支撑的问题时，"
                 "使用 web_search；回答中引用搜索结果里的来源 URL。"
             )
-        return _with_user_custom_prompt(_with_persistent_memory(prompt, self.memory_store))
+        return _with_user_custom_prompt(
+            _with_persistent_memory(prompt, self.memory_store)
+        )
 
     def _agent_system_prompt(self):
         prompt = AGENT_SYSTEM_PROMPT
@@ -3579,7 +3728,9 @@ class LLMChat:
         skills_prompt = self.agent_tools.skills_catalog_prompt()
         if skills_prompt:
             prompt += skills_prompt
-        return _with_user_custom_prompt(_with_persistent_memory(prompt, self.memory_store))
+        return _with_user_custom_prompt(
+            _with_persistent_memory(prompt, self.memory_store)
+        )
 
     def _reasoning_effort_value(self):
         return parse_reasoning_effort(self.reasoning_effort)
@@ -3708,7 +3859,8 @@ class LLMChat:
                     "thinking": {
                         "type": (
                             "enabled"
-                            if self.thinking_mode and not self._reasoning_disabled_by_effort()
+                            if self.thinking_mode
+                            and not self._reasoning_disabled_by_effort()
                             else "disabled"
                         ),
                     }
@@ -3856,12 +4008,10 @@ class LLMChat:
                 function_call["index"] = raw_index
             elif len(tool_calls) > 1:
                 function_call["index"] = index
-            normalized.append(
-                {
-                    "type": self._get_field(call, "type", "function") or "function",
-                    "function": function_call,
-                }
-            )
+            normalized.append({
+                "type": self._get_field(call, "type", "function") or "function",
+                "function": function_call,
+            })
         return normalized
 
     def _uses_minimax_openai_compat(self, model=None):
@@ -3869,7 +4019,11 @@ class LLMChat:
             return False
         base_url = str(self.base_url or "").lower()
         model_name = str(model or self.model or "").lower()
-        return "minimax" in base_url or "minimaxi" in base_url or model_name.startswith("minimax")
+        return (
+            "minimax" in base_url
+            or "minimaxi" in base_url
+            or model_name.startswith("minimax")
+        )
 
     def _uses_deepseek_openai_compat(self, model=None):
         if self.api_type != API_TYPE_OPENAI:
@@ -3904,7 +4058,9 @@ class LLMChat:
             self._get_field(message, "reasoning_details", None)
         )
         reasoning = self._get_field(message, "reasoning", "") or ""
-        return _clean_reasoning_text(reasoning_content or reasoning_details or reasoning)
+        return _clean_reasoning_text(
+            reasoning_content or reasoning_details or reasoning
+        )
 
     def _message_content_text(self, content):
         if self._uses_minimax_openai_compat():
@@ -3919,7 +4075,9 @@ class LLMChat:
         clean_response, _, has_tagged_thinking = _split_tagged_think_text(raw_response)
         if self._uses_minimax_openai_compat() and not has_tagged_thinking:
             clean_response = _clean_content_text(raw_response)
-        clean_delta, clean_response = self._split_stream_delta(current_response, clean_response)
+        clean_delta, clean_response = self._split_stream_delta(
+            current_response, clean_response
+        )
         return clean_delta, clean_response, raw_response
 
     def _stream_tagged_reasoning_delta(self, raw_response, current_tagged_thinking):
@@ -3937,7 +4095,9 @@ class LLMChat:
         if reasoning:
             raw_thinking += reasoning
             clean_thinking = _clean_reasoning_text(raw_thinking)
-            clean_delta, clean_thinking = self._split_stream_delta(current_thinking, clean_thinking)
+            clean_delta, clean_thinking = self._split_stream_delta(
+                current_thinking, clean_thinking
+            )
             return clean_delta, clean_thinking, raw_thinking
 
         reasoning_details = self._reasoning_details_text(
@@ -3949,7 +4109,9 @@ class LLMChat:
             else:
                 raw_thinking += reasoning_details
             clean_thinking = _clean_reasoning_text(raw_thinking)
-            clean_delta, clean_thinking = self._split_stream_delta(current_thinking, clean_thinking)
+            clean_delta, clean_thinking = self._split_stream_delta(
+                current_thinking, clean_thinking
+            )
             return clean_delta, clean_thinking, raw_thinking
         return "", current_thinking, raw_thinking
 
@@ -4170,7 +4332,9 @@ def _estimate_text_tokens(text):
 def _clean_reasoning_text(content):
     text = str(content or "")
     text = re.sub(r"<\s*/?\s*think\s*>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE
+    )
     return text.strip()
 
 
@@ -4247,15 +4411,23 @@ def _split_tagged_think_text(content):
         content_parts.append(cleaned_tail)
         break
 
-    return "".join(content_parts), _clean_reasoning_text("".join(thinking_parts)), found_tag
+    return (
+        "".join(content_parts),
+        _clean_reasoning_text("".join(thinking_parts)),
+        found_tag,
+    )
 
 
 def _clean_content_text(content):
     text = str(content or "")
-    text = re.sub(r"<\s*think\s*>.*?<\s*/\s*think\s*>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(
+        r"<\s*think\s*>.*?<\s*/\s*think\s*>", "", text, flags=re.IGNORECASE | re.DOTALL
+    )
     text = re.sub(r"<\s*think\s*>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<\s*/\s*think\s*>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE
+    )
     return text
 
 
@@ -4404,9 +4576,13 @@ def _summary_sentence_candidates(text):
 
 def _clean_summary_sentence(sentence):
     sentence = _strip_list_marker(str(sentence or ""))
-    sentence = re.sub(r"[:：]\s*(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?\s*$", "", sentence)
+    sentence = re.sub(
+        r"[:：]\s*(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?\s*$", "", sentence
+    )
     sentence = sentence.strip(" \t\r\n-:;：")
-    if not sentence or re.fullmatch(r"(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?", sentence):
+    if not sentence or re.fullmatch(
+        r"(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?", sentence
+    ):
         return ""
     return sentence
 
