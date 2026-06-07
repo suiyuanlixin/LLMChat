@@ -193,6 +193,7 @@ def run_chat_loop(
             web_search_max_results=config.web_search_max_results,
             web_search_depth=config.web_search_depth,
             web_search_topic=config.web_search_topic,
+            agent_plan_enabled=config.agent_plan_enable,
         )
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")

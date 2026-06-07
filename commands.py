@@ -46,7 +46,7 @@ COMMANDS = {
     "/mode": "Switch between normal and stream output modes (Example: /mode stream).",
     "/think": "Toggle thinking mode on/off (Example: /think on).",
     "/comp": "Compact the current conversation context immediately.",
-    "/plan": "Inspect, approve, recover, or clear current agent todos (Example: /plan check).",
+    "/plan": "Inspect, approve, recover, or clear the current agent plan (Example: /plan check).",
     "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
     "/search": "Toggle, inspect or configure web search (Example: /search on).",
     "/skills": "Toggle, inspect or configure agent skills (Example: /skills workspace on).",
@@ -130,6 +130,7 @@ def _apply_config(chat, config):
         chat.set_agent_approval_mode(config.agent_approval_mode)
         chat.set_agent_show_thinking(config.agent_show_thinking)
         chat.set_agent_summary_model(config.agent_summary_model)
+        chat.set_agent_plan_enabled(config.agent_plan_enable)
         chat.set_skills_config(
             config.skills_enable,
             config.skills_source_app,
@@ -283,15 +284,16 @@ def handle_plan(chat, args):
     raw_args = str(args or "").strip()
     parts = raw_args.split(maxsplit=2)
     action = parts[0].lower() if parts else ""
+    status = chat.get_plan_status()
     if action in {"clear", "reset"}:
-        chat.clear_todos()
-        print_success("Todos cleared.")
+        chat.clear_plan()
+        print_success("Plan cleared.")
         return True
 
     if action == "approve":
         tail = raw_args.split(maxsplit=1)
         note = tail[1] if len(tail) > 1 else ""
-        if chat.approve_todos(note):
+        if chat.approve_plan(note):
             print_success("Plan approved.")
         else:
             print_info("No plan approval change needed.")
@@ -300,14 +302,17 @@ def handle_plan(chat, args):
     if action in {"reject", "deny"}:
         tail = raw_args.split(maxsplit=1)
         reason = tail[1] if len(tail) > 1 else ""
-        if chat.reject_todos(reason):
+        if chat.reject_plan(reason):
             print_warn("Plan rejected.")
         else:
             print_info("No current plan to reject.")
         return True
 
     if action == "check":
-        print_info(chat.get_todo_quality_report())
+        if not status.get("enabled", True):
+            print_info("Agent plan is off. Use /agent plan on to enable planning.")
+            return True
+        print_info(chat.get_plan_quality_report())
         return True
 
     if action in {"history", "log", "events"}:
@@ -318,7 +323,7 @@ def handle_plan(chat, args):
             except ValueError:
                 print_error("Usage: /plan history [limit]")
                 return True
-        events = chat.get_todo_history(limit)
+        events = chat.get_plan_history(limit)
         if not events:
             print_info("No plan events.")
             return True
@@ -327,17 +332,17 @@ def handle_plan(chat, args):
 
     if action in {"retry", "unblock"}:
         if len(parts) < 2:
-            print_error(f"Usage: /plan {action} <todo-id> [reason]")
+            print_error(f"Usage: /plan {action} <item-id> [reason]")
             return True
-        todo_id = parts[1]
+        item_id = parts[1]
         reason = parts[2] if len(parts) >= 3 else ""
         try:
             if action == "retry":
-                chat.retry_todo(todo_id, reason)
-                print_success(f"Todo retried: {todo_id}")
+                chat.retry_plan_item(item_id, reason)
+                print_success(f"Plan item retried: {item_id}")
             else:
-                chat.unblock_todo(todo_id, reason)
-                print_success(f"Todo unblocked: {todo_id}")
+                chat.unblock_plan_item(item_id, reason)
+                print_success(f"Plan item unblocked: {item_id}")
         except ValueError as error:
             print_error(str(error))
         return True
@@ -346,29 +351,32 @@ def handle_plan(chat, args):
         print_error(
             "Usage: /plan | /plan check | /plan history [limit] | "
             "/plan approve [note] | /plan reject [reason] | "
-            "/plan retry <todo-id> [reason] | /plan unblock <todo-id> [reason] | "
+            "/plan retry <item-id> [reason] | /plan unblock <item-id> [reason] | "
             "/plan clear"
         )
         return True
 
-    status = chat.get_todo_status()
-    items = status.get("items") or []
-    if not items:
-        print_info("No todos.")
+    if not status.get("enabled", True):
+        print_info("Agent plan is off. Use /agent plan on to enable planning.")
         return True
 
-    summary = _format_todos_for_display(items)
+    items = status.get("items") or []
+    if not items:
+        print_info("No plan items.")
+        return True
+
+    summary = _format_plan_items_for_display(items)
     meta = _format_plan_meta(status)
     if meta:
         summary = summary + "\n\n" + meta
     if status.get("all_completed"):
-        print_info("No active todos. Last completed plan:\n" + summary)
+        print_info("No active plan items. Last completed plan:\n" + summary)
     else:
-        print_info("Current todos:\n" + summary)
+        print_info("Current plan:\n" + summary)
     return True
 
 
-def _format_todos_for_display(items):
+def _format_plan_items_for_display(items):
     lines = []
     for item in items:
         status = item.get("status") or "pending"
@@ -1153,6 +1161,7 @@ def handle_agent(chat, args):
         approval = status.get("approval_mode", "confirm")
         show_thinking = status.get("show_thinking", "summary")
         summary_model = status.get("summary_model") or "local"
+        plan = "on" if status.get("plan_enabled", True) else "off"
         skills = status.get("skills") or {}
         skills_state = "on" if skills.get("enabled") else "off"
         skill_sources = skills.get("sources") or {}
@@ -1162,11 +1171,13 @@ def handle_agent(chat, args):
             f"Approval: {approval}.\n"
             f"Show thinking: {show_thinking}.\n"
             f"Summary model: {summary_model}.\n"
+            f"Plan: {plan}.\n"
             f"Skills: {skills_state} ({skills.get('count', 0)} loaded; "
             f"app={'on' if skill_sources.get('app') else 'off'}, "
             f"workspace={'on' if skill_sources.get('workspace') else 'off'}).\n"
             f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
-            f"/agent approve confirm|auto | /agent show-thinking summary|full|off | /skills"
+            f"/agent approve confirm|auto | /agent show-thinking summary|full|off | "
+            f"/agent plan on|off | /skills"
         )
         return True
 
@@ -1256,13 +1267,27 @@ def handle_agent(chat, args):
         chat.set_agent_show_thinking(show_thinking)
         save_config_field("agent_show_thinking", show_thinking)
         print_success(f"Agent thinking display set to {show_thinking}.")
+    elif mode == "plan":
+        if len(parts) == 1:
+            current = "on" if status.get("plan_enabled", True) else "off"
+            print_info(
+                f"Current agent plan: {current}. Usage: /agent plan on|off"
+            )
+            return True
+        if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
+            print_error("Usage: /agent plan on|off")
+            return True
+        enabled = parts[1].lower() == "on"
+        chat.set_agent_plan_enabled(enabled)
+        save_config_field("agent_plan_enable", enabled)
+        print_success(f"Agent plan turned {'on' if enabled else 'off'}.")
     elif mode == "skills":
         return handle_skills(chat, " ".join(parts[1:]) if len(parts) > 1 else None)
     else:
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
             f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto, "
-            f"/agent show-thinking summary|full|off, or /skills."
+            f"/agent show-thinking summary|full|off, /agent plan on|off, or /skills."
         )
     return True
 

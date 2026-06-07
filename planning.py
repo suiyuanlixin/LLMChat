@@ -265,11 +265,11 @@ class TodoStore:
     def retry_todo(self, todo_id, reason=""):
         item = self._find_item(todo_id)
         if item is None:
-            raise ValueError(f"Unknown todo id: {todo_id}")
+            raise ValueError(f"Unknown plan item id: {todo_id}")
         if item.status not in {TODO_STATUS_BLOCKED, TODO_STATUS_FAILED, TODO_STATUS_COMPLETED}:
             raise ValueError(
-                f"Todo '{todo_id}' is {item.status}; only blocked, failed, "
-                "or completed todos can be retried."
+                f"Plan item '{todo_id}' is {item.status}; only blocked, failed, "
+                "or completed plan items can be retried."
             )
         previous = item.status
         item.status = TODO_STATUS_PENDING
@@ -278,12 +278,12 @@ class TodoStore:
         item.verification_note = ""
         self.approval_state = PLAN_APPROVAL_PENDING
         self.approval_note = _single_line(
-            reason or f"Todo '{todo_id}' retried from {previous}.",
+            reason or f"Plan item '{todo_id}' retried from {previous}.",
             240,
         )
         self.revision += 1
         self._record_event(
-            "todo_retried",
+            "plan_item_retried",
             {
                 "id": item.id,
                 "from_status": previous,
@@ -298,19 +298,19 @@ class TodoStore:
     def unblock_todo(self, todo_id, reason=""):
         item = self._find_item(todo_id)
         if item is None:
-            raise ValueError(f"Unknown todo id: {todo_id}")
+            raise ValueError(f"Unknown plan item id: {todo_id}")
         if item.status != TODO_STATUS_BLOCKED:
-            raise ValueError(f"Todo '{todo_id}' is {item.status}, not blocked.")
+            raise ValueError(f"Plan item '{todo_id}' is {item.status}, not blocked.")
         item.status = TODO_STATUS_PENDING
         item.reason = ""
         self.approval_state = PLAN_APPROVAL_PENDING
         self.approval_note = _single_line(
-            reason or f"Todo '{todo_id}' unblocked.",
+            reason or f"Plan item '{todo_id}' unblocked.",
             240,
         )
         self.revision += 1
         self._record_event(
-            "todo_unblocked",
+            "plan_item_unblocked",
             {"id": item.id, "to_status": item.status, "reason": self.approval_note},
         )
         self._persist()
@@ -419,7 +419,7 @@ class TodoStore:
     def summary(self, include_completed=True):
         items = self.items if include_completed else self.incomplete_items()
         if not items:
-            return "(no todos)"
+            return "(no plan items)"
         return "\n".join(_format_todo_line(item) for item in items)
 
     def incomplete_summary(self):
@@ -428,14 +428,14 @@ class TodoStore:
     def actionable_summary(self):
         items = self.actionable_items()
         if not items:
-            return "(no pending or in-progress todos)"
+            return "(no pending or in-progress plan items)"
         return "\n".join(_format_todo_line(item) for item in items)
 
     def approval_summary(self):
         state = self.approval_state.replace("_", " ")
         note = f": {self.approval_note}" if self.approval_note else ""
         if not self.items:
-            return "Plan approval: not required (no todos)."
+            return "Plan approval: not required (no plan items)."
         return f"Plan approval: {state}{note}."
 
     def budget_status(self, max_tool_calls=None, used_tool_calls=0):
@@ -472,7 +472,7 @@ class TodoStore:
                 f"{item['priority'].upper()} {item['id']}"
                 for item in status["next"]
             )
-            lines.append(f"Next recommended todos: {next_text}.")
+            lines.append(f"Next recommended plan items: {next_text}.")
         actionable_count = len(self.actionable_items())
         if actionable_count and remaining <= actionable_count:
             lines.append(
@@ -496,14 +496,14 @@ class TodoStore:
             and self.approval_state == PLAN_APPROVAL_APPROVED
             and not in_progress
         ):
-            warnings.append("Approved active plan has no in_progress todo.")
+            warnings.append("Approved active plan has no in_progress item.")
 
         generated_ids = [
-            item.id for item in non_system if item.id.startswith("todo-")
+            item.id for item in non_system if item.id.startswith(("step-", "todo-"))
         ]
         if generated_ids:
             warnings.append(
-                "Some todos use generated ids; stable semantic ids make dependencies "
+                "Some plan items use generated ids; stable semantic ids make dependencies "
                 f"and recovery safer: {', '.join(generated_ids[:5])}."
             )
 
@@ -515,7 +515,7 @@ class TodoStore:
         ]
         if high_without_criteria:
             warnings.append(
-                "High-priority todos should include observable completion_criteria: "
+                "High-priority plan items should include observable completion_criteria: "
                 + ", ".join(high_without_criteria[:5])
                 + "."
             )
@@ -529,7 +529,7 @@ class TodoStore:
         ]
         if unverified:
             warnings.append(
-                "Completed todos with criteria still need verification evidence: "
+                "Completed plan items with criteria still need verification evidence: "
                 + ", ".join(unverified[:5])
                 + "."
             )
@@ -542,7 +542,7 @@ class TodoStore:
         ]
         if vague_blockers:
             warnings.append(
-                "Blocked/failed todos should have specific reasons: "
+                "Blocked/failed plan items should have specific reasons: "
                 + ", ".join(vague_blockers[:5])
                 + "."
             )
@@ -550,7 +550,7 @@ class TodoStore:
         p0_items = [item.id for item in non_system if item.priority == TODO_PRIORITY_P0]
         if len(p0_items) > 2:
             warnings.append(
-                "More than two P0 todos usually means priorities are not selective: "
+                "More than two P0 plan items usually means priorities are not selective: "
                 + ", ".join(p0_items[:5])
                 + "."
             )
@@ -568,7 +568,7 @@ class TodoStore:
             if actionable and remaining <= len(actionable):
                 warnings.append(
                     f"Only {remaining} tool calls remain for {len(actionable)} actionable "
-                    "todos; prioritize ready P0/P1 items."
+                    "plan items; prioritize ready P0/P1 items."
                 )
 
         return warnings
@@ -637,12 +637,12 @@ class TodoStore:
     def tool_result(self, max_tool_calls=None, used_tool_calls=0):
         parts = []
         if not self.items:
-            parts.append("Todos cleared. Todo panel hidden.")
+            parts.append("Plan cleared. Plan panel hidden.")
         elif self.all_completed():
-            parts.append("All todos completed. Todo panel hidden.")
+            parts.append("All plan items completed. Plan panel hidden.")
             parts.append(self.summary())
         else:
-            parts.append("Todos updated:")
+            parts.append("Plan updated:")
             parts.append(self.summary())
 
         if self.items:
@@ -657,13 +657,13 @@ class TodoStore:
         if todos is None:
             todos = []
         if not isinstance(todos, list):
-            raise ValueError("todos must be an array.")
+            raise ValueError("items must be an array.")
 
         items = []
         seen_ids = set()
         for index, todo in enumerate(todos, 1):
             if not isinstance(todo, dict):
-                raise ValueError(f"todos[{index}] must be an object.")
+                raise ValueError(f"items[{index}] must be an object.")
             content = str(
                 todo.get("content")
                 or todo.get("task")
@@ -673,9 +673,9 @@ class TodoStore:
             if not content:
                 continue
 
-            item_id = str(todo.get("id") or f"todo-{index}").strip()
+            item_id = str(todo.get("id") or f"step-{index}").strip()
             if item_id in seen_ids:
-                raise ValueError(f"Duplicate todo id: {item_id}")
+                raise ValueError(f"Duplicate plan item id: {item_id}")
             seen_ids.add(item_id)
 
             status = _normalize_todo_status(todo.get("status"))
@@ -687,7 +687,7 @@ class TodoStore:
                 or ""
             ).strip()
             if status in {TODO_STATUS_BLOCKED, TODO_STATUS_FAILED} and not reason:
-                raise ValueError(f"{status} todo '{item_id}' must include a reason.")
+                raise ValueError(f"{status} plan item '{item_id}' must include a reason.")
 
             completion_criteria = _normalize_completion_criteria(
                 todo.get("completion_criteria")
@@ -698,7 +698,7 @@ class TodoStore:
             verification_note = str(todo.get("verification_note") or "").strip()
             if verified and completion_criteria and not verification_note:
                 raise ValueError(
-                    f"Verified todo '{item_id}' must include verification_note."
+                    f"Verified plan item '{item_id}' must include verification_note."
                 )
 
             items.append(
@@ -866,12 +866,16 @@ class TodoStore:
         for item in self.items:
             old = old_by_id.get(item.id)
             if old is None:
-                self._record_event("todo_added", {"todo": item.to_dict()})
+                self._record_event("plan_item_added", {"item": item.to_dict()})
                 continue
             changes = _item_changes(old, item)
             if not changes:
                 continue
-            event_type = "todo_status_changed" if set(changes) == {"status"} else "todo_updated"
+            event_type = (
+                "plan_item_status_changed"
+                if set(changes) == {"status"}
+                else "plan_item_updated"
+            )
             payload = {"id": item.id, "changes": changes}
             if "status" in changes:
                 payload["from_status"] = changes["status"]["from"]
@@ -880,7 +884,7 @@ class TodoStore:
 
         for item in old_items:
             if item.id not in new_by_id:
-                self._record_event("todo_removed", {"id": item.id, "todo": item.to_dict()})
+                self._record_event("plan_item_removed", {"id": item.id, "item": item.to_dict()})
 
         if old_approval_state != self.approval_state:
             self._record_event(
@@ -914,10 +918,10 @@ def _validate_dependencies(items):
     for item in items:
         for dependency in item.depends_on:
             if dependency == item.id:
-                raise ValueError(f"Todo '{item.id}' cannot depend on itself.")
+                raise ValueError(f"Plan item '{item.id}' cannot depend on itself.")
             if dependency not in by_id:
                 raise ValueError(
-                    f"Todo '{item.id}' depends on unknown todo '{dependency}'."
+                    f"Plan item '{item.id}' depends on unknown plan item '{dependency}'."
                 )
 
     visiting = set()
@@ -927,7 +931,7 @@ def _validate_dependencies(items):
         if item.id in visited:
             return
         if item.id in visiting:
-            raise ValueError("Todo dependencies cannot contain cycles.")
+            raise ValueError("Plan item dependencies cannot contain cycles.")
         visiting.add(item.id)
         for dependency_id in item.depends_on:
             visit(by_id[dependency_id])
@@ -947,7 +951,7 @@ def _validate_dependencies(items):
         ]
         if unmet:
             raise ValueError(
-                f"Todo '{item.id}' cannot be {item.status} until dependencies "
+                f"Plan item '{item.id}' cannot be {item.status} until dependencies "
                 f"are completed: {', '.join(unmet)}"
             )
 
@@ -1038,7 +1042,7 @@ def _validate_single_in_progress(items):
         item.id for item in items if item.status == TODO_STATUS_IN_PROGRESS
     ]
     if len(in_progress) > 1:
-        raise ValueError("Only one todo can be in_progress at a time.")
+        raise ValueError("Only one plan item can be in_progress at a time.")
 
 
 def _hold_unapproved_progress(

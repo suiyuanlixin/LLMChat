@@ -18,7 +18,7 @@ from ui import (
     print_stream_response_continue,
     print_stream_response_start,
     print_warn,
-    set_todos_panel,
+    set_plan_panel,
 )
 from config import (
     API_TYPE_ANTHROPIC,
@@ -41,6 +41,8 @@ from config import (
 from memory import MemoryStore, parse_memory_update_response
 from tools import (
     AgentTools,
+    PROGRAM_DOCS_TOOL_DEFINITION,
+    WEB_FETCH_TOOL_DEFINITION,
     WEB_SEARCH_TOOL_DEFINITION,
     anthropic_tool_schemas,
     glm_tool_schemas,
@@ -93,21 +95,6 @@ AGENT_SYSTEM_PROMPT = f"""{AGENT_PROJECT_PROMPT}
 
 Rules:
 - Work only inside the configured workspace and use tools for local file facts.
-- For multi-step tasks, create and maintain a task plan with update_todos before acting.
-- Call update_todos with the full current todo list whenever task status changes.
-- After a plan is approved, keep existing todo ids in later update_todos calls until they are completed, blocked, or failed; do not drop or replace approved todos just to revise the plan.
-- Give each todo a stable id when dependencies matter. Use depends_on to block later work until prerequisites are completed.
-- Use priority p0/p1/p2/p3 to reflect urgency. Prefer p0/p1 tasks when budget is tight.
-- Treat planning and acting as separate phases. A new plan requires approval before non-planning tools run; approved plans can be updated in place while work continues.
-- Before plan approval, leave planned work pending; do not mark a todo in_progress or completed until tools have actually run after approval.
-- Keep at most one todo in_progress. Mark the active step in_progress before working on it.
-- Use structured completion_criteria for tasks that need observable proof. Prefer objects like {{"type":"test","target":"pytest path","expected":"exit code 0"}}.
-- Set verified=true with a verification_note only after tool output proves the criteria.
-- Use blocked with a clear reason when progress requires user input or an external change.
-- Use failed with a clear reason when verification fails or an attempted approach is invalid; do not mark it completed just to finish.
-- Keep the plan high quality: avoid vague tasks, avoid too many P0 todos, include criteria for P0/P1 work, and keep dependencies explicit.
-- Mark completed steps completed, and do not give the final answer while any todo is pending or in_progress.
-- Skip update_todos for simple one-step answers or direct questions that do not need a plan.
 - Explore before editing: list directories, search, and read relevant line ranges first.
 - Prefer small, targeted changes. Do not rewrite unrelated code.
 - Use read_file with line ranges and line numbers when a file is long.
@@ -119,6 +106,25 @@ Rules:
 - In the final summary, distinguish files you edited in this run from pre-existing workspace changes.
 - If a tool fails, explain the failure and try a different precise approach instead of repeating the same call.
 - Stop when the task is complete and summarize what changed."""
+
+
+AGENT_PLAN_RULES = """
+Plan rules:
+- For multi-step tasks, create and maintain a task plan with update_plan before acting.
+- Call update_plan with the full current plan item list whenever task status changes.
+- After a plan is approved, keep existing plan item ids in later update_plan calls until they are completed, blocked, or failed; do not drop or replace approved items just to revise the plan.
+- Give each plan item a stable id when dependencies matter. Use depends_on to block later work until prerequisites are completed.
+- Use priority p0/p1/p2/p3 to reflect urgency. Prefer p0/p1 tasks when budget is tight.
+- Treat planning and acting as separate phases. A new plan requires approval before non-planning tools run; approved plans can be updated in place while work continues.
+- Before plan approval, leave planned work pending; do not mark a plan item in_progress or completed until tools have actually run after approval.
+- Keep at most one plan item in_progress. Mark the active step in_progress before working on it.
+- Use structured completion_criteria for tasks that need observable proof. Prefer objects like {"type":"test","target":"pytest path","expected":"exit code 0"}.
+- Set verified=true with a verification_note only after tool output proves the criteria.
+- Use blocked with a clear reason when progress requires user input or an external change.
+- Use failed with a clear reason when verification fails or an attempted approach is invalid; do not mark it completed just to finish.
+- Keep the plan high quality: avoid vague items, avoid too many P0 items, include criteria for P0/P1 work, and keep dependencies explicit.
+- Mark completed steps completed, and do not give the final answer while any plan item is pending or in_progress.
+- Skip update_plan for simple one-step answers or direct questions that do not need a plan."""
 
 
 COMPACTION_SYSTEM_PROMPT = """你负责压缩聊天上下文。
@@ -224,6 +230,7 @@ class OmniAgent:
         web_search_max_results=5,
         web_search_depth="basic",
         web_search_topic="general",
+        agent_plan_enabled=True,
     ):
         _ensure_user_prompt_file()
         self.debug = bool(debug)
@@ -256,7 +263,8 @@ class OmniAgent:
             web_search_max_results=web_search_max_results,
             web_search_depth=web_search_depth,
             web_search_topic=web_search_topic,
-            todo_update_callback=set_todos_panel,
+            todo_update_callback=set_plan_panel,
+            todos_enabled=agent_plan_enabled,
             skills_enabled=skills_enabled,
             skills_app_enabled=skills_source_app,
             skills_workspace_enabled=skills_source_workspace,
@@ -272,6 +280,8 @@ class OmniAgent:
         self.agent_stop_requested = False
         self.agent_tool_calls = 0
         self.agent_final_check_done = False
+        self.agent_plan_check_signature = None
+        self.agent_plan_check_exit_note = ""
         self.agent_context_warning_sent = False
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
@@ -280,7 +290,7 @@ class OmniAgent:
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
-        self.resume_existing_todos = False
+        self.resume_existing_plan = False
         self.configure(
             api_type,
             base_url,
@@ -419,6 +429,10 @@ class OmniAgent:
     def set_agent_summary_model(self, model):
         self.agent_summary_model = str(model or "").strip()
 
+    def set_agent_plan_enabled(self, enabled):
+        self.agent_tools.set_todos_enabled(enabled)
+        self.agent_final_check_done = False
+
     def set_agent_skills(self, enabled):
         self.agent_tools.set_skills_enabled(enabled)
 
@@ -464,6 +478,9 @@ class OmniAgent:
 
     def _normal_web_search_available(self):
         return bool(self.agent_tools.web_search_available)
+
+    def _normal_tools_available(self):
+        return True
 
     def set_compaction_config(
         self,
@@ -531,44 +548,45 @@ class OmniAgent:
             "approval_mode": self.agent_tools.approval_mode,
             "show_thinking": self.agent_show_thinking,
             "summary_model": self.agent_summary_model,
+            "plan_enabled": self.agent_tools.todos_enabled,
             "skills": self.agent_tools.skills_status(),
             "plan": self.agent_tools.todo_status(),
         }
 
-    def get_todo_status(self):
+    def get_plan_status(self):
         return self.agent_tools.todo_status()
 
-    def clear_todos(self):
+    def clear_plan(self):
         self.agent_tools.clear_todos()
-        self.resume_existing_todos = False
+        self.resume_existing_plan = False
 
-    def approve_todos(self, note=""):
+    def approve_plan(self, note=""):
         changed = self.agent_tools.approve_todos(note)
         if changed:
-            self.resume_existing_todos = True
+            self.resume_existing_plan = True
         return changed
 
-    def reject_todos(self, reason=""):
+    def reject_plan(self, reason=""):
         return self.agent_tools.reject_todos(reason)
 
-    def retry_todo(self, todo_id, reason=""):
+    def retry_plan_item(self, todo_id, reason=""):
         changed = self.agent_tools.retry_todo(todo_id, reason)
         if changed:
             self.agent_final_check_done = False
-            self.resume_existing_todos = True
+            self.resume_existing_plan = True
         return changed
 
-    def unblock_todo(self, todo_id, reason=""):
+    def unblock_plan_item(self, todo_id, reason=""):
         changed = self.agent_tools.unblock_todo(todo_id, reason)
         if changed:
             self.agent_final_check_done = False
-            self.resume_existing_todos = True
+            self.resume_existing_plan = True
         return changed
 
-    def get_todo_quality_report(self):
+    def get_plan_quality_report(self):
         return self.agent_tools.todo_quality_report()
 
-    def get_todo_history(self, limit=20):
+    def get_plan_history(self, limit=20):
         return self.agent_tools.todo_history(limit)
 
     def send_message(
@@ -588,7 +606,7 @@ class OmniAgent:
 
             if self.agent_mode:
                 response = self._agent_response()
-            elif self._normal_web_search_available():
+            elif self._normal_tools_available():
                 response = self._normal_web_search_response(
                     stream_callback_thinking,
                     stream_callback_response,
@@ -653,6 +671,8 @@ class OmniAgent:
         self.agent_stop_requested = False
         self.agent_tool_calls = 0
         self.agent_final_check_done = False
+        self.agent_plan_check_signature = None
+        self.agent_plan_check_exit_note = ""
         self.agent_context_warning_sent = False
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
@@ -661,8 +681,8 @@ class OmniAgent:
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
-        self.agent_tools.begin_agent_session(clear_todos=not self.resume_existing_todos)
-        self.resume_existing_todos = False
+        self.agent_tools.begin_agent_session(clear_todos=not self.resume_existing_plan)
+        self.resume_existing_plan = False
         self.agent_tools.set_budget_context(
             self.max_agent_tool_calls,
             self.agent_tool_calls,
@@ -729,6 +749,9 @@ class OmniAgent:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                final_response = self._agent_response_with_plan_exit_note(
+                    final_response
+                )
                 self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
@@ -804,6 +827,9 @@ class OmniAgent:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                final_response = self._agent_response_with_plan_exit_note(
+                    final_response
+                )
                 self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
@@ -1041,9 +1067,13 @@ class OmniAgent:
                 )
 
     def _execute_normal_web_search_tool(self, name, arguments):
+        arguments = arguments if isinstance(arguments, dict) else {}
+        if name == "read_program_docs":
+            return self.agent_tools.execute(name, arguments)
+        if name == "web_fetch":
+            return self.agent_tools.execute(name, arguments)
         if name != "web_search":
             return _error_text(f"Tool is not available in normal mode: {name}")
-        arguments = arguments if isinstance(arguments, dict) else {}
         query = str(arguments.get("query") or "").strip()
         kwargs = {key: value for key, value in arguments.items() if key != "query"}
         try:
@@ -1057,10 +1087,8 @@ class OmniAgent:
         stream_callback_response=None,
     ):
         try:
-            thinking_started = False
             if self.thinking_mode:
-                print_stream_thinking("")
-                thinking_started = True
+                print_stream_thinking("", leading_newline=False)
             full_thinking = ""
             final_response = ""
 
@@ -1068,7 +1096,7 @@ class OmniAgent:
                 (
                     assistant_message,
                     thinking,
-                    _text,
+                    text,
                     tool_calls,
                     _response_started,
                 ) = self._stream_chat_completion_normal_web_search_turn(
@@ -1081,11 +1109,11 @@ class OmniAgent:
                 full_thinking += thinking
 
                 if not tool_calls:
-                    return self._stream_normal_web_search_final_response(
+                    self.conversation_history.append(assistant_message)
+                    return self._stream_normal_tool_first_response(
                         full_thinking,
-                        stream_callback_thinking,
+                        text,
                         stream_callback_response,
-                        thinking_started=thinking_started,
                     )
 
                 self.conversation_history.append(assistant_message)
@@ -1272,10 +1300,8 @@ class OmniAgent:
         stream_callback_response=None,
     ):
         try:
-            thinking_started = False
             if self.thinking_mode:
-                print_stream_thinking("")
-                thinking_started = True
+                print_stream_thinking("", leading_newline=False)
             full_thinking = ""
             final_response = ""
 
@@ -1283,7 +1309,7 @@ class OmniAgent:
                 (
                     assistant_message,
                     thinking,
-                    _text,
+                    text,
                     tool_calls,
                     _response_started,
                 ) = self._stream_ollama_normal_web_search_turn(
@@ -1296,11 +1322,11 @@ class OmniAgent:
                 full_thinking += thinking
 
                 if not tool_calls:
-                    return self._stream_normal_web_search_final_response(
+                    self.conversation_history.append(assistant_message)
+                    return self._stream_normal_tool_first_response(
                         _clean_reasoning_text(full_thinking),
-                        stream_callback_thinking,
+                        text,
                         stream_callback_response,
-                        thinking_started=thinking_started,
                     )
 
                 self.conversation_history.append(assistant_message)
@@ -1472,10 +1498,8 @@ class OmniAgent:
         stream_callback_response=None,
     ):
         try:
-            thinking_started = False
             if self.thinking_mode:
-                print_stream_thinking("")
-                thinking_started = True
+                print_stream_thinking("", leading_newline=False)
             full_thinking = ""
             final_response = ""
 
@@ -1483,7 +1507,7 @@ class OmniAgent:
                 (
                     blocks,
                     thinking,
-                    _text,
+                    text,
                     tool_uses,
                     _response_started,
                 ) = self._stream_anthropic_normal_web_search_turn(
@@ -1496,11 +1520,14 @@ class OmniAgent:
                 full_thinking += thinking
 
                 if not tool_uses:
-                    return self._stream_normal_web_search_final_response(
+                    self.conversation_history.append({
+                        "role": "assistant",
+                        "content": blocks,
+                    })
+                    return self._stream_normal_tool_first_response(
                         full_thinking,
-                        stream_callback_thinking,
+                        text,
                         stream_callback_response,
-                        thinking_started=thinking_started,
                     )
 
                 self.conversation_history.append({
@@ -1727,34 +1754,22 @@ class OmniAgent:
         print_stream_response_start(self.model)
         return True
 
-    def _stream_normal_web_search_final_response(
+    def _stream_normal_tool_first_response(
         self,
-        prior_thinking,
-        stream_callback_thinking=None,
-        stream_callback_response=None,
-        thinking_started=False,
+        thinking,
+        response,
+        callback_response=None,
     ):
-        previous = getattr(self, "_normal_web_search_final_response_active", False)
-        self._normal_web_search_final_response_active = True
-        try:
-            response = self._stream_response(
-                stream_callback_thinking,
-                stream_callback_response,
-                self.model,
-                initial_thinking=prior_thinking,
-                thinking_started=thinking_started,
-            )
-        finally:
-            self._normal_web_search_final_response_active = previous
-
-        if not response:
-            return None
-        response["thinking"] = _combine_reasoning_text(
-            prior_thinking,
-            response.get("thinking", ""),
-        )
-        response["response_streamed"] = True
-        return response
+        response_started = False
+        if response:
+            response_started = self._start_normal_stream_response(False, thinking)
+            if callback_response:
+                callback_response(response)
+        return {
+            "thinking": thinking,
+            "response": response,
+            "response_streamed": response_started,
+        }
 
     def _stream_normal_web_search_round_limit_response(
         self,
@@ -1764,7 +1779,7 @@ class OmniAgent:
         stream_callback_response=None,
     ):
         message = (
-            "Web search stopped after reaching the normal-mode search round limit."
+            "Normal-mode tools stopped after reaching the round limit."
         )
         if response_started or thinking:
             console.print()
@@ -1810,7 +1825,7 @@ class OmniAgent:
         callback_response=None,
     ):
         if thinking and self.thinking_mode and callback_thinking:
-            print_stream_thinking("")
+            print_stream_thinking("", leading_newline=False)
             callback_thinking(thinking)
             if not thinking.endswith("\n"):
                 console.print()
@@ -1826,7 +1841,7 @@ class OmniAgent:
         stream_callback_response=None,
     ):
         message = (
-            "Web search stopped after reaching the normal-mode search round limit."
+            "Normal-mode tools stopped after reaching the round limit."
         )
         print_error(message)
         return self._finalize_normal_web_search_response(
@@ -1851,6 +1866,7 @@ class OmniAgent:
                     tools=ollama_tool_schemas(
                         self.agent_tools.web_search_available,
                         self.agent_tools.skills_available,
+                        self.agent_tools.todos_enabled,
                     ),
                 )
             )
@@ -1869,6 +1885,9 @@ class OmniAgent:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                final_response = self._agent_response_with_plan_exit_note(
+                    final_response
+                )
                 self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
@@ -1916,6 +1935,7 @@ class OmniAgent:
             tools=anthropic_tool_schemas(
                 self.agent_tools.web_search_available,
                 self.agent_tools.skills_available,
+                self.agent_tools.todos_enabled,
             ),
             stream=True,
             **self._anthropic_request_options(),
@@ -2981,6 +3001,12 @@ class OmniAgent:
 
     def _append_agent_final_check_if_needed(self):
         if self.agent_tools.has_incomplete_todos():
+            signature = self._agent_plan_check_signature()
+            if self.agent_plan_check_signature == signature:
+                self.agent_plan_check_exit_note = self._agent_plan_check_exit_note()
+                print_warn("Agent plan check stopped to avoid an automatic loop.")
+                return False
+            self.agent_plan_check_signature = signature
             budget_summary = self.agent_tools.todo_budget_summary()
             quality_report = self.agent_tools.todo_quality_report()
             extra_guidance = ""
@@ -2993,10 +3019,10 @@ class OmniAgent:
                 "content": (
                     "Automatic task plan check for this local agent run:\n\n"
                     f"{self.agent_tools.todo_actionable_summary()}\n\n"
-                    "There are still pending or in-progress todos. Continue using tools "
+                    "There are still pending or in-progress plan items. Continue using tools "
                     "to finish the remaining work. Respect depends_on before starting later "
-                    "todos, and update the todo list as each item changes. Only provide the "
-                    "final response after all pending/in-progress todos are completed, blocked, "
+                    "items, and update the plan as each item changes. Only provide the "
+                    "final response after all pending/in-progress plan items are completed, blocked, "
                     "or failed with a clear reason."
                     f"{extra_guidance}"
                 ),
@@ -3019,16 +3045,25 @@ class OmniAgent:
         )
 
         if verification_passed:
-            verification_instruction = (
-                "Automatic final verification passed. Completed todos with completion criteria "
-                "are now tied to this verification result. "
-            )
+            if self.agent_tools.todos_enabled:
+                verification_instruction = (
+                    "Automatic final verification passed. Completed plan items with completion criteria "
+                    "are now tied to this verification result. "
+                )
+            else:
+                verification_instruction = "Automatic final verification passed. "
         else:
-            verification_instruction = (
-                "Automatic final verification failed, and the Todo List now includes a failed "
-                "automatic verification item. Continue using tools to fix the failure and update "
-                "todos; if you cannot proceed, mark the relevant todo blocked with a clear reason. "
-            )
+            if self.agent_tools.todos_enabled:
+                verification_instruction = (
+                    "Automatic final verification failed, and the Plan now includes a failed "
+                    "automatic verification item. Continue using tools to fix the failure and update "
+                    "the plan; if you cannot proceed, mark the relevant plan item blocked with a clear reason. "
+                )
+            else:
+                verification_instruction = (
+                    "Automatic final verification failed. Continue using tools to fix the failure; "
+                    "the plan is disabled, so do not call update_plan. "
+                )
         self.conversation_history.append({
             "role": "user",
             "content": (
@@ -3043,6 +3078,32 @@ class OmniAgent:
             ),
         })
         return True
+
+    def _agent_plan_check_signature(self):
+        return (
+            self.agent_tools.todo_revision(),
+            self.agent_tools.session_change_count(),
+            self.agent_tool_calls,
+        )
+
+    def _agent_plan_check_exit_note(self):
+        summary = self.agent_tools.todo_actionable_summary()
+        return (
+            "OmniAgent stopped the automatic plan check to avoid a repeat loop. "
+            "The model returned a final response without using tools after the same "
+            "plan check had already been sent, and the plan still has pending or "
+            "in-progress items:\n\n"
+            f"{summary}"
+        )
+
+    def _agent_response_with_plan_exit_note(self, response):
+        note = self.agent_plan_check_exit_note
+        if not note:
+            return response
+        response = str(response or "").rstrip()
+        if not response:
+            return note
+        return f"{response}\n\n{note}"
 
     def _execute_agent_tool(self, name, tool_input):
         self.agent_tool_calls += 1
@@ -3110,7 +3171,7 @@ class OmniAgent:
                 response = self.client.chat.completions.create(**kwargs)
 
             if self.thinking_mode and not thinking_started:
-                print_stream_thinking("")
+                print_stream_thinking("", leading_newline=False)
             field_thinking = ""
             tagged_thinking = ""
             raw_thinking = ""
@@ -3204,7 +3265,7 @@ class OmniAgent:
             )
 
             if self.thinking_mode and not thinking_started:
-                print_stream_thinking("")
+                print_stream_thinking("", leading_newline=False)
             field_thinking = ""
             tagged_thinking = ""
             full_response = ""
@@ -3297,7 +3358,7 @@ class OmniAgent:
             )
 
             if self.thinking_mode and not thinking_started:
-                print_stream_thinking("")
+                print_stream_thinking("", leading_newline=False)
             field_thinking = ""
             tagged_thinking = ""
             full_response = ""
@@ -3703,23 +3764,48 @@ class OmniAgent:
 
     def _normal_system_prompt(self):
         prompt = NORMAL_SYSTEM_PROMPT
-        if getattr(self, "_normal_web_search_final_response_active", False):
-            prompt += (
-                "\nWeb search planning for this turn is complete. If search results are "
-                "present in the conversation, use them for the final answer and cite their "
-                "source URLs. Do not call web_search in this final response."
-            )
-        elif self._normal_web_search_available():
+        if self._normal_web_search_available():
             prompt += (
                 "\n联网搜索已开启。遇到近期、易变化、外部事实不足或需要来源支撑的问题时，"
                 "使用 web_search；回答中引用搜索结果里的来源 URL。"
             )
+        if self.agent_tools.program_docs_available:
+            prompt += (
+                "\nYou may use read_program_docs to read OmniAgent's built-in "
+                "README when the user asks how to use, configure, learn, or "
+                "troubleshoot this program. This does not grant general workspace "
+                "file access in normal chat."
+            )
+        prompt += (
+            "\nUse web_fetch when the user provides a specific public webpage URL "
+            "and asks you to read or summarize that page."
+        )
         return _with_user_custom_prompt(
             _with_persistent_memory(prompt, self.memory_store)
         )
 
     def _agent_system_prompt(self):
         prompt = AGENT_SYSTEM_PROMPT
+        if self.agent_tools.todos_enabled:
+            prompt += "\n\n" + AGENT_PLAN_RULES
+        else:
+            prompt += (
+                "\n\nAgent plan is disabled for this session. Do not call update_plan, "
+                "do not wait for plan approval, and do not refer to plan state as required "
+                "for completion."
+            )
+        prompt += (
+            "\n- Use web_fetch when the user provides a specific public webpage URL "
+            "and asks you to read or summarize that page."
+        )
+        prompt += (
+            "\n- Use ask_user only for an important uncertainty that materially affects "
+            "the goal, scope, tradeoffs, or acceptance criteria and cannot be resolved "
+            "from local files, tools, or web facts. Ask one multiple-choice question at a time."
+            "\n- When you need the user to choose among options during an Agent task, "
+            "call ask_user instead of writing a numbered or bulleted choice list in normal "
+            "assistant text. After ask_user returns, continue the task with the selected option."
+        )
         if self.agent_tools.web_search_available:
             prompt += (
                 "\n- Use web_search for recent, unstable, or external facts when local files "
@@ -3917,24 +4003,33 @@ class OmniAgent:
     def _chat_tool_schemas(self):
         include_web_search = self.agent_tools.web_search_available
         include_skills = self.agent_tools.skills_available
+        include_plan = self.agent_tools.todos_enabled
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
-            return openai_tool_schemas(include_web_search, include_skills)
-        return glm_tool_schemas(include_web_search, include_skills)
+            return openai_tool_schemas(include_web_search, include_skills, include_plan)
+        return glm_tool_schemas(include_web_search, include_skills, include_plan)
 
     def _normal_web_search_tool_schemas(self):
-        if self.api_type == API_TYPE_ANTHROPIC:
-            return [WEB_SEARCH_TOOL_DEFINITION]
+        definitions = []
+        if self.agent_tools.program_docs_available:
+            definitions.append(PROGRAM_DOCS_TOOL_DEFINITION)
+        definitions.append(WEB_FETCH_TOOL_DEFINITION)
+        if self.agent_tools.web_search_available:
+            definitions.append(WEB_SEARCH_TOOL_DEFINITION)
 
-        definition = WEB_SEARCH_TOOL_DEFINITION
-        schema = {
-            "type": "function",
-            "function": {
-                "name": definition["name"],
-                "description": definition["description"],
-                "parameters": definition["input_schema"],
-            },
-        }
-        return [schema]
+        if self.api_type == API_TYPE_ANTHROPIC:
+            return definitions
+
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": definition["name"],
+                    "description": definition["description"],
+                    "parameters": definition["input_schema"],
+                },
+            }
+            for definition in definitions
+        ]
 
     def _chat_tool_result_message(self, tool_call_id, name, content):
         message = {
@@ -4174,14 +4269,14 @@ class OmniAgent:
         self.conversation_history = []
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
-        self.clear_todos()
+        self.clear_plan()
         self._clear_context_usage()
 
     def set_history(self, history):
         self.conversation_history = list(history or [])
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
-        self.clear_todos()
+        self.clear_plan()
         self._clear_context_usage()
 
     def get_history(self):

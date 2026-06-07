@@ -1,5 +1,6 @@
 import fnmatch
 import difflib
+import ipaddress
 import json
 import os
 import re
@@ -10,12 +11,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 
 from planning import TodoStore
 from skills import SkillRegistry
 from ui import (
     get_agent_confirmation,
+    get_agent_choice,
     get_agent_diff_confirmation,
     get_agent_plan_confirmation,
 )
@@ -42,6 +45,13 @@ COMMAND_TIMEOUT_SECONDS = 60
 GIT_TIMEOUT_SECONDS = 30
 AGENT_APPROVAL_CONFIRM = "confirm"
 AGENT_APPROVAL_AUTO = "auto"
+PROGRAM_DOC_FILENAMES = ("README.md",)
+PROGRAM_DOC_DEFAULT_MAX_CHARS = 30000
+WEB_FETCH_DEFAULT_MAX_CHARS = 8000
+WEB_FETCH_MAX_CHARS = 60000
+WEB_FETCH_MAX_RESPONSE_BYTES = 1000000
+WEB_FETCH_MAX_REDIRECTS = 5
+NO_WORKSPACE_TOOLS = {"read_program_docs", "web_fetch"}
 
 SKIP_DIRS = {
     ".git",
@@ -52,24 +62,104 @@ SKIP_DIRS = {
     ".pytest_cache",
 }
 
+PROGRAM_DOCS_TOOL_DEFINITION = {
+    "name": "read_program_docs",
+    "description": (
+        "Read OmniAgent's built-in program documentation so the assistant can "
+        "help users learn commands, configuration, agent mode, skills, and usage. "
+        "This read-only tool only exposes approved documentation files."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "max_chars": {
+                "type": "integer",
+                "description": (
+                    "Optional maximum documentation characters to return. "
+                    "Defaults to 30000."
+                ),
+            },
+        },
+    },
+}
+
+WEB_FETCH_TOOL_DEFINITION = {
+    "name": "web_fetch",
+    "description": (
+        "Fetch a single public HTTP/HTTPS URL and return extracted text or raw "
+        "HTML/text. Use this when the user provides a specific webpage link. "
+        "Blocks localhost, private, loopback, link-local, multicast, reserved, "
+        "and other non-public addresses."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The full public http:// or https:// URL to fetch.",
+            },
+            "extract_mode": {
+                "type": "string",
+                "enum": ["text", "raw"],
+                "description": "text extracts readable page text; raw returns raw HTML/text. Defaults to text.",
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": "Maximum characters to return. Defaults to 8000.",
+            },
+        },
+        "required": ["url"],
+    },
+}
+
+ASK_USER_TOOL_DEFINITION = {
+    "name": "ask_user",
+    "description": (
+        "Ask the user one important multiple-choice question and return the selected option. "
+        "In Agent mode, use this tool instead of asking the user to choose from options "
+        "in normal assistant text. "
+        "Use only for uncertainty that materially affects goal, scope, tradeoffs, or acceptance "
+        "criteria and cannot be resolved from local files, tools, or web facts."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The single question to ask the user.",
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Two to eight mutually exclusive answer options.",
+            },
+            "default_index": {
+                "type": "integer",
+                "description": "Optional 1-based default option index.",
+            },
+        },
+        "required": ["question", "options"],
+    },
+}
+
 TOOL_DEFINITIONS = [
     {
-        "name": "update_todos",
+        "name": "update_plan",
         "description": (
-            "Replace the current task plan with a full todo list. "
+            "Replace the current task plan with a full list of plan items. "
             "Use this for multi-step agent work. Supports dependencies, priorities, "
             "completion criteria, and blocked/failed states. Keep existing approved "
-            "todo ids until they are completed, blocked, or failed. At most one item "
-            "may be in_progress."
+            "plan item ids until they are completed, blocked, or failed. At most one "
+            "item may be in_progress."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "todos": {
+                "items": {
                     "type": "array",
                     "description": (
-                        "The complete current todo list. Preserve existing approved "
-                        "todos in this array until they are completed, blocked, or failed. "
+                        "The complete current plan item list. Preserve existing approved "
+                        "items in this array until they are completed, blocked, or failed. "
                         "Use an empty array only when intentionally clearing an inactive plan."
                     ),
                     "items": {
@@ -117,7 +207,7 @@ TOOL_DEFINITIONS = [
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": (
-                                    "Todo ids that must be completed before this task can be "
+                                    "Plan item ids that must be completed before this task can be "
                                     "in_progress or completed."
                                 ),
                             },
@@ -168,7 +258,7 @@ TOOL_DEFINITIONS = [
                                     ]
                                 },
                                 "description": (
-                                    "Observable conditions required before this todo may be "
+                                    "Observable conditions required before this item may be "
                                     "considered done. Prefer structured objects with type, "
                                     "target, and expected."
                                 ),
@@ -184,7 +274,7 @@ TOOL_DEFINITIONS = [
                                 "type": "boolean",
                                 "description": (
                                     "Whether the completion criteria were verified by tool output. "
-                                    "Use only with completed todos."
+                                    "Use only with completed plan items."
                                 ),
                             },
                             "verification_note": {
@@ -199,9 +289,10 @@ TOOL_DEFINITIONS = [
                     },
                 },
             },
-            "required": ["todos"],
+            "required": ["items"],
         },
     },
+    ASK_USER_TOOL_DEFINITION,
     {
         "name": "read_file",
         "description": "Read a UTF-8 text file from the configured workspace.",
@@ -228,6 +319,8 @@ TOOL_DEFINITIONS = [
             "required": ["file_path"],
         },
     },
+    PROGRAM_DOCS_TOOL_DEFINITION,
+    WEB_FETCH_TOOL_DEFINITION,
     {
         "name": "list_dir",
         "description": "List files and directories under a workspace path.",
@@ -360,7 +453,7 @@ TOOL_DEFINITIONS = [
         "description": (
             "Start a temporary Python static HTTP server inside the workspace, request one "
             "or more local paths, then terminate the server before returning. Use this for "
-            "static-site todos like 'start static service + curl check 200' instead of "
+            "static-site plan items like 'start static service + curl check 200' instead of "
             "running a foreground server with bash."
         ),
         "input_schema": {
@@ -556,8 +649,12 @@ SKILL_TOOL_DEFINITIONS = [
 ]
 
 
-def tool_definitions(include_web_search=False, include_skills=False):
-    definitions = list(TOOL_DEFINITIONS)
+def tool_definitions(include_web_search=False, include_skills=False, include_plan=True):
+    definitions = [
+        tool
+        for tool in TOOL_DEFINITIONS
+        if include_plan or tool["name"] != "update_plan"
+    ]
     if include_skills:
         definitions.extend(SKILL_TOOL_DEFINITIONS)
     if include_web_search:
@@ -565,11 +662,15 @@ def tool_definitions(include_web_search=False, include_skills=False):
     return definitions
 
 
-def anthropic_tool_schemas(include_web_search=False, include_skills=False):
-    return tool_definitions(include_web_search, include_skills)
+def anthropic_tool_schemas(
+    include_web_search=False,
+    include_skills=False,
+    include_plan=True,
+):
+    return tool_definitions(include_web_search, include_skills, include_plan)
 
 
-def glm_tool_schemas(include_web_search=False, include_skills=False):
+def glm_tool_schemas(include_web_search=False, include_skills=False, include_plan=True):
     return [
         {
             "type": "function",
@@ -579,16 +680,16 @@ def glm_tool_schemas(include_web_search=False, include_skills=False):
                 "parameters": tool["input_schema"],
             },
         }
-        for tool in tool_definitions(include_web_search, include_skills)
+        for tool in tool_definitions(include_web_search, include_skills, include_plan)
     ]
 
 
-def openai_tool_schemas(include_web_search=False, include_skills=False):
-    return glm_tool_schemas(include_web_search, include_skills)
+def openai_tool_schemas(include_web_search=False, include_skills=False, include_plan=True):
+    return glm_tool_schemas(include_web_search, include_skills, include_plan)
 
 
-def ollama_tool_schemas(include_web_search=False, include_skills=False):
-    return glm_tool_schemas(include_web_search, include_skills)
+def ollama_tool_schemas(include_web_search=False, include_skills=False, include_plan=True):
+    return glm_tool_schemas(include_web_search, include_skills, include_plan)
 
 
 class AgentToolError(Exception):
@@ -609,6 +710,7 @@ class AgentTools:
         web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
         todo_update_callback=None,
         plan_approval_output_callback=None,
+        todos_enabled=True,
         skills_enabled=True,
         skills_app_enabled=True,
         skills_workspace_enabled=False,
@@ -618,10 +720,12 @@ class AgentTools:
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
         self.plan_approval_output_callback = plan_approval_output_callback
+        self.todos_enabled = bool(todos_enabled)
         self.todo_store = TodoStore(
-            on_change=todo_update_callback,
+            on_change=todo_update_callback if self.todos_enabled else None,
             plan_dir=_plan_dir_for_workspace(self.workspace_dir),
         )
+        self.todo_update_callback = todo_update_callback
         self.max_tool_calls = None
         self.used_tool_calls = 0
         self.skill_registry = SkillRegistry(
@@ -647,6 +751,10 @@ class AgentTools:
     def enabled(self):
         return self.workspace_dir is not None
 
+    @property
+    def program_docs_available(self):
+        return bool(_program_doc_paths())
+
     def set_workspace_dir(self, workspace_dir):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.todo_store.set_plan_dir(
@@ -665,7 +773,16 @@ class AgentTools:
         self.visible_output_callback = callback
 
     def set_todo_update_callback(self, callback):
-        self.todo_store.set_on_change(callback)
+        self.todo_update_callback = callback
+        self.todo_store.set_on_change(callback if self.todos_enabled else None)
+
+    def set_todos_enabled(self, enabled):
+        self.todos_enabled = bool(enabled)
+        self.todo_store.set_on_change(
+            self.todo_update_callback if self.todos_enabled else None
+        )
+        if not self.todos_enabled and self.todo_update_callback:
+            self.todo_update_callback([])
 
     def set_budget_context(self, max_tool_calls=None, used_tool_calls=0):
         if max_tool_calls is None:
@@ -766,7 +883,7 @@ class AgentTools:
         return self._web_search(payload)
 
     def begin_agent_session(self, clear_todos=True):
-        if clear_todos:
+        if clear_todos and self.todos_enabled:
             self.todo_store.clear()
         self.session_changed_files = []
         self._session_changed_file_set = set()
@@ -788,33 +905,48 @@ class AgentTools:
         return self.todo_store.revision
 
     def todo_status(self):
-        return self.todo_store.status(
+        status = self.todo_store.status(
             max_tool_calls=self.max_tool_calls,
             used_tool_calls=self.used_tool_calls,
         )
+        status["enabled"] = self.todos_enabled
+        if not self.todos_enabled:
+            status["active_items"] = []
+            status["quality_warnings"] = []
+        return status
 
     def todo_summary(self, include_completed=True):
+        if not self.todos_enabled:
+            return "(plan disabled)"
         return self.todo_store.summary(include_completed=include_completed)
 
     def todo_incomplete_summary(self):
+        if not self.todos_enabled:
+            return "(plan disabled)"
         return self.todo_store.incomplete_summary()
 
     def has_incomplete_todos(self):
-        return self.todo_store.has_actionable_incomplete()
+        return self.todos_enabled and self.todo_store.has_actionable_incomplete()
 
     def has_unverified_completed_todos(self):
-        return self.todo_store.has_unverified_completed_criteria()
+        return self.todos_enabled and self.todo_store.has_unverified_completed_criteria()
 
     def todo_actionable_summary(self):
+        if not self.todos_enabled:
+            return "(plan disabled)"
         return self.todo_store.actionable_summary()
 
     def todo_quality_report(self):
+        if not self.todos_enabled:
+            return "Plan disabled."
         return self.todo_store.quality_report(
             max_tool_calls=self.max_tool_calls,
             used_tool_calls=self.used_tool_calls,
         )
 
     def todo_budget_summary(self):
+        if not self.todos_enabled:
+            return ""
         return self.todo_store.budget_summary(
             max_tool_calls=self.max_tool_calls,
             used_tool_calls=self.used_tool_calls,
@@ -836,6 +968,8 @@ class AgentTools:
         return self.todo_store.unblock_todo(todo_id, reason=reason)
 
     def apply_todo_final_verification(self, passed, check_result):
+        if not self.todos_enabled:
+            return False
         return self.todo_store.apply_final_verification(
             passed,
             _final_verification_note(check_result, passed),
@@ -905,7 +1039,7 @@ class AgentTools:
         return _final_check_passed(check_result)
 
     def execute(self, name, tool_input):
-        if not self.enabled:
+        if not self.enabled and name not in NO_WORKSPACE_TOOLS:
             return _error_result("No workspace directory")
 
         try:
@@ -913,10 +1047,15 @@ class AgentTools:
                 tool_input = json.loads(tool_input or "{}")
             if not isinstance(tool_input, dict):
                 raise AgentToolError("Tool input must be an object.")
+            if name == "update_plan" and not self.todos_enabled:
+                return _error_result("Agent plan is disabled.")
 
             handlers = {
-                "update_todos": self._update_todos,
+                "update_plan": self._update_plan,
+                "ask_user": self._ask_user,
                 "read_file": self._read_file,
+                "read_program_docs": self._read_program_docs,
+                "web_fetch": self._web_fetch,
                 "list_dir": self._list_dir,
                 "write_file": self._write_file,
                 "edit_file": self._edit_file,
@@ -942,13 +1081,31 @@ class AgentTools:
         except Exception as error:
             return _error_result(str(error))
 
-    def _update_todos(self, tool_input):
-        todos = tool_input.get("todos")
-        self.todo_store.update(todos)
+    def _update_plan(self, tool_input):
+        items = tool_input.get("items")
+        self.todo_store.update(items)
         return self.todo_store.tool_result(
             max_tool_calls=self.max_tool_calls,
             used_tool_calls=self.used_tool_calls,
         )
+
+    def _ask_user(self, tool_input):
+        question = _required_string(tool_input, "question")
+        options = _required_string_options(tool_input.get("options"))
+        default_index = _bounded_int(
+            tool_input.get("default_index"),
+            1,
+            1,
+            len(options),
+            "default_index",
+        )
+        self._before_visible_output()
+        selected_index, selected_text = get_agent_choice(
+            question,
+            options,
+            default_index=default_index,
+        )
+        return f"User selected option {selected_index}: {selected_text}"
 
     def _read_file(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
@@ -985,6 +1142,59 @@ class AgentTools:
             f"Lines: {start_line}-{end_line} of {total_lines}\n\n"
             f"{truncated}{suffix}"
         )
+
+    def _read_program_docs(self, tool_input):
+        max_chars = _bounded_int(
+            tool_input.get("max_chars"),
+            PROGRAM_DOC_DEFAULT_MAX_CHARS,
+            1000,
+            MAX_READ_CHARS,
+            "max_chars",
+        )
+        paths = _program_doc_paths()
+        if not paths:
+            raise AgentToolError("Program documentation is not available.")
+
+        sections = []
+        remaining = max_chars
+        truncated = False
+        for path in paths:
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                raise AgentToolError(
+                    f"Failed to read program documentation: {path.name}"
+                ) from error
+
+            if remaining <= 0:
+                truncated = True
+                break
+            selected = _truncate(content, remaining)
+            if len(content) > remaining:
+                truncated = True
+            remaining -= len(selected)
+            sections.append(
+                f"File: {path.name}\n"
+                f"Characters: {len(content)}\n\n"
+                f"{selected}"
+            )
+
+        suffix = "\n\n[program documentation truncated]" if truncated else ""
+        return "Program documentation:\n\n" + "\n\n".join(sections) + suffix
+
+    def _web_fetch(self, tool_input):
+        url = _required_string(tool_input, "url")
+        extract_mode = str(tool_input.get("extract_mode") or "text").strip().lower()
+        if extract_mode not in {"text", "raw"}:
+            raise AgentToolError("extract_mode must be text or raw.")
+        max_chars = _bounded_int(
+            tool_input.get("max_chars"),
+            WEB_FETCH_DEFAULT_MAX_CHARS,
+            1,
+            WEB_FETCH_MAX_CHARS,
+            "max_chars",
+        )
+        return _fetch_public_webpage(url, extract_mode, max_chars)
 
     def _list_dir(self, tool_input):
         root = self._resolve_path(str(tool_input.get("path") or "."))
@@ -1556,14 +1766,16 @@ class AgentTools:
         return get_agent_confirmation(title, detail)
 
     def _plan_action_gate(self, name, tool_input):
+        if not self.todos_enabled:
+            return None
         if not self.todo_store.needs_action_approval():
             return self._active_todo_gate(name)
-        if name == "update_todos":
+        if name in {"update_plan", "ask_user"}:
             return None
 
         if self.todo_store.approval_state == "rejected":
             return _error_result(
-                "Current plan was rejected. Revise the plan with update_todos, "
+                "Current plan was rejected. Revise the plan with update_plan, "
                 "or ask the user to run /plan approve before using more tools."
             )
 
@@ -1591,7 +1803,9 @@ class AgentTools:
         )
 
     def _active_todo_gate(self, name):
-        if name == "update_todos":
+        if not self.todos_enabled:
+            return None
+        if name in {"update_plan", "ask_user"}:
             return None
         if not self.todo_store.requires_active_todo():
             return None
@@ -1599,8 +1813,8 @@ class AgentTools:
         if active is not None:
             return None
         return _error_result(
-            "Before using more tools, call update_todos and mark exactly one ready "
-            "todo as in_progress. This keeps the Todo List synchronized with the "
+            "Before using more tools, call update_plan and mark exactly one ready "
+            "plan item as in_progress. This keeps the Plan synchronized with the "
             "work being executed."
         )
 
@@ -1637,6 +1851,210 @@ def normalize_workspace_dir(workspace_dir):
     if not path.is_dir():
         return None
     return path
+
+
+class _WebTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if str(tag or "").lower() in {"script", "style", "noscript"}:
+            self.skip_depth += 1
+        if str(tag or "").lower() in {
+            "article",
+            "br",
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "li",
+            "main",
+            "p",
+            "section",
+            "td",
+            "th",
+            "tr",
+        }:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if str(tag or "").lower() in {"script", "style", "noscript"}:
+            self.skip_depth = max(0, self.skip_depth - 1)
+            return
+        if str(tag or "").lower() in {
+            "article",
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "li",
+            "main",
+            "p",
+            "section",
+            "tr",
+        }:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+        text = str(data or "").strip()
+        if text:
+            self.parts.append(text)
+
+    def text(self):
+        text = " ".join(self.parts)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirects = getattr(req, "_omniagent_redirects", 0) + 1
+        if redirects > WEB_FETCH_MAX_REDIRECTS:
+            raise AgentToolError("too many redirects")
+        _validate_public_http_url(newurl)
+        next_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if next_request is not None:
+            setattr(next_request, "_omniagent_redirects", redirects)
+        return next_request
+
+
+def _fetch_public_webpage(url, extract_mode, max_chars):
+    normalized_url = _validate_public_http_url(url)
+    request = urllib.request.Request(
+        normalized_url,
+        headers={"User-Agent": "OmniAgent-web-fetch/1.0"},
+        method="GET",
+    )
+    opener = urllib.request.build_opener(_SafeRedirectHandler)
+    try:
+        with opener.open(request, timeout=15) as response:
+            final_url = response.geturl()
+            _validate_public_http_url(final_url)
+            content_type = (response.headers.get("Content-Type") or "").split(";")[0]
+            content_type = content_type.strip().lower()
+            if content_type and not _is_web_fetch_text_content_type(content_type):
+                raise AgentToolError(f"unsupported content-type: {content_type}")
+            data = response.read(WEB_FETCH_MAX_RESPONSE_BYTES + 1)
+            if len(data) > WEB_FETCH_MAX_RESPONSE_BYTES:
+                raise AgentToolError(
+                    f"response too large (>{WEB_FETCH_MAX_RESPONSE_BYTES} bytes)"
+                )
+            charset = response.headers.get_content_charset() or "utf-8"
+            raw_text = data.decode(charset, errors="replace")
+    except urllib.error.HTTPError as error:
+        raise AgentToolError(f"HTTP {error.code} fetching {normalized_url}") from error
+    except urllib.error.URLError as error:
+        reason = getattr(error, "reason", error)
+        raise AgentToolError(f"Failed to fetch {normalized_url}: {reason}") from error
+    except TimeoutError as error:
+        raise AgentToolError(f"Timed out fetching {normalized_url}") from error
+
+    if extract_mode == "text":
+        parser = _WebTextExtractor()
+        parser.feed(raw_text)
+        body = parser.text()
+    else:
+        body = raw_text
+
+    truncated = len(body) > max_chars
+    body = _truncate(body, max_chars)
+    suffix = "\n\n[web_fetch truncated]" if truncated else ""
+    return (
+        f"URL: {final_url}\n"
+        f"Mode: {extract_mode}\n"
+        f"Characters: {len(body)}"
+        f"{'+' if truncated else ''}\n\n"
+        f"{body}{suffix}"
+    )
+
+
+def _validate_public_http_url(url):
+    value = str(url or "").strip()
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise AgentToolError("web_fetch only allows http/https URLs.")
+    if not parsed.hostname:
+        raise AgentToolError("web_fetch URL must include a host.")
+    hostname = parsed.hostname.strip().lower().rstrip(".")
+    if hostname in {"localhost", "localhost.localdomain"}:
+        raise AgentToolError(f"blocked host: {hostname}")
+    if "%" in hostname:
+        raise AgentToolError("zone identifiers are not allowed in hosts.")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as error:
+        raise AgentToolError(f"invalid URL port: {error}") from error
+    for ip in _resolve_web_fetch_host_ips(hostname, port):
+        if _is_blocked_web_fetch_ip(ip):
+            raise AgentToolError(f"blocked non-public address: {ip}")
+    return urllib.parse.urlunparse(parsed)
+
+
+def _resolve_web_fetch_host_ips(hostname, port):
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as error:
+            raise AgentToolError(f"host resolution failed: {error}") from error
+        ips = []
+        for info in infos:
+            address = info[4][0]
+            try:
+                ips.append(ipaddress.ip_address(address))
+            except ValueError:
+                continue
+        if not ips:
+            raise AgentToolError("host resolved to no addresses.")
+        return ips
+    return [literal]
+
+
+def _is_blocked_web_fetch_ip(ip):
+    return any(
+        (
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
+def _is_web_fetch_text_content_type(content_type):
+    return (
+        content_type.startswith("text/")
+        or content_type
+        in {
+            "application/atom+xml",
+            "application/json",
+            "application/ld+json",
+            "application/rss+xml",
+            "application/xhtml+xml",
+            "application/xml",
+        }
+    )
+
+
+def _program_doc_paths():
+    root = Path(__file__).resolve().parent
+    paths = []
+    for filename in PROGRAM_DOC_FILENAMES:
+        path = root / filename
+        if path.is_file():
+            paths.append(path)
+    return paths
 
 
 def _plan_dir_for_workspace(workspace_dir):
@@ -1789,6 +2207,22 @@ def _required_string(data, key, allow_empty=False):
     if not allow_empty and not value:
         raise AgentToolError(f"{key} cannot be empty.")
     return value
+
+
+def _required_string_options(value):
+    if not isinstance(value, list):
+        raise AgentToolError("options must be an array.")
+    options = []
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, str):
+            raise AgentToolError(f"options[{index}] must be a string.")
+        text = " ".join(item.split())
+        if not text:
+            raise AgentToolError(f"options[{index}] cannot be empty.")
+        options.append(text)
+    if len(options) < 2 or len(options) > 8:
+        raise AgentToolError("options must contain between 2 and 8 items.")
+    return options
 
 
 def _required_positive_int(data, key):

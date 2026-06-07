@@ -34,6 +34,7 @@ DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
 DEFAULT_AGENT_SUMMARY_MODEL = ""
+DEFAULT_AGENT_PLAN_ENABLE = True
 DEFAULT_SKILLS_ENABLE = True
 DEFAULT_SKILLS_SOURCE_APP = True
 DEFAULT_SKILLS_SOURCE_WORKSPACE = False
@@ -80,6 +81,7 @@ class AppConfig:
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
     agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
     agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
+    agent_plan_enable: bool = DEFAULT_AGENT_PLAN_ENABLE
     skills_enable: bool = DEFAULT_SKILLS_ENABLE
     skills_source_app: bool = DEFAULT_SKILLS_SOURCE_APP
     skills_source_workspace: bool = DEFAULT_SKILLS_SOURCE_WORKSPACE
@@ -116,6 +118,7 @@ class AppConfig:
             "agent_approval_mode": self.agent_approval_mode,
             "agent_show_thinking": self.agent_show_thinking,
             "agent_summary_model": self.agent_summary_model,
+            "agent_plan_enable": self.agent_plan_enable,
             "skills_enable": self.skills_enable,
             "skills_source_app": self.skills_source_app,
             "skills_source_workspace": self.skills_source_workspace,
@@ -155,6 +158,7 @@ class AppConfig:
                 "approve": self.agent_approval_mode,
                 "show_thinking": self.agent_show_thinking,
                 "summary_model": self.agent_summary_model,
+                "plan_mode": self.agent_plan_enable,
             },
             "skills": {
                 "enable": self.skills_enable,
@@ -438,6 +442,10 @@ def _sanitize_config(config):
         config["context_window_tokens"] = DEFAULT_CONTEXT_WINDOW_TOKENS
 
     config["agent_mode"] = _parse_bool(agent_config.get("enable"), DEFAULT_AGENT_MODE)
+    config["agent_plan_enable"] = _parse_bool(
+        agent_config.get("plan_mode"),
+        DEFAULT_AGENT_PLAN_ENABLE,
+    )
     config["agent_summary_model"] = str(
         agent_config.get("summary_model", DEFAULT_AGENT_SUMMARY_MODEL) or ""
     ).strip()
@@ -793,6 +801,7 @@ def load_config():
         agent_approval_mode=DEFAULT_AGENT_APPROVAL_MODE,
         agent_show_thinking=DEFAULT_AGENT_SHOW_THINKING,
         agent_summary_model=DEFAULT_AGENT_SUMMARY_MODEL,
+        agent_plan_enable=DEFAULT_AGENT_PLAN_ENABLE,
         skills_enable=DEFAULT_SKILLS_ENABLE,
         skills_source_app=DEFAULT_SKILLS_SOURCE_APP,
         skills_source_workspace=DEFAULT_SKILLS_SOURCE_WORKSPACE,
@@ -951,6 +960,7 @@ def update_config():
         agent_approval_mode=new_agent_approval_mode,
         agent_show_thinking=config.agent_show_thinking,
         agent_summary_model=new_agent_summary_model,
+        agent_plan_enable=config.agent_plan_enable,
         skills_enable=config.skills_enable,
         skills_source_app=config.skills_source_app,
         skills_source_workspace=config.skills_source_workspace,

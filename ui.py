@@ -1022,7 +1022,7 @@ def _todo_panel_renderable(todos, width, max_lines):
         if index < len(lines) - 1:
             body_parts.append("\n")
 
-    title = Text.assemble(gradient_text("TodoList", *INFO_TEXT_COLOR))
+    title = Text.assemble(gradient_text("Plan", *INFO_TEXT_COLOR))
     return Panel(
         Text.assemble(*body_parts),
         padding=0,
@@ -1121,6 +1121,9 @@ class ChatTUISession:
         self.pending_prompt_rendered = False
         self.confirmation_active = False
         self.confirmation_selected = False
+        self.choice_question = ""
+        self.choice_options = []
+        self.choice_selected_index = 0
         self.lock = threading.RLock()
         self.input_queue = queue.Queue()
         self.dashboard_cache_key = None
@@ -1425,6 +1428,9 @@ class ChatTUISession:
             self.pending_prompt_rendered = True
             self.confirmation_active = True
             self.confirmation_selected = bool(default)
+            self.choice_question = ""
+            self.choice_options = []
+            self.choice_selected_index = 0
             self.input_enabled = True
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
@@ -1437,6 +1443,36 @@ class ChatTUISession:
         if isinstance(result, BaseException):
             raise result
         return bool(result)
+
+    def request_choice(self, question, options, default_index=1):
+        while True:
+            try:
+                self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        normalized_options = [str(option) for option in options]
+        selected_index = max(0, min(len(normalized_options) - 1, default_index - 1))
+        with self.lock:
+            self.pending_prompt_text = ""
+            self.pending_prompt_rendered = True
+            self.confirmation_active = True
+            self.confirmation_selected = False
+            self.choice_question = str(question or "")
+            self.choice_options = normalized_options
+            self.choice_selected_index = selected_index
+            self.input_enabled = True
+
+        self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
+        self._render_confirmation_line()
+        self._resize_input()
+        self.layout.focus(self.input_area)
+        self.invalidate()
+
+        result = self.input_queue.get()
+        if isinstance(result, BaseException):
+            raise result
+        return int(result)
 
     def request_input(
         self,
@@ -1457,6 +1493,9 @@ class ChatTUISession:
             self.pending_prompt_text = str(prompt_text or "")
             self.pending_prompt_rendered = bool(prompt_rendered)
             self.confirmation_active = False
+            self.choice_question = ""
+            self.choice_options = []
+            self.choice_selected_index = 0
             self.input_enabled = True
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
@@ -1566,23 +1605,40 @@ class ChatTUISession:
         @bindings.add("up", eager=True, filter=confirm_filter)
         @bindings.add("s-tab", eager=True, filter=confirm_filter)
         def _(event):
-            self._set_confirmation_selected(True)
+            if self._choice_active():
+                self._move_choice_selection(-1)
+            else:
+                self._set_confirmation_selected(True)
 
         @bindings.add("right", eager=True, filter=confirm_filter)
         @bindings.add("down", eager=True, filter=confirm_filter)
         @bindings.add("tab", eager=True, filter=confirm_filter)
         def _(event):
-            self._set_confirmation_selected(False)
+            if self._choice_active():
+                self._move_choice_selection(1)
+            else:
+                self._set_confirmation_selected(False)
 
         @bindings.add("y", eager=True, filter=confirm_filter)
         def _(event):
+            if self._choice_active():
+                return
             self._set_confirmation_selected(True)
             self._submit_confirmation()
 
         @bindings.add("n", eager=True, filter=confirm_filter)
         def _(event):
+            if self._choice_active():
+                return
             self._set_confirmation_selected(False)
             self._submit_confirmation()
+
+        for digit in "12345678":
+            @bindings.add(digit, eager=True, filter=confirm_filter)
+            def _(event, digit=digit):
+                if not self._choice_active():
+                    return
+                self._select_choice_index(int(digit) - 1, submit=True)
 
         @bindings.add("pageup", eager=True, is_global=True)
         def _(event):
@@ -1625,16 +1681,47 @@ class ChatTUISession:
             return
 
         with self.lock:
-            selected = bool(self.confirmation_selected)
+            choice_active = bool(self.choice_options)
+            if choice_active:
+                choice_question = self.choice_question
+                choice_options = list(self.choice_options)
+                selected = max(
+                    0,
+                    min(len(choice_options) - 1, self.choice_selected_index),
+                )
+                result = selected + 1
+            else:
+                choice_question = ""
+                choice_options = []
+                selected = bool(self.confirmation_selected)
+                result = selected
             self.input_enabled = False
             self.confirmation_active = False
             self.pending_prompt_text = ""
             self.pending_prompt_rendered = False
+            self.choice_question = ""
+            self.choice_options = []
+            self.choice_selected_index = 0
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
         self._resize_input()
-        self._render_confirmation_line(selected=selected, confirmed=True)
-        self.input_queue.put(selected)
+        if choice_active:
+            renderable = _choice_renderable(
+                choice_question,
+                choice_options,
+                selected,
+                confirmed=True,
+            )
+        else:
+            renderable = _confirmation_line_renderable(selected, confirmed=True)
+        ansi = _render_console_print_to_ansi(
+            self._columns(),
+            renderable,
+            end="\n",
+            soft_wrap=True,
+        )
+        self._replace_confirmation_line(ansi)
+        self.input_queue.put(result)
         self.invalidate()
 
     def _set_confirmation_selected(self, selected):
@@ -1645,12 +1732,51 @@ class ChatTUISession:
         self._render_confirmation_line()
         self.invalidate()
 
+    def _choice_active(self):
+        with self.lock:
+            return bool(self.confirmation_active and self.choice_options)
+
+    def _move_choice_selection(self, delta):
+        with self.lock:
+            if not self.confirmation_active or not self.choice_options:
+                return
+            count = len(self.choice_options)
+            self.choice_selected_index = (self.choice_selected_index + delta) % count
+        self._render_confirmation_line()
+        self.invalidate()
+
+    def _select_choice_index(self, index, submit=False):
+        with self.lock:
+            if not self.confirmation_active or not self.choice_options:
+                return
+            if index < 0 or index >= len(self.choice_options):
+                return
+            self.choice_selected_index = index
+        self._render_confirmation_line()
+        self.invalidate()
+        if submit:
+            self._submit_confirmation()
+
     def _render_confirmation_line(self, selected=None, confirmed=False):
         if selected is None:
             with self.lock:
-                selected = bool(self.confirmation_selected)
+                if self.choice_options:
+                    selected = self.choice_selected_index
+                else:
+                    selected = bool(self.confirmation_selected)
 
-        renderable = _confirmation_line_renderable(selected, confirmed=confirmed)
+        with self.lock:
+            choice_question = self.choice_question
+            choice_options = list(self.choice_options)
+        if choice_options:
+            renderable = _choice_renderable(
+                choice_question,
+                choice_options,
+                int(selected),
+                confirmed=confirmed,
+            )
+        else:
+            renderable = _confirmation_line_renderable(selected, confirmed=confirmed)
         ansi = _render_console_print_to_ansi(
             self._columns(),
             renderable,
@@ -1996,13 +2122,13 @@ def start_tui(model_name=None, workspace_dir=None):
     return _tui_session
 
 
-def set_todos_panel(todos):
+def set_plan_panel(items):
     if _tui_session is not None:
-        _tui_session.set_todos(todos)
+        _tui_session.set_todos(items)
 
 
-def clear_todos_panel():
-    set_todos_panel([])
+def clear_plan_panel():
+    set_plan_panel([])
 
 
 def run_tui(worker):
@@ -2543,6 +2669,40 @@ def get_agent_confirmation(title, detail):
     return get_continue_confirmation()
 
 
+def get_agent_choice(question, options, default_index=1):
+    normalized_options = [str(option) for option in options]
+    default_index = max(1, min(len(normalized_options), int(default_index or 1)))
+    if _tui_session is not None:
+        selected = _tui_session.request_choice(
+            question,
+            normalized_options,
+            default_index=default_index,
+        )
+        return selected, normalized_options[selected - 1]
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        selected = _read_terminal_choice(
+            question,
+            normalized_options,
+            default_index=default_index,
+        )
+        return selected, normalized_options[selected - 1]
+
+    console.print(_choice_renderable(question, normalized_options, default_index - 1))
+    while True:
+        answer = console.input(f"Select option [1-{len(normalized_options)}]: ").strip()
+        if not answer:
+            return default_index, normalized_options[default_index - 1]
+        try:
+            selected = int(answer)
+        except ValueError:
+            console.print(f"Please enter a number from 1 to {len(normalized_options)}.")
+            continue
+        if 1 <= selected <= len(normalized_options):
+            return selected, normalized_options[selected - 1]
+        console.print(f"Please enter a number from 1 to {len(normalized_options)}.")
+
+
 def _confirmation_line_prompt():
     return Text.assemble(
         gradient_text("Continue? ", *TEXT_COLOR),
@@ -2553,8 +2713,8 @@ def _confirmation_line_prompt():
 def _confirmation_line_renderable(selected, confirmed=False):
     selected = bool(selected)
     confirmed = bool(confirmed)
-    yes_colors = SUCCESS_COLOR if selected and confirmed else TEXT_COLOR
-    no_colors = SUCCESS_COLOR if not selected and confirmed else TEXT_COLOR
+    yes_colors = _selection_marker_colors(selected, confirmed)
+    no_colors = _selection_marker_colors(not selected, confirmed)
     return Text.assemble(
         _confirmation_line_prompt(),
         " ",
@@ -2562,6 +2722,32 @@ def _confirmation_line_renderable(selected, confirmed=False):
         "  ",
         gradient_text("No" if selected else "[No]", *no_colors),
     )
+
+
+def _choice_renderable(question, options, selected_index, confirmed=False):
+    selected_index = max(0, min(len(options) - 1, int(selected_index or 0)))
+    parts = [
+        "\n",
+        gradient_text("[-]", *INFO_COLOR),
+        gradient_text(f" {question}\n", *TEXT_COLOR),
+        gradient_text("(use arrows, number keys, Enter)\n", *THINK_COLOR),
+    ]
+    for index, option in enumerate(options):
+        selected = index == selected_index
+        marker_colors = _selection_marker_colors(selected, confirmed)
+        marker = f"[{index + 1}]" if selected else f" {index + 1} "
+        suffix = "\n" if index < len(options) - 1 else ""
+        parts.extend([
+            gradient_text(marker, *marker_colors),
+            gradient_text(f" {option}{suffix}", *TEXT_COLOR),
+        ])
+    return Text.assemble(*parts)
+
+
+def _selection_marker_colors(selected, confirmed=False):
+    if not selected:
+        return TEXT_COLOR
+    return SUCCESS_COLOR if confirmed else INFO_COLOR
 
 
 def _read_terminal_confirmation(default=False):
@@ -2600,6 +2786,51 @@ def _read_terminal_confirmation(default=False):
     return selected
 
 
+def _read_terminal_choice(question, options, default_index=1):
+    _enable_ansi_input_rendering()
+    selected_index = max(0, min(len(options) - 1, default_index - 1))
+    line = _choice_ansi(question, options, selected_index)
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+    while True:
+        key = _read_terminal_confirmation_key()
+        if key in {"left", "up", "s-tab"}:
+            selected_index = (selected_index - 1) % len(options)
+        elif key in {"right", "down", "tab"}:
+            selected_index = (selected_index + 1) % len(options)
+        elif key.startswith("digit:"):
+            digit = int(key.split(":", 1)[1])
+            if 1 <= digit <= len(options):
+                selected_index = digit - 1
+                break
+            continue
+        elif key == "enter":
+            break
+        elif key == "interrupt":
+            raise KeyboardInterrupt()
+        else:
+            continue
+
+        next_line = _choice_ansi(question, options, selected_index)
+        if next_line != line:
+            sys.stdout.write(_terminal_block_replace_prefix(line) + next_line)
+            sys.stdout.flush()
+            line = next_line
+
+    confirmed_line = _choice_ansi(
+        question,
+        options,
+        selected_index,
+        confirmed=True,
+    )
+    if confirmed_line != line:
+        sys.stdout.write(_terminal_block_replace_prefix(line) + confirmed_line)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return selected_index + 1
+
+
 def _confirmation_line_ansi(selected, confirmed=False):
     width = shutil.get_terminal_size(fallback=(80, 24)).columns
     return _render_console_print_to_ansi(
@@ -2608,6 +2839,26 @@ def _confirmation_line_ansi(selected, confirmed=False):
         end="",
         soft_wrap=True,
     )
+
+
+def _choice_ansi(question, options, selected_index, confirmed=False):
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    return _render_console_print_to_ansi(
+        width,
+        _choice_renderable(
+            question,
+            options,
+            selected_index,
+            confirmed=confirmed,
+        ),
+        end="",
+        soft_wrap=True,
+    )
+
+
+def _terminal_block_replace_prefix(text):
+    lines = max(1, str(text or "").count("\n"))
+    return f"\x1b[{lines}F\x1b[0J"
 
 
 def _read_terminal_confirmation_key():
@@ -2620,6 +2871,8 @@ def _read_terminal_confirmation_key():
         if ch in {"\t"}:
             return "tab"
         value = ch.lower()
+        if value in {"1", "2", "3", "4", "5", "6", "7", "8"}:
+            return f"digit:{value}"
         if value == "y":
             return "yes"
         if value == "n":
@@ -2649,6 +2902,8 @@ def _read_terminal_confirmation_key():
             return "enter"
         if ch == "\t":
             return "tab"
+        if ch in {"1", "2", "3", "4", "5", "6", "7", "8"}:
+            return f"digit:{ch}"
         value = ch.lower()
         if value == "y":
             return "yes"
