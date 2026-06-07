@@ -1088,7 +1088,7 @@ class OmniAgent:
     ):
         try:
             if self.thinking_mode:
-                print_stream_thinking("", leading_newline=False)
+                print_stream_thinking("")
             full_thinking = ""
             final_response = ""
 
@@ -1301,7 +1301,7 @@ class OmniAgent:
     ):
         try:
             if self.thinking_mode:
-                print_stream_thinking("", leading_newline=False)
+                print_stream_thinking("")
             full_thinking = ""
             final_response = ""
 
@@ -1499,7 +1499,7 @@ class OmniAgent:
     ):
         try:
             if self.thinking_mode:
-                print_stream_thinking("", leading_newline=False)
+                print_stream_thinking("")
             full_thinking = ""
             final_response = ""
 
@@ -1785,15 +1785,10 @@ class OmniAgent:
             console.print()
         print_error(message)
         final_response = response or message
-        if not response and stream_callback_response:
-            response_started = self._start_normal_stream_response(
-                response_started, thinking
-            )
-            stream_callback_response(message)
         return {
             "thinking": thinking,
             "response": final_response,
-            "response_streamed": response_started,
+            "response_streamed": response_started or not response,
         }
 
     def _finalize_normal_web_search_response(
@@ -1825,7 +1820,7 @@ class OmniAgent:
         callback_response=None,
     ):
         if thinking and self.thinking_mode and callback_thinking:
-            print_stream_thinking("", leading_newline=False)
+            print_stream_thinking("")
             callback_thinking(thinking)
             if not thinking.endswith("\n"):
                 console.print()
@@ -1844,9 +1839,15 @@ class OmniAgent:
             "Normal-mode tools stopped after reaching the round limit."
         )
         print_error(message)
+        if not response:
+            return {
+                "thinking": thinking,
+                "response": message,
+                "response_streamed": True,
+            }
         return self._finalize_normal_web_search_response(
             thinking,
-            response or message,
+            response,
             stream_callback_thinking,
             stream_callback_response,
         )
@@ -3171,7 +3172,7 @@ class OmniAgent:
                 response = self.client.chat.completions.create(**kwargs)
 
             if self.thinking_mode and not thinking_started:
-                print_stream_thinking("", leading_newline=False)
+                print_stream_thinking("")
             field_thinking = ""
             tagged_thinking = ""
             raw_thinking = ""
@@ -3265,7 +3266,7 @@ class OmniAgent:
             )
 
             if self.thinking_mode and not thinking_started:
-                print_stream_thinking("", leading_newline=False)
+                print_stream_thinking("")
             field_thinking = ""
             tagged_thinking = ""
             full_response = ""
@@ -3358,7 +3359,7 @@ class OmniAgent:
             )
 
             if self.thinking_mode and not thinking_started:
-                print_stream_thinking("", leading_newline=False)
+                print_stream_thinking("")
             field_thinking = ""
             tagged_thinking = ""
             full_response = ""
