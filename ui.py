@@ -77,6 +77,12 @@ console = _ConsoleProxy()
 
 VERSION = "3.0.0"
 
+DASHBOARD_LOGO_LINES = (
+    "▗▄█▄▄▟▙▄",
+    "▐▌ ◆ ◆ █",
+    " ▝▀▀▀▀▀▀",
+)
+
 SUCCESS_COLOR = ["#67b6a6", "#92ded2"]
 INFO_COLOR = ["#6d8da8", "#97cbe3"]
 INFO_TEXT_COLOR = ["#97cbe3", "#c0ece8"]
@@ -493,8 +499,12 @@ def print_stream_response_continue(content):
     console.print(Text(content, style=f"bold {STREAM_RESPONSE_COLOR}"), end="")
 
 
-def _dashboard_text_from_segments(*segments):
-    max_length = max(console.width - 44, 0)
+def _dashboard_right_width(left_column_width):
+    return max(console.width - left_column_width - 5, 0)
+
+
+def _dashboard_text_from_segments(*segments, left_column_width):
+    max_length = _dashboard_right_width(left_column_width)
     full_text = "".join(content for content, _ in segments)
 
     if len(full_text) <= max_length:
@@ -502,7 +512,7 @@ def _dashboard_text_from_segments(*segments):
             *(gradient_text(content, *colors) for content, colors in segments)
         )
 
-    remaining_length = max(console.width - 47, 0)
+    remaining_length = max(max_length - 3, 0)
     rendered_segments = []
     for content, colors in segments:
         if remaining_length <= 0:
@@ -528,7 +538,23 @@ def _dashboard_centered_left_text(*segments):
     )
 
 
-def _get_last_record_text(line_number):
+def _dashboard_left_text(width, *segments):
+    content_length = sum(len(content) for content, _ in segments)
+    total_padding = max(width - content_length, 0)
+    left_padding = total_padding // 2
+    right_padding = total_padding - left_padding
+    return Text.assemble(
+        " " * left_padding,
+        *(gradient_text(content, *colors) for content, colors in segments),
+        " " * right_padding,
+    )
+
+
+def _dashboard_left_logo_text(line_index, width):
+    return _dashboard_left_text(width, (DASHBOARD_LOGO_LINES[line_index], INFO_COLOR))
+
+
+def _get_last_record_text(line_number, left_column_width):
     record_dir = "record"
     if not os.path.exists(record_dir):
         files = []
@@ -537,13 +563,17 @@ def _get_last_record_text(line_number):
 
     if not files:
         if line_number == 1:
-            return _dashboard_text_from_segments((" No history record", TEXT_COLOR))
+            return _dashboard_text_from_segments(
+                (" No history record", TEXT_COLOR),
+                left_column_width=left_column_width,
+            )
         return Text("")
 
     if len(files) > 5 and line_number == 1:
         return _dashboard_text_from_segments(
             ("[-]", INFO_COLOR),
             (" ...", TEXT_COLOR),
+            left_column_width=left_column_width,
         )
 
     if len(files) > 5:
@@ -585,6 +615,7 @@ def _get_last_record_text(line_number):
         (f" <{version}>", THINK_COLOR),
         (f" <{model}>", THINK_COLOR),
         (f" <{msg_count}>", THINK_COLOR),
+        left_column_width=left_column_width,
     )
 
 
@@ -601,20 +632,21 @@ def show_dashboard(model_name, workspace_dir=None):
         gradient_text("OmniAgent", *INFO_TEXT_COLOR),
         gradient_text(f" v{VERSION}", *TEXT_COLOR),
     )
-    billing_text = f"{model_name.upper() + ' · API Usage Billing':^37}"
+    billing_text = f"{model_name.upper()} · API Usage Billing"
     cwd = workspace_dir or "No workspace directory"
-    cwd_text = f"...{cwd[-34:]}" if len(cwd) > 37 else f"{cwd:^37}"
+    cwd_text = cwd
+    left_column_width = max(len(billing_text), len(cwd_text)) + 6
 
-    if console.width < 68:
+    if console.width < left_column_width + 29:
         dashboard_content = Text.assemble(
             "\n",
             _dashboard_centered_left_text(("Welcome back!", TEXT_COLOR)),
             "\n\n",
-            _dashboard_centered_left_text(("▐▛███▜▌", INFO_COLOR)),
+            _dashboard_centered_left_text((DASHBOARD_LOGO_LINES[0], INFO_COLOR)),
             "\n",
-            _dashboard_centered_left_text(("▝▜█████▛▘", INFO_COLOR)),
+            _dashboard_centered_left_text((DASHBOARD_LOGO_LINES[1], INFO_COLOR)),
             "\n",
-            _dashboard_centered_left_text(("▘▘ ▝▝", INFO_COLOR)),
+            _dashboard_centered_left_text((DASHBOARD_LOGO_LINES[2], INFO_COLOR)),
             "\n\n",
             _dashboard_centered_left_text((billing_text, THINK_COLOR)),
             "\n",
@@ -622,58 +654,47 @@ def show_dashboard(model_name, workspace_dir=None):
         )
     else:
         dashboard_content = Text.assemble(
-            " " * 39,
+            " " * left_column_width,
             Text("│", style="bold #6d8da8"),
             gradient_text(" Tips for getting started\n", *INFO_TEXT_COLOR),
-            " " * 13,
-            gradient_text("Welcome back!", *TEXT_COLOR),
-            " " * 13,
+            _dashboard_left_text(left_column_width, ("Welcome back!", TEXT_COLOR)),
             Text("│", style="bold #6d8da8"),
             _dashboard_text_from_segments(
                 (
                     " Run /help to display a list of available commands and their descriptions.",
                     TEXT_COLOR,
                 ),
+                left_column_width=left_column_width,
             ),
             "\n",
-            " " * 39,
+            " " * left_column_width,
             Text("│", style="bold #6d8da8"),
             " ",
-            gradient_text("─" * (console.width - 44), *INFO_COLOR),
+            gradient_text("─" * _dashboard_right_width(left_column_width), *INFO_COLOR),
             "\n",
-            " " * 16,
-            gradient_text("▐▛███▜▌", *INFO_COLOR),
-            " " * 16,
+            _dashboard_left_logo_text(0, left_column_width),
             Text("│", style="bold #6d8da8"),
             gradient_text(" History record", *INFO_TEXT_COLOR),
             "\n",
-            " " * 15,
-            gradient_text("▝▜█████▛▘", *INFO_COLOR),
-            " " * 15,
+            _dashboard_left_logo_text(1, left_column_width),
             Text("│", style="bold #6d8da8"),
-            _get_last_record_text(1),
+            _get_last_record_text(1, left_column_width),
             "\n",
-            " " * 17,
-            gradient_text("▘▘ ▝▝", *INFO_COLOR),
-            " " * 17,
+            _dashboard_left_logo_text(2, left_column_width),
             Text("│", style="bold #6d8da8"),
-            _get_last_record_text(2),
+            _get_last_record_text(2, left_column_width),
             "\n",
-            " " * 39,
+            " " * left_column_width,
             Text("│", style="bold #6d8da8"),
-            _get_last_record_text(3),
+            _get_last_record_text(3, left_column_width),
             "\n",
-            " " * 1,
-            gradient_text(billing_text, *THINK_COLOR),
-            " " * 1,
+            _dashboard_left_text(left_column_width, (billing_text, THINK_COLOR)),
             Text("│", style="bold #6d8da8"),
-            _get_last_record_text(4),
+            _get_last_record_text(4, left_column_width),
             "\n",
-            " " * 1,
-            gradient_text(cwd_text, *THINK_COLOR),
-            " " * 1,
+            _dashboard_left_text(left_column_width, (cwd_text, THINK_COLOR)),
             Text("│", style="bold #6d8da8"),
-            _get_last_record_text(5),
+            _get_last_record_text(5, left_column_width),
         )
 
     console.print(
