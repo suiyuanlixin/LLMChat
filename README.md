@@ -122,6 +122,8 @@ pip install -r requirements.txt
 }
 ```
 
+MiniMax 推荐使用 OpenAI 兼容配置。Anthropic 兼容的 MiniMax-M3 也会在 `thinking_mode=true` 时尝试启用 thinking，但最终是否能显示取决于服务端是否返回 reasoning 字段。
+
 ```json
 {
   "api_type": "gemini",

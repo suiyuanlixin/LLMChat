@@ -1081,6 +1081,39 @@ class OmniAgent:
         except Exception as error:
             return _error_text(str(error))
 
+    @staticmethod
+    def _normal_stream_thinking_tracker(callback_thinking):
+        state = {"streamed": False}
+        if callback_thinking is None:
+            return state, None
+
+        def tracked(content):
+            if content:
+                state["streamed"] = True
+            callback_thinking(content)
+
+        return state, tracked
+
+    def _stream_normal_thinking_if_needed(
+        self,
+        thinking,
+        callback_thinking=None,
+        thinking_streamed=False,
+    ):
+        if (
+            not thinking
+            or not self.thinking_mode
+            or thinking_streamed
+            or callback_thinking is None
+        ):
+            return False, bool(thinking_streamed)
+
+        print_stream_thinking("")
+        callback_thinking(thinking)
+        if not str(thinking).endswith("\n"):
+            console.print()
+        return True, True
+
     def _stream_chat_completion_normal_web_search_response(
         self,
         stream_callback_thinking=None,
@@ -1089,6 +1122,9 @@ class OmniAgent:
         try:
             if self.thinking_mode:
                 print_stream_thinking("")
+            thinking_streamed, tracked_callback_thinking = (
+                self._normal_stream_thinking_tracker(stream_callback_thinking)
+            )
             full_thinking = ""
             final_response = ""
 
@@ -1102,7 +1138,7 @@ class OmniAgent:
                 ) = self._stream_chat_completion_normal_web_search_turn(
                     full_thinking,
                     False,
-                    stream_callback_thinking,
+                    tracked_callback_thinking,
                     None,
                     emit_response=False,
                 )
@@ -1114,6 +1150,8 @@ class OmniAgent:
                         full_thinking,
                         text,
                         stream_callback_response,
+                        tracked_callback_thinking,
+                        thinking_streamed["streamed"],
                     )
 
                 self.conversation_history.append(assistant_message)
@@ -1124,6 +1162,8 @@ class OmniAgent:
                 final_response,
                 False,
                 stream_callback_response,
+                tracked_callback_thinking,
+                thinking_streamed["streamed"],
             )
         except Exception as error:
             print_error(f"Stream error: {error}")
@@ -1302,6 +1342,9 @@ class OmniAgent:
         try:
             if self.thinking_mode:
                 print_stream_thinking("")
+            thinking_streamed, tracked_callback_thinking = (
+                self._normal_stream_thinking_tracker(stream_callback_thinking)
+            )
             full_thinking = ""
             final_response = ""
 
@@ -1315,7 +1358,7 @@ class OmniAgent:
                 ) = self._stream_ollama_normal_web_search_turn(
                     full_thinking,
                     False,
-                    stream_callback_thinking,
+                    tracked_callback_thinking,
                     None,
                     emit_response=False,
                 )
@@ -1327,6 +1370,8 @@ class OmniAgent:
                         _clean_reasoning_text(full_thinking),
                         text,
                         stream_callback_response,
+                        tracked_callback_thinking,
+                        thinking_streamed["streamed"],
                     )
 
                 self.conversation_history.append(assistant_message)
@@ -1339,6 +1384,8 @@ class OmniAgent:
                 final_response,
                 False,
                 stream_callback_response,
+                tracked_callback_thinking,
+                thinking_streamed["streamed"],
             )
         except Exception as error:
             print_error(f"Stream error: {error}")
@@ -1500,6 +1547,9 @@ class OmniAgent:
         try:
             if self.thinking_mode:
                 print_stream_thinking("")
+            thinking_streamed, tracked_callback_thinking = (
+                self._normal_stream_thinking_tracker(stream_callback_thinking)
+            )
             full_thinking = ""
             final_response = ""
 
@@ -1513,7 +1563,7 @@ class OmniAgent:
                 ) = self._stream_anthropic_normal_web_search_turn(
                     full_thinking,
                     False,
-                    stream_callback_thinking,
+                    tracked_callback_thinking,
                     None,
                     emit_response=False,
                 )
@@ -1528,6 +1578,8 @@ class OmniAgent:
                         full_thinking,
                         text,
                         stream_callback_response,
+                        tracked_callback_thinking,
+                        thinking_streamed["streamed"],
                     )
 
                 self.conversation_history.append({
@@ -1556,6 +1608,8 @@ class OmniAgent:
                 final_response,
                 False,
                 stream_callback_response,
+                tracked_callback_thinking,
+                thinking_streamed["streamed"],
             )
         except Exception as error:
             print_error(f"Stream error: {error}")
@@ -1597,7 +1651,16 @@ class OmniAgent:
             if chunk_type == "content_block_start":
                 content_block = self._get_field(chunk, "content_block")
                 block_type = self._get_field(content_block, "type", "")
+                initial_reasoning = self._anthropic_reasoning_text(content_block)
                 if block_type == "text":
+                    if initial_reasoning:
+                        field_thinking += initial_reasoning
+                        if (
+                            callback_thinking
+                            and self.thinking_mode
+                            and not response_started
+                        ):
+                            callback_thinking(initial_reasoning)
                     initial_text = self._get_field(content_block, "text", "") or ""
                     block = {"type": "text", "text": ""}
                     if initial_text:
@@ -1633,10 +1696,11 @@ class OmniAgent:
                             )
                             if callback_response:
                                 callback_response(content)
-                elif block_type == "thinking":
-                    initial_thinking = (
-                        self._get_field(content_block, "thinking", "") or ""
-                    )
+                elif (
+                    self._is_anthropic_reasoning_block_type(block_type)
+                    or initial_reasoning
+                ):
+                    initial_thinking = initial_reasoning
                     block = {"type": "thinking", "thinking": initial_thinking}
                     if initial_thinking:
                         field_thinking += initial_thinking
@@ -1703,8 +1767,8 @@ class OmniAgent:
                             )
                             if callback_response:
                                 callback_response(content)
-                elif delta_type == "thinking_delta":
-                    thinking_delta = self._get_field(delta, "thinking", "") or ""
+                elif self._is_anthropic_reasoning_delta_type(delta_type):
+                    thinking_delta = self._anthropic_delta_reasoning_text(delta)
                     if thinking_delta:
                         field_thinking += thinking_delta
                         block["thinking"] = block.get("thinking", "") + thinking_delta
@@ -1759,16 +1823,30 @@ class OmniAgent:
         thinking,
         response,
         callback_response=None,
+        callback_thinking=None,
+        thinking_streamed=False,
     ):
+        thinking_printed_now, thinking_streamed = (
+            self._stream_normal_thinking_if_needed(
+                thinking,
+                callback_thinking,
+                thinking_streamed,
+            )
+        )
         response_started = False
         if response:
-            response_started = self._start_normal_stream_response(False, thinking)
+            separator_thinking = "" if thinking_printed_now else thinking
+            response_started = self._start_normal_stream_response(
+                False,
+                separator_thinking,
+            )
             if callback_response:
                 callback_response(response)
         return {
             "thinking": thinking,
             "response": response,
             "response_streamed": response_started,
+            "thinking_streamed": thinking_streamed,
         }
 
     def _stream_normal_web_search_round_limit_response(
@@ -1777,18 +1855,29 @@ class OmniAgent:
         response,
         response_started,
         stream_callback_response=None,
+        stream_callback_thinking=None,
+        thinking_streamed=False,
     ):
         message = (
             "Normal-mode tools stopped after reaching the round limit."
         )
+        thinking_printed_now, thinking_streamed = (
+            self._stream_normal_thinking_if_needed(
+                thinking,
+                stream_callback_thinking,
+                thinking_streamed,
+            )
+        )
         if response_started or thinking:
-            console.print()
+            if not thinking_printed_now:
+                console.print()
         print_error(message)
         final_response = response or message
         return {
             "thinking": thinking,
             "response": final_response,
             "response_streamed": response_started or not response,
+            "thinking_streamed": thinking_streamed,
         }
 
     def _finalize_normal_web_search_response(
@@ -1799,7 +1888,7 @@ class OmniAgent:
         stream_callback_response=None,
     ):
         if self.stream_mode:
-            self._stream_normal_web_search_text(
+            thinking_streamed = self._stream_normal_web_search_text(
                 thinking,
                 response,
                 stream_callback_thinking,
@@ -1809,6 +1898,7 @@ class OmniAgent:
                 "thinking": thinking,
                 "response": response,
                 "response_streamed": True,
+                "thinking_streamed": thinking_streamed,
             }
         return {"thinking": thinking, "response": response}
 
@@ -1819,14 +1909,17 @@ class OmniAgent:
         callback_thinking=None,
         callback_response=None,
     ):
-        if thinking and self.thinking_mode and callback_thinking:
-            print_stream_thinking("")
-            callback_thinking(thinking)
-            if not thinking.endswith("\n"):
-                console.print()
+        _, thinking_streamed = (
+            self._stream_normal_thinking_if_needed(
+                thinking,
+                callback_thinking,
+                False,
+            )
+        )
         print_stream_response_start(self.model)
         if response and callback_response:
             callback_response(response)
+        return thinking_streamed
 
     def _normal_web_search_round_limit_response(
         self,
@@ -1952,10 +2045,23 @@ class OmniAgent:
             if chunk_type == "content_block_start":
                 content_block = self._get_field(chunk, "content_block")
                 block_type = self._get_field(content_block, "type", "")
+                initial_reasoning = self._anthropic_reasoning_text(content_block)
                 if block_type == "text":
+                    if initial_reasoning:
+                        blocks.append({
+                            "type": "thinking",
+                            "thinking": initial_reasoning,
+                        })
+                        self._show_agent_thinking(initial_reasoning)
                     block = {"type": "text", "text": ""}
-                elif block_type == "thinking":
-                    block = {"type": "thinking", "thinking": ""}
+                elif (
+                    self._is_anthropic_reasoning_block_type(block_type)
+                    or initial_reasoning
+                ):
+                    block = {
+                        "type": "thinking",
+                        "thinking": initial_reasoning,
+                    }
                 elif block_type == "tool_use":
                     block = {
                         "type": "tool_use",
@@ -1978,8 +2084,8 @@ class OmniAgent:
                 if delta_type == "text_delta":
                     text_delta = self._get_field(delta, "text", "") or ""
                     block["text"] = block.get("text", "") + text_delta
-                elif delta_type == "thinking_delta":
-                    thinking_delta = self._get_field(delta, "thinking", "") or ""
+                elif self._is_anthropic_reasoning_delta_type(delta_type):
+                    thinking_delta = self._anthropic_delta_reasoning_text(delta)
                     block["thinking"] = block.get("thinking", "") + thinking_delta
                     self._stream_agent_thinking(thinking_delta)
                 elif delta_type == "signature_delta":
@@ -3375,7 +3481,17 @@ class OmniAgent:
 
                 if chunk_type == "content_block_start":
                     content_block = self._get_field(chunk, "content_block")
-                    if self._get_field(content_block, "type") == "text":
+                    block_type = self._get_field(content_block, "type")
+                    initial_reasoning = self._anthropic_reasoning_text(content_block)
+                    if initial_reasoning:
+                        field_thinking += initial_reasoning
+                        if (
+                            callback_thinking
+                            and self.thinking_mode
+                            and not response_started
+                        ):
+                            callback_thinking(initial_reasoning)
+                    if block_type == "text":
                         initial_text = self._get_field(content_block, "text", "") or ""
                         if initial_text:
                             content, full_response, raw_response = (
@@ -3425,8 +3541,8 @@ class OmniAgent:
                 delta = self._get_field(chunk, "delta")
                 delta_type = self._get_field(delta, "type", "")
 
-                if delta_type == "thinking_delta":
-                    thinking = self._get_field(delta, "thinking", "") or ""
+                if self._is_anthropic_reasoning_delta_type(delta_type):
+                    thinking = self._anthropic_delta_reasoning_text(delta)
                     if thinking:
                         field_thinking += thinking
                         if (
@@ -3543,18 +3659,8 @@ class OmniAgent:
 
     def _anthropic_response_parts(self, response):
         content = self._get_field(response, "content", [])
-        full_thinking = ""
-        full_response = ""
-
-        if isinstance(content, str):
-            full_response = content
-        else:
-            for block in content or []:
-                block_type = self._get_field(block, "type", "")
-                if block_type == "thinking":
-                    full_thinking += self._get_field(block, "thinking", "") or ""
-                elif block_type == "text":
-                    full_response += self._get_field(block, "text", "") or ""
+        blocks = self._anthropic_content_blocks(content)
+        full_thinking, full_response, _ = self._parse_anthropic_blocks(blocks)
         return full_thinking, full_response
 
     def _anthropic_content_blocks(self, content):
@@ -3564,7 +3670,10 @@ class OmniAgent:
         blocks = []
         for block in content or []:
             block_type = self._get_field(block, "type", "")
+            thinking = self._anthropic_reasoning_text(block, clean=False)
             if block_type == "text":
+                if thinking:
+                    blocks.append({"type": "thinking", "thinking": thinking})
                 blocks.append({
                     "type": "text",
                     "text": self._get_field(block, "text", "") or "",
@@ -3576,10 +3685,10 @@ class OmniAgent:
                     "name": self._get_field(block, "name", "") or "",
                     "input": self._get_field(block, "input", {}) or {},
                 })
-            elif block_type == "thinking":
+            elif self._is_anthropic_reasoning_block_type(block_type) or thinking:
                 thinking_block = {
                     "type": "thinking",
-                    "thinking": self._get_field(block, "thinking", "") or "",
+                    "thinking": thinking,
                 }
                 signature = self._get_field(block, "signature")
                 if signature:
@@ -3594,12 +3703,12 @@ class OmniAgent:
         for block in blocks:
             block_type = block.get("type")
             if block_type == "thinking":
-                thinking += block.get("thinking", "") or ""
+                thinking += self._anthropic_reasoning_text(block, clean=False)
             elif block_type == "text":
                 text += block.get("text", "") or ""
             elif block_type == "tool_use":
                 tool_uses.append(block)
-        return thinking, text, tool_uses
+        return _clean_reasoning_text(thinking), text, tool_uses
 
     def _chat_message_parts(self, message):
         text = self._message_content_text(self._get_field(message, "content", "") or "")
@@ -3842,7 +3951,10 @@ class OmniAgent:
             return {}
         effort_value = self._reasoning_effort_value()
         options = {}
-        if self._uses_deepseek_anthropic_compat():
+        if (
+            self._uses_deepseek_anthropic_compat()
+            or self._uses_minimax_anthropic_compat()
+        ):
             effort = self._deepseek_reasoning_effort(effort_value)
             options["thinking"] = {
                 "type": (
@@ -4121,6 +4233,17 @@ class OmniAgent:
             or model_name.startswith("minimax")
         )
 
+    def _uses_minimax_anthropic_compat(self, model=None):
+        if self.api_type != API_TYPE_ANTHROPIC:
+            return False
+        base_url = str(self.base_url or "").lower()
+        model_name = str(model or self.model or "").lower()
+        return (
+            "minimax" in base_url
+            or "minimaxi" in base_url
+            or model_name.startswith("minimax")
+        )
+
     def _uses_deepseek_openai_compat(self, model=None):
         if self.api_type != API_TYPE_OPENAI:
             return False
@@ -4149,14 +4272,7 @@ class OmniAgent:
         )
 
     def _message_reasoning_text(self, message):
-        reasoning_content = self._get_field(message, "reasoning_content", "") or ""
-        reasoning_details = self._reasoning_details_text(
-            self._get_field(message, "reasoning_details", None)
-        )
-        reasoning = self._get_field(message, "reasoning", "") or ""
-        return _clean_reasoning_text(
-            reasoning_content or reasoning_details or reasoning
-        )
+        return self._anthropic_reasoning_text(message)
 
     def _message_content_text(self, content):
         if self._uses_minimax_openai_compat():
@@ -4182,12 +4298,20 @@ class OmniAgent:
             return "", current_tagged_thinking
         return self._split_stream_delta(current_tagged_thinking, tagged_thinking)
 
+    @staticmethod
+    def _is_anthropic_reasoning_block_type(block_type):
+        return block_type in {"thinking", "reasoning", "reasoning_content"}
+
+    @staticmethod
+    def _is_anthropic_reasoning_delta_type(delta_type):
+        return delta_type in {
+            "thinking_delta",
+            "reasoning_delta",
+            "reasoning_content_delta",
+        }
+
     def _stream_reasoning_delta(self, delta, current_thinking, raw_thinking):
-        reasoning = (
-            self._get_field(delta, "reasoning_content", "")
-            or self._get_field(delta, "reasoning", "")
-            or ""
-        )
+        reasoning = self._anthropic_reasoning_text(delta, include_details=False)
         if reasoning:
             raw_thinking += reasoning
             clean_thinking = _clean_reasoning_text(raw_thinking)
@@ -4195,7 +4319,6 @@ class OmniAgent:
                 current_thinking, clean_thinking
             )
             return clean_delta, clean_thinking, raw_thinking
-
         reasoning_details = self._reasoning_details_text(
             self._get_field(delta, "reasoning_details", None)
         )
@@ -4210,6 +4333,43 @@ class OmniAgent:
             )
             return clean_delta, clean_thinking, raw_thinking
         return "", current_thinking, raw_thinking
+
+    def _anthropic_reasoning_text(self, item, clean=True, include_details=True):
+        item_type = self._get_field(item, "type", "") or ""
+        thinking = self._get_field(item, "thinking", "") or ""
+        reasoning_content = self._get_field(item, "reasoning_content", "") or ""
+        reasoning = self._get_field(item, "reasoning", "") or ""
+        reasoning_details = ""
+        if include_details:
+            reasoning_details = self._reasoning_details_text(
+                self._get_field(item, "reasoning_details", None)
+            )
+        compatible_text = ""
+        if (
+            self._is_anthropic_reasoning_block_type(item_type)
+            or self._is_anthropic_reasoning_delta_type(item_type)
+        ):
+            compatible_text = (
+                self._get_field(item, "text", "")
+                or self._get_field(item, "content", "")
+                or self._get_field(item, "delta", "")
+                or ""
+            )
+        text = ""
+        for part in (
+            thinking,
+            reasoning_content,
+            reasoning,
+            reasoning_details,
+            compatible_text,
+        ):
+            text = _merge_reasoning_text(text, str(part or ""))
+        if clean:
+            return _clean_reasoning_text(text)
+        return text
+
+    def _anthropic_delta_reasoning_text(self, delta):
+        return self._anthropic_reasoning_text(delta)
 
     def _reasoning_details_text(self, details):
         if not details:

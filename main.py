@@ -43,12 +43,24 @@ def stream_print_response(content):
         clean_and_print_stream_response(content)
 
 
+def _should_print_unstreamed_thinking(response, stream_mode, thinking_mode):
+    return (
+        response.get("thinking")
+        and thinking_mode
+        and (stream_mode or response.get("response_streamed"))
+        and response.get("thinking_streamed") is False
+    )
+
+
 def handle_response(response, model_name, stream_mode=False, thinking_mode=False):
     if not response:
         print_error(
             "Failed to get response, please check your APIKey and network connection."
         )
         return
+
+    if _should_print_unstreamed_thinking(response, stream_mode, thinking_mode):
+        print_thinking(_clean_text(response.get("thinking")))
 
     if stream_mode:
         console.print()
