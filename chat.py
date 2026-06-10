@@ -590,10 +590,15 @@ class OmniAgent:
         return self.agent_tools.todo_history(limit)
 
     def send_message(
-        self, user_message, stream_callback_thinking=None, stream_callback_response=None
+        self,
+        user_message,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+        media_references=None,
     ):
         original_history = self._history_snapshot()
-        self.conversation_history.append({"role": "user", "content": user_message})
+        user_content = self._user_message_content(user_message, media_references)
+        self.conversation_history.append({"role": "user", "content": user_content})
         self._record_preference_signal(user_message)
 
         try:
@@ -1197,6 +1202,7 @@ class OmniAgent:
         full_response = ""
         raw_response = ""
         tool_call_parts = {}
+        reasoning_detail_parts = {}
         usage_input_tokens = None
 
         for chunk in response:
@@ -1207,6 +1213,10 @@ class OmniAgent:
                 continue
 
             delta = chunk.choices[0].delta
+            self._update_stream_reasoning_details(
+                reasoning_detail_parts,
+                self._get_field(delta, "reasoning_details", None),
+            )
             reasoning, field_thinking, raw_thinking = self._stream_reasoning_delta(
                 delta,
                 field_thinking,
@@ -1257,7 +1267,13 @@ class OmniAgent:
 
         full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
         assistant_message = self._chat_stream_assistant_message(
-            full_response, full_thinking
+            full_response,
+            full_thinking,
+            raw_content=raw_response,
+            reasoning_details=self._stream_reasoning_details(
+                reasoning_detail_parts,
+                full_thinking,
+            ),
         )
         assistant_tool_calls, tool_calls = self._chat_stream_tool_calls(tool_call_parts)
         if assistant_tool_calls:
@@ -1319,14 +1335,17 @@ class OmniAgent:
             arguments = part.get("arguments", "")
             name = part.get("name", "")
             call_id = part.get("id", "")
-            assistant_tool_calls.append({
+            assistant_tool_call = {
                 "id": call_id,
                 "type": part.get("type") or "function",
                 "function": {
                     "name": name,
                     "arguments": arguments,
                 },
-            })
+            }
+            if self._uses_minimax_openai_compat():
+                assistant_tool_call["index"] = index
+            assistant_tool_calls.append(assistant_tool_call)
             tool_calls.append({
                 "id": call_id,
                 "name": name,
@@ -3285,6 +3304,7 @@ class OmniAgent:
             full_response = ""
             raw_response = ""
             thinking_ended = False
+            reasoning_detail_parts = {}
             usage_input_tokens = None
 
             for chunk in response:
@@ -3294,6 +3314,10 @@ class OmniAgent:
                 if not getattr(chunk, "choices", None):
                     continue
                 delta = chunk.choices[0].delta
+                self._update_stream_reasoning_details(
+                    reasoning_detail_parts,
+                    self._get_field(delta, "reasoning_details", None),
+                )
                 reasoning, field_thinking, raw_thinking = self._stream_reasoning_delta(
                     delta,
                     field_thinking,
@@ -3340,6 +3364,11 @@ class OmniAgent:
                 self._chat_stream_assistant_message(
                     full_response,
                     _combine_reasoning_text(field_thinking, tagged_thinking),
+                    raw_content=raw_response,
+                    reasoning_details=self._stream_reasoning_details(
+                        reasoning_detail_parts,
+                        _combine_reasoning_text(field_thinking, tagged_thinking),
+                    ),
                 )
             )
             if usage_input_tokens is not None:
@@ -3378,6 +3407,8 @@ class OmniAgent:
             full_response = ""
             raw_response = ""
             response_started = False
+            blocks = []
+            active_block_index = None
             usage_input_tokens = None
 
             for chunk in response:
@@ -3483,6 +3514,30 @@ class OmniAgent:
                     content_block = self._get_field(chunk, "content_block")
                     block_type = self._get_field(content_block, "type")
                     initial_reasoning = self._anthropic_reasoning_text(content_block)
+                    if block_type == "text":
+                        block = {"type": "text", "text": ""}
+                    elif (
+                        self._is_anthropic_reasoning_block_type(block_type)
+                        or initial_reasoning
+                    ):
+                        block = {
+                            "type": "thinking",
+                            "thinking": initial_reasoning,
+                        }
+                        signature = self._get_field(content_block, "signature")
+                        if signature:
+                            block["signature"] = signature
+                    elif block_type == "tool_use":
+                        block = {
+                            "type": "tool_use",
+                            "id": self._get_field(content_block, "id", "") or "",
+                            "name": self._get_field(content_block, "name", "") or "",
+                            "input": self._get_field(content_block, "input", {}) or {},
+                        }
+                    else:
+                        block = {"type": block_type or "unknown"}
+                    blocks.append(block)
+                    active_block_index = len(blocks) - 1
                     if initial_reasoning:
                         field_thinking += initial_reasoning
                         if (
@@ -3494,6 +3549,7 @@ class OmniAgent:
                     if block_type == "text":
                         initial_text = self._get_field(content_block, "text", "") or ""
                         if initial_text:
+                            block["text"] = block.get("text", "") + initial_text
                             content, full_response, raw_response = (
                                 self._stream_content_delta(
                                     initial_text,
@@ -3535,25 +3591,41 @@ class OmniAgent:
                                     callback_response(content)
                     continue
 
+                if chunk_type == "content_block_stop":
+                    active_block_index = None
+                    continue
+
                 if chunk_type != "content_block_delta":
                     continue
 
                 delta = self._get_field(chunk, "delta")
                 delta_type = self._get_field(delta, "type", "")
+                block = None
+                if active_block_index is not None:
+                    block = blocks[active_block_index]
 
                 if self._is_anthropic_reasoning_delta_type(delta_type):
                     thinking = self._anthropic_delta_reasoning_text(delta)
                     if thinking:
                         field_thinking += thinking
+                        if block is not None:
+                            block["thinking"] = block.get("thinking", "") + thinking
                         if (
                             callback_thinking
                             and self.thinking_mode
                             and not response_started
                         ):
                             callback_thinking(thinking)
+                elif delta_type == "signature_delta":
+                    if block is not None:
+                        block["signature"] = block.get("signature", "") + (
+                            self._get_field(delta, "signature", "") or ""
+                        )
                 elif delta_type == "text_delta":
                     text = self._get_field(delta, "text", "") or ""
                     if text:
+                        if block is not None:
+                            block["text"] = block.get("text", "") + text
                         content, full_response, raw_response = (
                             self._stream_content_delta(
                                 text,
@@ -3594,9 +3666,12 @@ class OmniAgent:
                             if callback_response:
                                 callback_response(content)
 
+            history_content = full_response
+            if self._uses_minimax_anthropic_compat():
+                history_content = blocks
             self.conversation_history.append({
                 "role": "assistant",
-                "content": full_response,
+                "content": history_content,
             })
             if usage_input_tokens is not None:
                 self._set_context_input_tokens(usage_input_tokens, "api_usage")
@@ -3642,11 +3717,15 @@ class OmniAgent:
     def _parse_anthropic_response(self, response):
         try:
             self._record_context_usage(response)
-            full_thinking, full_response = self._anthropic_response_parts(response)
+            blocks = self._anthropic_content_blocks(
+                self._get_field(response, "content", [])
+            )
+            full_thinking, full_response, _ = self._parse_anthropic_blocks(blocks)
+            history_content = blocks if self._uses_minimax_anthropic_compat() else full_response
 
             self.conversation_history.append({
                 "role": "assistant",
-                "content": full_response,
+                "content": history_content,
             })
             return {"thinking": full_thinking, "response": full_response}
         except (AttributeError, TypeError) as error:
@@ -3711,11 +3790,25 @@ class OmniAgent:
         return _clean_reasoning_text(thinking), text, tool_uses
 
     def _chat_message_parts(self, message):
-        text = self._message_content_text(self._get_field(message, "content", "") or "")
+        raw_content = self._get_field(message, "content", "")
+        if raw_content is None:
+            raw_content = ""
+        text = self._message_content_text(raw_content)
         thinking_content = self._message_reasoning_text(message)
+        if self._uses_minimax_openai_compat():
+            _, tagged_thinking, has_tagged_thinking = _split_tagged_think_text(
+                raw_content
+            )
+            if has_tagged_thinking and tagged_thinking:
+                thinking_content = _clean_reasoning_text(
+                    _merge_reasoning_text(thinking_content, tagged_thinking)
+                )
         raw_tool_calls = self._get_field(message, "tool_calls", None) or []
 
-        assistant_message = {"role": "assistant", "content": text}
+        assistant_message = {
+            "role": "assistant",
+            "content": self._chat_assistant_content_for_history(raw_content, text),
+        }
         reasoning_details = self._get_field(message, "reasoning_details", None)
         if reasoning_details:
             assistant_message["reasoning_details"] = self._plain_data(reasoning_details)
@@ -3730,7 +3823,7 @@ class OmniAgent:
                 arguments = self._get_field(function, "arguments", {}) or {}
                 parsed_arguments = self._parse_tool_arguments(arguments)
 
-                assistant_tool_calls.append({
+                assistant_tool_call = {
                     "id": call_id,
                     "type": self._get_field(call, "type", "function") or "function",
                     "function": {
@@ -3739,7 +3832,11 @@ class OmniAgent:
                         if isinstance(arguments, str)
                         else json.dumps(arguments),
                     },
-                })
+                }
+                raw_index = self._get_field(call, "index", None)
+                if self._uses_minimax_openai_compat() and raw_index is not None:
+                    assistant_tool_call["index"] = raw_index
+                assistant_tool_calls.append(assistant_tool_call)
                 tool_calls.append({
                     "id": call_id,
                     "name": name,
@@ -3748,6 +3845,11 @@ class OmniAgent:
             assistant_message["tool_calls"] = assistant_tool_calls
 
         return assistant_message, thinking_content, text, tool_calls
+
+    def _chat_assistant_content_for_history(self, raw_content, display_text):
+        if self._uses_minimax_openai_compat():
+            return self._plain_data(raw_content)
+        return display_text
 
     def _ollama_message_parts(self, message):
         text = str(self._get_field(message, "content", "") or "")
@@ -3798,6 +3900,69 @@ class OmniAgent:
             return json.loads(arguments)
         except (TypeError, json.JSONDecodeError):
             return {}
+
+    def _user_message_content(self, text, media_references=None):
+        media_references = list(media_references or [])
+        if not media_references or not self._supports_minimax_media_input():
+            return text
+        if self.api_type == API_TYPE_ANTHROPIC:
+            return self._anthropic_user_media_content(text, media_references)
+        return self._openai_user_media_content(text, media_references)
+
+    def _supports_minimax_media_input(self):
+        model_name = str(self.model or "").lower()
+        is_m3 = model_name.startswith("minimax-m3")
+        return is_m3 and (
+            self._uses_minimax_openai_compat()
+            or self._uses_minimax_anthropic_compat()
+        )
+
+    def _openai_user_media_content(self, text, media_references):
+        content = [{"type": "text", "text": text}]
+        for media in media_references:
+            data_url = self._media_reference_data_url(media)
+            detail = media.get("detail") or "default"
+            if media.get("kind") == "image":
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": data_url,
+                        "detail": detail,
+                    },
+                })
+            elif media.get("kind") == "video":
+                content.append({
+                    "type": "video_url",
+                    "video_url": {
+                        "url": data_url,
+                        "detail": detail,
+                    },
+                })
+        return content
+
+    def _anthropic_user_media_content(self, text, media_references):
+        content = [{"type": "text", "text": text}]
+        for media in media_references:
+            kind = media.get("kind")
+            if kind not in {"image", "video"}:
+                continue
+            block = {
+                "type": kind,
+                "source": {
+                    "type": "base64",
+                    "media_type": media.get("mime_type") or "",
+                    "data": media.get("data") or "",
+                },
+                "detail": media.get("detail") or "default",
+            }
+            content.append(block)
+        return content
+
+    @staticmethod
+    def _media_reference_data_url(media):
+        mime_type = media.get("mime_type") or "application/octet-stream"
+        data = media.get("data") or ""
+        return f"data:{mime_type};base64,{data}"
 
     def _anthropic_messages(self):
         messages = []
@@ -4162,10 +4327,23 @@ class OmniAgent:
             "content": content,
         }
 
-    def _chat_stream_assistant_message(self, content, thinking):
-        message = {"role": "assistant", "content": content}
-        if self._uses_minimax_openai_compat() and thinking:
-            message["reasoning_details"] = [{"text": thinking}]
+    def _chat_stream_assistant_message(
+        self,
+        content,
+        thinking,
+        raw_content=None,
+        reasoning_details=None,
+    ):
+        history_content = content
+        if self._uses_minimax_openai_compat() and raw_content is not None:
+            history_content = raw_content
+        message = {"role": "assistant", "content": history_content}
+        if self._uses_minimax_openai_compat():
+            details = reasoning_details or []
+            if details:
+                message["reasoning_details"] = details
+            elif thinking:
+                message["reasoning_details"] = [{"text": thinking}]
         return message
 
     @staticmethod
@@ -4388,6 +4566,54 @@ class OmniAgent:
         if content is not None:
             return str(content)
         return ""
+
+    def _update_stream_reasoning_details(self, detail_parts, details):
+        if not details:
+            return
+
+        plain_details = self._plain_data(details)
+        if isinstance(plain_details, dict):
+            entries = [plain_details]
+        elif isinstance(plain_details, (list, tuple)):
+            entries = list(plain_details)
+        else:
+            entries = [{"text": str(plain_details)}]
+
+        for fallback_index, detail in enumerate(entries):
+            if detail is None:
+                continue
+            if not isinstance(detail, dict):
+                detail = {"text": str(detail)}
+
+            key = detail.get("index")
+            if key is None:
+                key = detail.get("id")
+            if key is None:
+                key = fallback_index
+            key = str(key)
+
+            target = detail_parts.setdefault(key, {})
+            for field, value in detail.items():
+                if field in {"text", "content"}:
+                    incoming = str(value or "")
+                    existing = str(target.get(field, "") or "")
+                    if existing and incoming.startswith(existing):
+                        target[field] = incoming
+                    elif incoming:
+                        target[field] = existing + incoming
+                    elif field not in target:
+                        target[field] = incoming
+                    continue
+                if value is not None:
+                    target[field] = value
+
+    def _stream_reasoning_details(self, detail_parts, fallback_text=""):
+        details = [dict(detail) for detail in detail_parts.values() if detail]
+        if details:
+            return details
+        if fallback_text:
+            return [{"text": fallback_text}]
+        return []
 
     @staticmethod
     def _split_stream_delta(current_text, next_text):

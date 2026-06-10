@@ -103,7 +103,7 @@ pip install -r requirements.txt
   "web_search": {
     "enable": true,
     "provider": "tavily",
-    "api_key": "YOUR_TAVILY_API_KEY",
+    "api_key": "YOUR_TAVILY_KEY",
     "max_results": 5,
     "search_depth": "basic",
     "topic": "general"
@@ -117,12 +117,12 @@ pip install -r requirements.txt
 {
   "api_type": "openai",
   "base_url": "https://api.minimaxi.com/v1",
-  "model": "MiniMax-M2.7",
-  "api_key": "YOUR_API_KEY"
+  "model": "MiniMax-M3",
+  "api_key": "YOUR_MINIMAX_KEY"
 }
 ```
 
-MiniMax 推荐使用 OpenAI 兼容配置。Anthropic 兼容的 MiniMax-M3 也会在 `thinking_mode=true` 时尝试启用 thinking，但最终是否能显示取决于服务端是否返回 reasoning 字段。
+MiniMax-M3 推荐使用 OpenAI 兼容配置。程序会在调用 MiniMax OpenAI 兼容接口时自动传递 `reasoning_split=true`，并在多轮 Function Call 中把完整 assistant 消息写回历史，包括 `reasoning_details`、`tool_calls` 和必要的原始 `<think>...</think>` 内容。也可以使用 Anthropic 兼容端点 `https://api.minimaxi.com/anthropic`；该路径会按官方要求完整回传 `thinking/text/tool_use` 内容块。MiniMax API Key 只从 `config.json` 的 `api_key` 字段读取。
 
 ```json
 {
@@ -160,7 +160,7 @@ MiniMax 推荐使用 OpenAI 兼容配置。Anthropic 兼容的 MiniMax-M3 也会
 | `api_type` | API 类型，只支持 `glm`、`anthropic`、`openai`、`gemini` 或 `ollama`。 |
 | `base_url` | 自定义 API 地址。`glm` 类型会自动忽略该字段；`anthropic` 和 `openai` 类型可留空使用 SDK 默认地址，也可填写兼容端点。`gemini` 留空时自动使用 `https://generativelanguage.googleapis.com/v1beta/openai/`。MiniMax OpenAI 兼容接口填写 `https://api.minimaxi.com/v1`。`ollama` 留空时使用本地默认服务，通常是 `http://localhost:11434`；直连 Ollama 云端时填写 `https://ollama.com`。 |
 | `model` | 模型名称，按服务商要求填写。 |
-| `api_key` | API Key。Gemini 使用 Google AI Studio 创建的 Gemini API Key。Ollama 本地模型和通过本地 Ollama 代理调用云端模型可留空；直连 `https://ollama.com` 时填写 Ollama API Key，也可以使用 `OLLAMA_API_KEY` 环境变量。请只保存在本地，不要提交到仓库。 |
+| `api_key` | API Key，只从 `config.json` 读取。Gemini 使用 Google AI Studio 创建的 Gemini API Key。Ollama 本地模型和通过本地 Ollama 代理调用云端模型可留空。请只保存在本地，不要提交到仓库。 |
 | `max_tokens` | 单次回复的最大 token 数。 |
 | `temperature` | 采样温度，范围为 `0` 到 `1`。 |
 | `stream_mode` | 是否默认启用流式输出。 |
@@ -187,7 +187,7 @@ MiniMax 推荐使用 OpenAI 兼容配置。Anthropic 兼容的 MiniMax-M3 也会
 | `memory_system.memory_model` | 执行持久记忆和情景记忆更新的模型。留空时使用当前模型。 |
 | `web_search.enable` | 是否开启网络搜索功能。开启且配置 Tavily key 后，普通交互和 Agent 都可以使用搜索。 |
 | `web_search.provider` | 网络搜索提供商，目前支持 `tavily`。 |
-| `web_search.api_key` | Tavily API Key，也可以通过 `/search key <tavily-api-key>` 写入。 |
+| `web_search.api_key` | Tavily API Key，只从 `config.json` 的 `web_search.api_key` 读取，也可以通过 `/search key <tavily-api-key>` 写入。 |
 | `web_search.max_results` | 每次搜索最多返回多少条结果，范围 `1` 到 `20`。 |
 | `web_search.search_depth` | Tavily 搜索深度，支持 `basic`、`fast`、`ultra-fast`、`advanced`。 |
 | `web_search.topic` | Tavily 搜索主题，支持 `general`、`news`、`finance`。 |
@@ -212,7 +212,7 @@ python main.py <workspace>
 
 ## 外部文件引用
 
-在消息中使用 `[/path/to/your/file]` 可以把工作目录外的单个文件内容附加给模型阅读。该功能只支持文件，不支持文件夹；引用目录或不存在的路径会取消本次发送并显示错误。
+在消息中使用 `[/path/to/your/file]` 可以把工作目录外的单个文件附加给模型阅读。该功能只支持文件，不支持文件夹；引用目录或不存在的路径会取消本次发送并显示错误。
 
 Windows 路径同样支持，例如：
 
@@ -220,7 +220,9 @@ Windows 路径同样支持，例如：
 请总结这个文件：[D:\Notes\report.md]
 ```
 
-文件内容会作为只读上下文附加到本次消息中，不会放开 Agent 工具对工作目录外路径的读写限制。单个引用文件最多附加 `60000` 个字符，超出部分会被截断。
+文本文件内容会作为只读上下文附加到本次消息中，不会放开 Agent 工具对工作目录外路径的读写限制。单个文本引用文件最多附加 `60000` 个字符，超出部分会被截断。
+
+引用图片或视频时，程序会自动检测文件类型。MiniMax-M3 的 OpenAI 兼容接口会收到 `image_url` / `video_url` 内容块，Anthropic 兼容接口会收到 `image` / `video` 内容块；其他模型或接口会保留附件清单文本，但不会直接发送媒体内容。支持的图片类型包括 JPEG、PNG、GIF、WEBP，支持的视频类型包括 MP4、AVI、MOV、MKV。本地图片最大 `10 MB`，本地视频最大 `50 MB`，媒体请求体总量限制为 `64 MB`。
 
 ## 自定义提示词
 
