@@ -3,6 +3,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from rich.cells import cell_len
 
@@ -48,6 +49,11 @@ from tools import (
     glm_tool_schemas,
     ollama_tool_schemas,
     openai_tool_schemas,
+)
+from subagents import (
+    FORBIDDEN_SUBAGENT_TOOL_NAMES,
+    SubagentRunner,
+    compose_subagent_task,
 )
 
 
@@ -302,6 +308,7 @@ class OmniAgent:
             thinking_mode=None,
             reasoning_effort=None,
         )
+        self.agent_tools.set_subagent_executor(self._dispatch_subagent)
 
     def configure(
         self,
@@ -1980,6 +1987,7 @@ class OmniAgent:
                         self.agent_tools.web_search_available,
                         self.agent_tools.skills_available,
                         self.agent_tools.todos_enabled,
+                        extra_definitions=self.agent_tools.subagent_tool_definitions(),
                     ),
                 )
             )
@@ -2049,6 +2057,7 @@ class OmniAgent:
                 self.agent_tools.web_search_available,
                 self.agent_tools.skills_available,
                 self.agent_tools.todos_enabled,
+                extra_definitions=self.agent_tools.subagent_tool_definitions(),
             ),
             stream=True,
             **self._anthropic_request_options(),
@@ -3251,6 +3260,54 @@ class OmniAgent:
         context_result = _compact_tool_result_for_context(tool_result)
         return context_result
 
+    def _dispatch_subagent(
+        self,
+        *,
+        agent_type,
+        task,
+        purpose="",
+        expected_output="",
+        evidence_required="",
+        scope_limit="",
+    ):
+        spec = self.agent_tools.subagent_registry.get(agent_type)
+        if spec is None:
+            return _error_text(
+                "Unknown subagent "
+                f"{agent_type!r}. Available: "
+                + ", ".join(
+                    self.agent_tools.subagent_registry.names(include_aliases=True)
+                )
+            )
+
+        subagent_task = compose_subagent_task(
+            task,
+            expected_output=expected_output,
+            evidence_required=evidence_required,
+            scope_limit=scope_limit,
+        )
+        label = _single_line(purpose or task, 120)
+        self._before_agent_visible_output()
+        print_info(f"Dispatching subagent {spec.name}: {label}")
+
+        runner = SubagentRunner(
+            parent_agent=self,
+            spec=spec,
+            tool_schemas=self._subagent_tool_schemas(spec),
+            execute_tool=self.agent_tools.execute,
+            compact_tool_result=_compact_tool_result_for_context,
+        )
+        try:
+            result = runner.run(subagent_task)
+        except Exception as error:
+            print_warn(f"Subagent {spec.name} failed: {error}")
+            return _error_text(f"Subagent '{spec.name}' failed: {error}")
+
+        print_info(
+            f"Subagent {spec.name} completed; returning {len(result)} characters."
+        )
+        return result
+
     def _history_snapshot(self):
         return [dict(message) for message in self.conversation_history]
 
@@ -3407,9 +3464,7 @@ class OmniAgent:
             full_response = ""
             raw_response = ""
             response_started = False
-            blocks = []
-            active_block_index = None
-            usage_input_tokens = None
+            usage_input_tokens = _no_usage_input_tokens()
 
             for chunk in response:
                 chunk_input_tokens = _response_input_tokens(chunk)
@@ -3502,7 +3557,9 @@ class OmniAgent:
             full_response = ""
             raw_response = ""
             response_started = False
-            usage_input_tokens = None
+            blocks = _empty_anthropic_blocks()
+            active_block_index = _no_active_block_index()
+            usage_input_tokens = _no_usage_input_tokens()
 
             for chunk in response:
                 chunk_input_tokens = _response_input_tokens(chunk)
@@ -3600,7 +3657,7 @@ class OmniAgent:
 
                 delta = self._get_field(chunk, "delta")
                 delta_type = self._get_field(delta, "type", "")
-                block = None
+                block = _no_anthropic_block()
                 if active_block_index is not None:
                     block = blocks[active_block_index]
 
@@ -3666,7 +3723,7 @@ class OmniAgent:
                             if callback_response:
                                 callback_response(content)
 
-            history_content = full_response
+            history_content = _assistant_history_content(full_response)
             if self._uses_minimax_anthropic_compat():
                 history_content = blocks
             self.conversation_history.append({
@@ -4073,6 +4130,19 @@ class OmniAgent:
             "\n- Use web_fetch when the user provides a specific public webpage URL "
             "and asks you to read or summarize that page."
         )
+        if self.agent_tools.subagents_available:
+            prompt += (
+                "\n- Use dispatch_subagent for independent research, code reading, audit, "
+                "or scoped implementation subtasks that would otherwise add bulky tool "
+                "output to the main context. The subagent has its own history and a "
+                "restricted tool whitelist; only its final summary returns to you."
+                "\n- Keep ownership of the main plan, user-facing decisions, final "
+                "verification, and final answer. Do not dispatch a subagent for tasks "
+                "that need immediate user clarification."
+                "\n- If several delegated tasks are independent, you may request multiple "
+                "dispatch_subagent calls in the same assistant tool-use turn; OmniAgent "
+                "will execute them safely in order for terminal v1."
+            )
         prompt += (
             "\n- Use ask_user only for an important uncertainty that materially affects "
             "the goal, scope, tradeoffs, or acceptance criteria and cannot be resolved "
@@ -4282,9 +4352,60 @@ class OmniAgent:
         include_web_search = self.agent_tools.web_search_available
         include_skills = self.agent_tools.skills_available
         include_plan = self.agent_tools.todos_enabled
+        extra_definitions = self.agent_tools.subagent_tool_definitions()
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
-            return openai_tool_schemas(include_web_search, include_skills, include_plan)
-        return glm_tool_schemas(include_web_search, include_skills, include_plan)
+            return openai_tool_schemas(
+                include_web_search,
+                include_skills,
+                include_plan,
+                extra_definitions=extra_definitions,
+            )
+        return glm_tool_schemas(
+            include_web_search,
+            include_skills,
+            include_plan,
+            extra_definitions=extra_definitions,
+        )
+
+    def _subagent_tool_schemas(self, spec):
+        include_web_search = (
+            self.agent_tools.web_search_available and "web_search" in spec.tool_names
+        )
+        include_skills = (
+            self.agent_tools.skills_available
+            and bool({"list_skills", "read_skill"} & set(spec.tool_names))
+        )
+        if self.api_type == API_TYPE_ANTHROPIC:
+            return anthropic_tool_schemas(
+                include_web_search,
+                include_skills,
+                False,
+                only_tools=spec.tool_names,
+                exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+            )
+        if self.api_type == API_TYPE_OLLAMA:
+            return ollama_tool_schemas(
+                include_web_search,
+                include_skills,
+                False,
+                only_tools=spec.tool_names,
+                exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+            )
+        if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
+            return openai_tool_schemas(
+                include_web_search,
+                include_skills,
+                False,
+                only_tools=spec.tool_names,
+                exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+            )
+        return glm_tool_schemas(
+            include_web_search,
+            include_skills,
+            False,
+            only_tools=spec.tool_names,
+            exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+        )
 
     def _normal_web_search_tool_schemas(self):
         definitions = []
@@ -4714,6 +4835,26 @@ def _response_input_tokens(response):
     if direct_tokens:
         return direct_tokens
     return None
+
+
+def _empty_anthropic_blocks() -> List[Dict[str, Any]]:
+    return []
+
+
+def _no_active_block_index() -> Optional[int]:
+    return None
+
+
+def _no_usage_input_tokens() -> Optional[int]:
+    return None
+
+
+def _no_anthropic_block() -> Optional[Dict[str, Any]]:
+    return None
+
+
+def _assistant_history_content(content) -> Any:
+    return content
 
 
 def _usage_input_tokens(usage):

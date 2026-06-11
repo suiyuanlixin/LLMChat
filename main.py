@@ -399,7 +399,13 @@ def main():
         agent_auto_disabled = True
 
     if sys.stdin.isatty() and sys.stdout.isatty():
-        start_tui(config.model, workspace_dir)
+        start_tui(
+            config.model,
+            workspace_dir,
+            config.api_type,
+            config.thinking_mode,
+            config.reasoning_effort,
+        )
         run_tui(
             lambda: run_chat_loop(
                 config,
@@ -410,7 +416,13 @@ def main():
         )
         return
 
-    show_dashboard(config.model, workspace_dir)
+    show_dashboard(
+        config.model,
+        workspace_dir,
+        config.api_type,
+        config.thinking_mode,
+        config.reasoning_effort,
+    )
     run_chat_loop(config, workspace_dir, workspace_error, agent_auto_disabled)
 
 

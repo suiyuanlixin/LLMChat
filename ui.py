@@ -527,10 +527,13 @@ def _dashboard_text_from_segments(*segments, left_column_width):
     return Text.assemble(*rendered_segments)
 
 
-def _dashboard_centered_left_text(*segments):
+def _dashboard_centered_left_text(*segments, bias_right=False):
     available_width = max(console.width - 2, 0)
     content_length = sum(len(content) for content, _ in segments)
-    left_padding = max((available_width - content_length) // 2, 0)
+    total_padding = max(available_width - content_length, 0)
+    left_padding = (
+        (total_padding + 1) // 2 if bias_right else total_padding // 2
+    )
 
     return Text.assemble(
         " " * left_padding,
@@ -538,10 +541,12 @@ def _dashboard_centered_left_text(*segments):
     )
 
 
-def _dashboard_left_text(width, *segments):
+def _dashboard_left_text(width, *segments, bias_right=False):
     content_length = sum(len(content) for content, _ in segments)
     total_padding = max(width - content_length, 0)
-    left_padding = total_padding // 2
+    left_padding = (
+        (total_padding + 1) // 2 if bias_right else total_padding // 2
+    )
     right_padding = total_padding - left_padding
     return Text.assemble(
         " " * left_padding,
@@ -619,9 +624,56 @@ def _get_last_record_text(line_number, left_column_width):
     )
 
 
-def show_dashboard(model_name, workspace_dir=None):
+def _dashboard_api_type_text(api_type=None):
+    value = str(api_type or "").strip()
+    if not value:
+        return ""
+    labels = {
+        "glm": "GLM",
+        "anthropic": "Anthropic",
+        "openai": "OpenAI",
+        "gemini": "Gemini",
+        "ollama": "Ollama",
+    }
+    return labels.get(value.lower(), value[:1].upper() + value[1:].lower())
+
+
+def _dashboard_model_status_text(
+    model_name,
+    api_type=None,
+    thinking_mode=None,
+    reasoning_effort=None,
+):
+    api_text = _dashboard_api_type_text(api_type)
+    model_text = str(model_name or "Unknown model").upper()
+    effort = str(reasoning_effort or "").strip()
+    if effort.lower() == "none" or thinking_mode is False:
+        label = "OFF"
+    elif not effort:
+        label = "Default"
+    else:
+        effort_key = effort.lower().replace("_", " ").replace("-", " ")
+        label = " ".join(word.capitalize() for word in effort_key.split())
+    if api_text:
+        return f"{api_text} · {model_text} · {label}"
+    return f"{model_text} · {label}"
+
+
+def show_dashboard(
+    model_name,
+    workspace_dir=None,
+    api_type=None,
+    thinking_mode=None,
+    reasoning_effort=None,
+):
     if _tui_session is not None and not _is_dashboard_capture():
-        _tui_session.set_dashboard(model_name, workspace_dir)
+        _tui_session.set_dashboard(
+            model_name,
+            workspace_dir,
+            api_type,
+            thinking_mode,
+            reasoning_effort,
+        )
         return
 
     if not _is_dashboard_capture():
@@ -632,15 +684,23 @@ def show_dashboard(model_name, workspace_dir=None):
         gradient_text("OmniAgent", *INFO_TEXT_COLOR),
         gradient_text(f" v{VERSION}", *TEXT_COLOR),
     )
-    billing_text = f"{model_name.upper()} · API Usage Billing"
+    model_status_text = _dashboard_model_status_text(
+        model_name,
+        api_type,
+        thinking_mode,
+        reasoning_effort,
+    )
     cwd = workspace_dir or "No workspace directory"
     cwd_text = cwd
-    left_column_width = max(len(billing_text), len(cwd_text)) + 6
+    left_column_width = max(len(model_status_text), len(cwd_text)) + 6
 
     if console.width < left_column_width + 29:
         dashboard_content = Text.assemble(
             "\n",
-            _dashboard_centered_left_text(("Welcome back!", TEXT_COLOR)),
+            _dashboard_centered_left_text(
+                ("Welcome back!", TEXT_COLOR),
+                bias_right=True,
+            ),
             "\n\n",
             _dashboard_centered_left_text((DASHBOARD_LOGO_LINES[0], INFO_COLOR)),
             "\n",
@@ -648,7 +708,7 @@ def show_dashboard(model_name, workspace_dir=None):
             "\n",
             _dashboard_centered_left_text((DASHBOARD_LOGO_LINES[2], INFO_COLOR)),
             "\n\n",
-            _dashboard_centered_left_text((billing_text, THINK_COLOR)),
+            _dashboard_centered_left_text((model_status_text, THINK_COLOR)),
             "\n",
             _dashboard_centered_left_text((cwd_text, THINK_COLOR)),
         )
@@ -657,7 +717,11 @@ def show_dashboard(model_name, workspace_dir=None):
             " " * left_column_width,
             Text("│", style="bold #6d8da8"),
             gradient_text(" Tips for getting started\n", *INFO_TEXT_COLOR),
-            _dashboard_left_text(left_column_width, ("Welcome back!", TEXT_COLOR)),
+            _dashboard_left_text(
+                left_column_width,
+                ("Welcome back!", TEXT_COLOR),
+                bias_right=True,
+            ),
             Text("│", style="bold #6d8da8"),
             _dashboard_text_from_segments(
                 (
@@ -688,7 +752,7 @@ def show_dashboard(model_name, workspace_dir=None):
             Text("│", style="bold #6d8da8"),
             _get_last_record_text(3, left_column_width),
             "\n",
-            _dashboard_left_text(left_column_width, (billing_text, THINK_COLOR)),
+            _dashboard_left_text(left_column_width, (model_status_text, THINK_COLOR)),
             Text("│", style="bold #6d8da8"),
             _get_last_record_text(4, left_column_width),
             "\n",
@@ -962,7 +1026,14 @@ def _render_diff_background_block_ansi(width, content, print_kwargs=None):
     )
 
 
-def _render_dashboard_ansi(model_name, workspace_dir, width):
+def _render_dashboard_ansi(
+    model_name,
+    workspace_dir,
+    width,
+    api_type=None,
+    thinking_mode=None,
+    reasoning_effort=None,
+):
     output = StringIO()
     render_console = Console(
         file=output,
@@ -977,7 +1048,13 @@ def _render_dashboard_ansi(model_name, workspace_dir, width):
     _console_override.console = render_console
     _dashboard_capture.active = True
     try:
-        show_dashboard(model_name, workspace_dir)
+        show_dashboard(
+            model_name,
+            workspace_dir,
+            api_type,
+            thinking_mode,
+            reasoning_effort,
+        )
     finally:
         if previous_console is None:
             try:
@@ -1121,11 +1198,17 @@ class ChatTUISession:
         self,
         model_name=None,
         workspace_dir=None,
+        api_type=None,
+        thinking_mode=None,
+        reasoning_effort=None,
         app_input=None,
         app_output=None,
     ):
         self.model_name = model_name or ""
         self.workspace_dir = workspace_dir
+        self.api_type = api_type
+        self.thinking_mode = thinking_mode
+        self.reasoning_effort = reasoning_effort
         self.messages_ansi = ""
         self.messages_plain = ""
         self.message_fragments = []
@@ -1244,10 +1327,20 @@ class ChatTUISession:
         )
         _patch_windows_output_full_width(self.app.output)
 
-    def set_dashboard(self, model_name, workspace_dir=None):
+    def set_dashboard(
+        self,
+        model_name,
+        workspace_dir=None,
+        api_type=None,
+        thinking_mode=None,
+        reasoning_effort=None,
+    ):
         with self.lock:
             self.model_name = model_name or ""
             self.workspace_dir = workspace_dir
+            self.api_type = api_type
+            self.thinking_mode = thinking_mode
+            self.reasoning_effort = reasoning_effort
             self.dashboard_cache_key = None
         self.invalidate()
 
@@ -1971,12 +2064,22 @@ class ChatTUISession:
     def _dashboard_text(self):
         width = self._columns()
         with self.lock:
-            key = (self.model_name, self.workspace_dir, width)
+            key = (
+                self.model_name,
+                self.workspace_dir,
+                self.api_type,
+                self.thinking_mode,
+                self.reasoning_effort,
+                width,
+            )
             if key != self.dashboard_cache_key:
                 self.dashboard_cache_text = _render_dashboard_ansi(
                     self.model_name,
                     self.workspace_dir,
                     width,
+                    self.api_type,
+                    self.thinking_mode,
+                    self.reasoning_effort,
                 )
                 self.dashboard_cache_key = key
             text = self.dashboard_cache_text
@@ -2137,9 +2240,21 @@ def fragment_list_to_text_safe(value):
         return str(value or "")
 
 
-def start_tui(model_name=None, workspace_dir=None):
+def start_tui(
+    model_name=None,
+    workspace_dir=None,
+    api_type=None,
+    thinking_mode=None,
+    reasoning_effort=None,
+):
     global _tui_session
-    _tui_session = ChatTUISession(model_name, workspace_dir)
+    _tui_session = ChatTUISession(
+        model_name,
+        workspace_dir,
+        api_type,
+        thinking_mode,
+        reasoning_effort,
+    )
     return _tui_session
 
 

@@ -34,6 +34,10 @@ from search import (
     normalize_web_search_provider,
     search_tavily,
 )
+from subagents import (
+    DISPATCH_SUBAGENT_TOOL_NAME,
+    SubagentRegistry,
+)
 
 
 MAX_READ_CHARS = 60000
@@ -649,7 +653,30 @@ SKILL_TOOL_DEFINITIONS = [
 ]
 
 
-def tool_definitions(include_web_search=False, include_skills=False, include_plan=True):
+def _filter_tool_definition_list(definitions, only_tools=None, exclude_tools=None):
+    if only_tools is None and exclude_tools is None:
+        return definitions
+    allowed = set(only_tools) if only_tools is not None else None
+    excluded = set(exclude_tools or [])
+    filtered = []
+    for definition in definitions:
+        name = definition.get("name")
+        if allowed is not None and name not in allowed:
+            continue
+        if name in excluded:
+            continue
+        filtered.append(definition)
+    return filtered
+
+
+def tool_definitions(
+    include_web_search=False,
+    include_skills=False,
+    include_plan=True,
+    extra_definitions=None,
+    only_tools=None,
+    exclude_tools=None,
+):
     definitions = [
         tool
         for tool in TOOL_DEFINITIONS
@@ -659,18 +686,37 @@ def tool_definitions(include_web_search=False, include_skills=False, include_pla
         definitions.extend(SKILL_TOOL_DEFINITIONS)
     if include_web_search:
         definitions.append(WEB_SEARCH_TOOL_DEFINITION)
-    return definitions
+    if extra_definitions:
+        definitions.extend(extra_definitions)
+    return _filter_tool_definition_list(definitions, only_tools, exclude_tools)
 
 
 def anthropic_tool_schemas(
     include_web_search=False,
     include_skills=False,
     include_plan=True,
+    extra_definitions=None,
+    only_tools=None,
+    exclude_tools=None,
 ):
-    return tool_definitions(include_web_search, include_skills, include_plan)
+    return tool_definitions(
+        include_web_search,
+        include_skills,
+        include_plan,
+        extra_definitions=extra_definitions,
+        only_tools=only_tools,
+        exclude_tools=exclude_tools,
+    )
 
 
-def glm_tool_schemas(include_web_search=False, include_skills=False, include_plan=True):
+def glm_tool_schemas(
+    include_web_search=False,
+    include_skills=False,
+    include_plan=True,
+    extra_definitions=None,
+    only_tools=None,
+    exclude_tools=None,
+):
     return [
         {
             "type": "function",
@@ -680,16 +726,51 @@ def glm_tool_schemas(include_web_search=False, include_skills=False, include_pla
                 "parameters": tool["input_schema"],
             },
         }
-        for tool in tool_definitions(include_web_search, include_skills, include_plan)
+        for tool in tool_definitions(
+            include_web_search,
+            include_skills,
+            include_plan,
+            extra_definitions=extra_definitions,
+            only_tools=only_tools,
+            exclude_tools=exclude_tools,
+        )
     ]
 
 
-def openai_tool_schemas(include_web_search=False, include_skills=False, include_plan=True):
-    return glm_tool_schemas(include_web_search, include_skills, include_plan)
+def openai_tool_schemas(
+    include_web_search=False,
+    include_skills=False,
+    include_plan=True,
+    extra_definitions=None,
+    only_tools=None,
+    exclude_tools=None,
+):
+    return glm_tool_schemas(
+        include_web_search,
+        include_skills,
+        include_plan,
+        extra_definitions=extra_definitions,
+        only_tools=only_tools,
+        exclude_tools=exclude_tools,
+    )
 
 
-def ollama_tool_schemas(include_web_search=False, include_skills=False, include_plan=True):
-    return glm_tool_schemas(include_web_search, include_skills, include_plan)
+def ollama_tool_schemas(
+    include_web_search=False,
+    include_skills=False,
+    include_plan=True,
+    extra_definitions=None,
+    only_tools=None,
+    exclude_tools=None,
+):
+    return glm_tool_schemas(
+        include_web_search,
+        include_skills,
+        include_plan,
+        extra_definitions=extra_definitions,
+        only_tools=only_tools,
+        exclude_tools=exclude_tools,
+    )
 
 
 class AgentToolError(Exception):
@@ -736,6 +817,11 @@ class AgentTools:
             auto_catalog=skills_auto_catalog,
             max_chars=skills_max_chars,
         )
+        self.subagent_registry = SubagentRegistry(
+            workspace_dir=self.workspace_dir,
+            skills_summary_provider=self.skills_catalog_prompt
+        )
+        self.subagent_executor = None
         self.set_approval_mode(approval_mode)
         self.set_web_search_config(
             web_search_enabled,
@@ -762,6 +848,7 @@ class AgentTools:
             load=True,
         )
         self.skill_registry.configure(workspace_dir=self.workspace_dir)
+        self.subagent_registry.configure(workspace_dir=self.workspace_dir)
 
     def set_approval_mode(self, approval_mode):
         mode = str(approval_mode or AGENT_APPROVAL_CONFIRM).strip().lower()
@@ -817,6 +904,72 @@ class AgentTools:
 
     def skills_catalog_prompt(self):
         return self.skill_registry.catalog_prompt()
+
+    def set_subagent_executor(self, executor):
+        self.subagent_executor = executor
+
+    @property
+    def subagents_available(self):
+        return self.enabled and self.subagent_executor is not None
+
+    def subagent_tool_definitions(self):
+        if not self.subagents_available:
+            return []
+        return [self._dispatch_subagent_tool_definition()]
+
+    def _dispatch_subagent_tool_definition(self):
+        return {
+            "name": DISPATCH_SUBAGENT_TOOL_NAME,
+            "description": (
+                "Dispatch a focused subagent with independent history and a restricted "
+                "tool whitelist. The subagent returns one concise summary, which is the "
+                "only content added back to the main context. Use this for independent "
+                "research, code reading, audit, or scoped implementation tasks that would "
+                "otherwise add bulky tool output to the main conversation.\n\n"
+                "Available agent_type values:\n"
+                f"{self.subagent_registry.describe()}"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "agent_type": {
+                        "type": "string",
+                        "enum": self.subagent_registry.names(include_aliases=True),
+                        "description": "The subagent role to dispatch.",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "The delegated task. Include enough local context, target files, "
+                            "and the desired summary shape."
+                        ),
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "Optional short label used for terminal status output.",
+                    },
+                    "expected_output": {
+                        "type": "string",
+                        "description": "Optional specific deliverable or format.",
+                    },
+                    "evidence_required": {
+                        "type": "string",
+                        "description": (
+                            "Optional evidence requirement, such as file paths, line numbers, "
+                            "URLs, command output, or diff summaries."
+                        ),
+                    },
+                    "scope_limit": {
+                        "type": "string",
+                        "description": (
+                            "Optional hard boundary, such as read-only, a directory, or files "
+                            "the subagent must not touch."
+                        ),
+                    },
+                },
+                "required": ["agent_type", "task"],
+            },
+        }
 
     def skills_status(self):
         return self.skill_registry.status()
@@ -1070,6 +1223,7 @@ class AgentTools:
                 "web_search": self._web_search,
                 "list_skills": self._list_skills,
                 "read_skill": self._read_skill,
+                DISPATCH_SUBAGENT_TOOL_NAME: self._dispatch_subagent,
             }
             handler = handlers.get(name)
             if handler is None:
@@ -1615,6 +1769,26 @@ class AgentTools:
     def _read_skill(self, tool_input):
         name = _required_string(tool_input, "name")
         return self.skill_registry.read_skill(name, tool_input.get("files"))
+
+    def _dispatch_subagent(self, tool_input):
+        if self.subagent_executor is None:
+            raise AgentToolError("Subagent dispatch is not available.")
+        agent_type = _required_string(tool_input, "agent_type")
+        task = _required_string(tool_input, "task")
+        if self.subagent_registry.get(agent_type) is None:
+            raise AgentToolError(
+                "Unknown subagent "
+                f"{agent_type!r}. Available: "
+                + ", ".join(self.subagent_registry.names(include_aliases=True))
+            )
+        return self.subagent_executor(
+            agent_type=agent_type,
+            task=task,
+            purpose=str(tool_input.get("purpose") or "").strip(),
+            expected_output=str(tool_input.get("expected_output") or "").strip(),
+            evidence_required=str(tool_input.get("evidence_required") or "").strip(),
+            scope_limit=str(tool_input.get("scope_limit") or "").strip(),
+        )
 
     def _web_search(self, tool_input):
         if not self.web_search_enabled:
