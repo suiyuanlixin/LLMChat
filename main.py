@@ -17,6 +17,7 @@ from ui import (
     print_stream_thinking_continue,
     clean_and_print_stream_response,
     clean_display_text,
+    set_on_esc,
 )
 from config import load_config
 from chat import OmniAgent
@@ -337,6 +338,8 @@ def run_chat_loop(
             agent_plan_enabled=config.agent_plan_enable,
             agent_team_enable=config.agent_team_enable,
         )
+        set_on_esc(lambda: chat.request_agent_stop())
+
     except Exception as error:
         print_error(f"Failed to initialize client: {error}")
         return

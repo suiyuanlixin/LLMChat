@@ -20,6 +20,7 @@ from ui import (
     print_stream_response_start,
     print_warn,
     set_plan_panel,
+    set_context_usage,
 )
 from config import (
     API_TYPE_ANTHROPIC,
@@ -2559,6 +2560,7 @@ class OmniAgent:
             return
         self.last_context_input_tokens = input_tokens
         self.last_context_usage_source = str(source or "api_usage")
+        set_context_usage(input_tokens, self.context_window_tokens)
 
     def _clear_context_usage(self):
         self.last_context_input_tokens = 0

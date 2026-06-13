@@ -422,6 +422,7 @@ def _append_stream_thinking_text(content):
         _tui_session.append_stream_text(content, f"bold {STREAM_THINK_COLOR}")
         return
     console.print(Text(content, style=f"bold {STREAM_THINK_COLOR}"), end="")
+    console.file.flush()
 
 
 def print_stream_thinking(content, leading_newline=True):
@@ -1239,6 +1240,10 @@ class ChatTUISession:
         self.last_terminal_size = None
         self.resize_watch_stop = threading.Event()
         self.resize_watch_thread = None
+        self.context_input_tokens = 0
+        self.context_window_tokens = 0
+        self.context_cache_key = None
+        self.context_cache_text = ""
 
         self.input_area = TextArea(
             multiline=True,
@@ -1253,6 +1258,21 @@ class ChatTUISession:
             style="class:input",
         )
         self.input_area.buffer.on_text_changed += lambda _: self._input_changed()
+        self.input_container = ConditionalContainer(
+            content=self.input_area,
+            filter=Condition(lambda: not self.confirmation_active),
+        )
+        self.selection_window = Window(
+            content=FormattedTextControl(
+                lambda: self._selection_formatted_text()
+            ),
+            height=lambda: self._selection_height(),
+            always_hide_cursor=True,
+        )
+        self.selection_container = ConditionalContainer(
+            content=self.selection_window,
+            filter=Condition(lambda: self.confirmation_active),
+        )
 
         self.message_control = _ScrollableMessageControl(
             self,
@@ -1300,13 +1320,29 @@ class ChatTUISession:
             height=1,
             always_hide_cursor=True,
         )
+        self.context_window = Window(
+            content=FormattedTextControl(
+                lambda: self._context_formatted_text()
+            ),
+            height=1,
+            always_hide_cursor=True,
+            style="class:context",
+        )
+        self.bottom_padding = Window(
+            content=FormattedTextControl(lambda: [("", " ")]),
+            height=1,
+            always_hide_cursor=True,
+        )
         self.root = HSplit([
             self.dashboard_window,
             self.message_window,
             self.todo_container,
             self.input_top_border,
-            self.input_area,
+            self.input_container,
+            self.selection_container,
             self.input_bottom_border,
+            self.context_window,
+            self.bottom_padding,
         ])
         self.layout = Layout(self.root, focused_element=self.input_area)
         self.app = Application(
@@ -1323,6 +1359,8 @@ class ChatTUISession:
                 "input.border": f"bold {STREAM_RESPONSE_COLOR}",
                 "input.placeholder": f"bold {STREAM_THINK_COLOR}",
                 "text-area": f"bold {STREAM_RESPONSE_COLOR}",
+                "context": f"bold {STREAM_THINK_COLOR}",
+                "context.hint": f"bold {STREAM_RESPONSE_COLOR}",
             }),
         )
         _patch_windows_output_full_width(self.app.output)
@@ -1343,6 +1381,42 @@ class ChatTUISession:
             self.reasoning_effort = reasoning_effort
             self.dashboard_cache_key = None
         self.invalidate()
+
+    def set_context_usage(self, input_tokens, context_window_tokens):
+        with self.lock:
+            self.context_input_tokens = max(0, int(input_tokens or 0))
+            self.context_window_tokens = max(1, int(context_window_tokens or 1))
+            self.context_cache_key = None
+        self.invalidate()
+
+    def _context_text(self):
+        with self.lock:
+            key = (self.context_input_tokens, self.context_window_tokens)
+            if key != self.context_cache_key:
+                input_tokens = self.context_input_tokens
+                window_tokens = self.context_window_tokens or 1
+                pct = (input_tokens / window_tokens) * 100
+                if input_tokens >= 1000:
+                    formatted = f"{input_tokens/1000:.1f}k"
+                else:
+                    formatted = str(input_tokens)
+                self.context_cache_text = f"{formatted} ({pct:.0f}%)"
+                self.context_cache_key = key
+        return self.context_cache_text
+
+    def _context_formatted_text(self):
+        right_text = self._context_text()
+        left_hint = "esc interrupt"
+        full_left_len = len(left_hint)
+        right_len = len(right_text) if right_text else 0
+        width = self._columns()
+        padding = max(0, width - full_left_len - right_len)
+        result = [
+            ("class:context.hint", "esc"),
+            ("class:context", " interrupt"),
+            ("class:context", " " * padding + right_text),
+        ]
+        return result
 
     def run(self, worker):
         def start_worker():
@@ -1548,9 +1622,9 @@ class ChatTUISession:
             self.input_enabled = True
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
-        self._render_confirmation_line()
+        self._render_selection_prompt()
         self._resize_input()
-        self.layout.focus(self.input_area)
+        self.layout.focus(self.selection_window)
         self.invalidate()
 
         result = self.input_queue.get()
@@ -1578,9 +1652,9 @@ class ChatTUISession:
             self.input_enabled = True
 
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
-        self._render_confirmation_line()
+        self._render_selection_prompt()
         self._resize_input()
-        self.layout.focus(self.input_area)
+        self.layout.focus(self.selection_window)
         self.invalidate()
 
         result = self.input_queue.get()
@@ -1708,6 +1782,11 @@ class ChatTUISession:
         def _(event):
             self._wake_input(KeyboardInterrupt())
 
+        @bindings.add("escape")
+        def _(event):
+            if _on_esc is not None:
+                _on_esc()
+
         @bindings.add("c-d")
         def _(event):
             if not self.input_area.text:
@@ -1820,14 +1899,13 @@ class ChatTUISession:
         self.input_area.buffer.set_document(Document("", 0), bypass_readonly=True)
         self._resize_input()
         if choice_active:
-            renderable = _choice_renderable(
+            renderable = _choice_result_renderable(
                 choice_question,
                 choice_options,
                 selected,
-                confirmed=True,
             )
         else:
-            renderable = _confirmation_line_renderable(selected, confirmed=True)
+            renderable = _confirmation_result_renderable(selected)
         ansi = _render_console_print_to_ansi(
             self._columns(),
             renderable,
@@ -1836,7 +1914,57 @@ class ChatTUISession:
         )
         self._replace_confirmation_line(ansi)
         self.input_queue.put(result)
+        self.layout.focus(self.input_area)
         self.invalidate()
+
+    def _selection_formatted_text(self):
+        with self.lock:
+            if self.choice_options:
+                options = list(self.choice_options)
+                selected_idx = self.choice_selected_index
+            else:
+                options = ["Yes", "No"]
+                selected_idx = 0 if self.confirmation_selected else 1
+        width = self._columns()
+        parts = []
+        for i, option in enumerate(options):
+            selected = i == selected_idx
+            colors = INFO_COLOR if selected else TEXT_COLOR
+            suffix = "\n" if i < len(options) - 1 else ""
+            parts.extend([
+                gradient_text("[-]", *colors),
+                " ",
+                gradient_text(f"{option}{suffix}", *TEXT_COLOR),
+            ])
+        renderable = Text.assemble(*parts)
+        ansi = _render_console_print_to_ansi(width, renderable)
+        fragments = list(to_formatted_text(PromptANSI(ansi)))
+        return fragments
+
+    def _selection_height(self):
+        with self.lock:
+            if self.choice_options:
+                return len(self.choice_options)
+            return 2
+
+    def _render_selection_prompt(self):
+        width = self._columns()
+        if self.choice_options:
+            prompt = Text.assemble(
+                "\n",
+                gradient_text("[-]", *INFO_COLOR),
+                gradient_text(f" {self.choice_question}\n", *TEXT_COLOR),
+                gradient_text("(use arrows, number keys, Enter)", *THINK_COLOR),
+            )
+        else:
+            prompt = _confirmation_line_prompt()
+        ansi = _render_console_print_to_ansi(
+            width,
+            prompt,
+            end="\n",
+            soft_wrap=True,
+        )
+        self._replace_confirmation_line(ansi)
 
     def _set_confirmation_selected(self, selected):
         with self.lock:
@@ -1872,6 +2000,8 @@ class ChatTUISession:
             self._submit_confirmation()
 
     def _render_confirmation_line(self, selected=None, confirmed=False):
+        if not confirmed:
+            return
         if selected is None:
             with self.lock:
                 if self.choice_options:
@@ -2100,7 +2230,7 @@ class ChatTUISession:
     def _todo_max_lines(self):
         return max(
             1,
-            min(8, self._rows() - self._dashboard_height() - self._input_height() - 6),
+            min(8, self._rows() - self._dashboard_height() - self._input_height() - 7),
         )
 
     def _todo_text(self):
@@ -2265,6 +2395,19 @@ def set_plan_panel(items):
 
 def clear_plan_panel():
     set_plan_panel([])
+
+
+_on_esc = None
+
+
+def set_on_esc(callback):
+    global _on_esc
+    _on_esc = callback
+
+
+def set_context_usage(input_tokens, context_window_tokens):
+    if _tui_session is not None:
+        _tui_session.set_context_usage(input_tokens, context_window_tokens)
 
 
 def run_tui(worker):
@@ -2615,6 +2758,10 @@ def _read_bottom_multiline_input(prompt_text):
 
             if ch == "\x03":
                 raise KeyboardInterrupt
+            if ch == "\x1b":
+                if _on_esc is not None:
+                    _on_esc()
+                continue
             if ch == "\x1a":
                 raise EOFError
 
@@ -2884,6 +3031,40 @@ def _selection_marker_colors(selected, confirmed=False):
     if not selected:
         return TEXT_COLOR
     return SUCCESS_COLOR if confirmed else INFO_COLOR
+
+
+def _confirmation_result_renderable(selected):
+    selected = bool(selected)
+    yes_colors = SUCCESS_COLOR if selected else TEXT_COLOR
+    no_colors = SUCCESS_COLOR if not selected else TEXT_COLOR
+    prompt = _confirmation_line_prompt()
+    return Text.assemble(
+        prompt, "\n",
+        gradient_text("[✓]" if selected else "[-]", *yes_colors), " ",
+        gradient_text("Yes", *TEXT_COLOR), "\n",
+        gradient_text("[-]" if selected else "[✓]", *no_colors), " ",
+        gradient_text("No", *TEXT_COLOR),
+    )
+
+
+def _choice_result_renderable(question, options, selected_index):
+    selected_index = max(0, min(len(options) - 1, int(selected_index or 0)))
+    parts = [
+        "\n",
+        gradient_text("[-]", *INFO_COLOR),
+        gradient_text(f" {question}\n", *TEXT_COLOR),
+        gradient_text("(use arrows, number keys, Enter)\n", *THINK_COLOR),
+    ]
+    for index, option in enumerate(options):
+        selected = index == selected_index
+        colors = SUCCESS_COLOR if selected else TEXT_COLOR
+        marker = "[✓]" if selected else "[-]"
+        suffix = "\n" if index < len(options) - 1 else ""
+        parts.extend([
+            gradient_text(marker, *colors),
+            gradient_text(f" {option}{suffix}", *TEXT_COLOR),
+        ])
+    return Text.assemble(*parts)
 
 
 def _read_terminal_confirmation(default=False):
