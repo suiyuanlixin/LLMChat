@@ -55,6 +55,11 @@ from subagents import (
     SubagentRunner,
     compose_subagent_task,
 )
+from team import (
+    TeamStore,
+    TeamRunner,
+    compose_teammate_task,
+)
 
 
 AGENT_CONTEXT_WARN_CHARS = 180000
@@ -237,6 +242,7 @@ class OmniAgent:
         web_search_depth="basic",
         web_search_topic="general",
         agent_plan_enabled=True,
+        agent_team_enable=False,
     ):
         _ensure_user_prompt_file()
         self.debug = bool(debug)
@@ -309,6 +315,17 @@ class OmniAgent:
             reasoning_effort=None,
         )
         self.agent_tools.set_subagent_executor(self._dispatch_subagent)
+        self.agent_team_enabled = bool(agent_team_enable) and (workspace_dir is not None)
+        if self.agent_team_enabled:
+            self.team_store = TeamStore(workspace_dir=workspace_dir)
+            self.agent_tools.set_team_config(
+                team_store=self.team_store,
+                team_enabled=True,
+            )
+            self.agent_tools.set_team_executor(self._execute_teammate)
+        else:
+            self.team_store = None
+            self.agent_tools.set_team_config(team_enabled=False)
 
     def configure(
         self,
@@ -558,6 +575,26 @@ class OmniAgent:
             "plan_enabled": self.agent_tools.todos_enabled,
             "skills": self.agent_tools.skills_status(),
             "plan": self.agent_tools.todo_status(),
+            "team_enabled": self.agent_team_enabled,
+        }
+
+    def set_team_mode(self, enabled):
+        self.agent_team_enabled = bool(enabled and self.agent_tools.enabled)
+        if self.team_store is not None:
+            self.agent_tools.set_team_config(
+                team_store=self.team_store,
+                team_enabled=self.agent_team_enabled,
+            )
+        return self.agent_team_enabled
+
+    def get_team_status(self):
+        roster = self.team_store.get_roster() if self.team_store else []
+        available_types = self.team_store.names() if self.team_store else []
+        return {
+            "enabled": self.agent_team_enabled,
+            "active_count": len(roster),
+            "teammates": roster,
+            "available_types": available_types,
         }
 
     def get_plan_status(self):
@@ -1987,7 +2024,8 @@ class OmniAgent:
                         self.agent_tools.web_search_available,
                         self.agent_tools.skills_available,
                         self.agent_tools.todos_enabled,
-                        extra_definitions=self.agent_tools.subagent_tool_definitions(),
+                        extra_definitions=self.agent_tools.subagent_tool_definitions()
+                        + self.agent_tools.team_tool_definitions(),
                     ),
                 )
             )
@@ -2057,7 +2095,8 @@ class OmniAgent:
                 self.agent_tools.web_search_available,
                 self.agent_tools.skills_available,
                 self.agent_tools.todos_enabled,
-                extra_definitions=self.agent_tools.subagent_tool_definitions(),
+                extra_definitions=self.agent_tools.subagent_tool_definitions()
+                + self.agent_tools.team_tool_definitions(),
             ),
             stream=True,
             **self._anthropic_request_options(),
@@ -3308,6 +3347,47 @@ class OmniAgent:
         )
         return result
 
+    def _execute_teammate(
+        self,
+        *,
+        spec,
+        task,
+        purpose="",
+        expected_output="",
+        evidence_required="",
+        scope_limit="",
+    ):
+        teammate_task = compose_teammate_task(
+            task,
+            expected_output=expected_output,
+            evidence_required=evidence_required,
+            scope_limit=scope_limit,
+        )
+        label = _single_line(purpose or task, 120)
+        self._before_agent_visible_output()
+        print_info(f"Teammate {spec.name} ({spec.role}): {label}")
+
+        runner = TeamRunner(
+            parent_agent=self,
+            spec=spec,
+            tool_schemas=self._teammate_tool_schemas(spec),
+            execute_tool=self.agent_tools.execute,
+            compact_tool_result=_compact_tool_result_for_context,
+            team_store=self.team_store,
+            api_type=self.api_type,
+        )
+        try:
+            result = runner.run(teammate_task)
+        except Exception as error:
+            print_warn(f"Teammate {spec.name} failed: {error}")
+            return _error_text(f"Teammate '{spec.name}' failed: {error}")
+
+        self.team_store.update_status(spec.name, "active", task_count=1)
+        print_info(
+            f"Teammate {spec.name} completed; returning {len(result)} characters."
+        )
+        return result
+
     def _history_snapshot(self):
         return [dict(message) for message in self.conversation_history]
 
@@ -4352,7 +4432,7 @@ class OmniAgent:
         include_web_search = self.agent_tools.web_search_available
         include_skills = self.agent_tools.skills_available
         include_plan = self.agent_tools.todos_enabled
-        extra_definitions = self.agent_tools.subagent_tool_definitions()
+        extra_definitions = self.agent_tools.subagent_tool_definitions() + self.agent_tools.team_tool_definitions()
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
             return openai_tool_schemas(
                 include_web_search,
@@ -4405,6 +4485,54 @@ class OmniAgent:
             False,
             only_tools=spec.tool_names,
             exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+        )
+
+    def _teammate_tool_schemas(self, spec):
+        include_web_search = (
+            self.agent_tools.web_search_available and "web_search" in spec.tool_names
+        )
+        include_skills = (
+            self.agent_tools.skills_available
+            and bool({"list_skills", "read_skill"} & set(spec.tool_names))
+        )
+        excluded = FORBIDDEN_SUBAGENT_TOOL_NAMES | {
+            "spawn_teammate",
+            "list_teammates",
+            "send_message",
+            "read_inbox",
+            "broadcast",
+            "shutdown_teammate",
+        }
+        if self.api_type == API_TYPE_ANTHROPIC:
+            return anthropic_tool_schemas(
+                include_web_search,
+                include_skills,
+                False,
+                only_tools=spec.tool_names,
+                exclude_tools=excluded,
+            )
+        if self.api_type == API_TYPE_OLLAMA:
+            return ollama_tool_schemas(
+                include_web_search,
+                include_skills,
+                False,
+                only_tools=spec.tool_names,
+                exclude_tools=excluded,
+            )
+        if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
+            return openai_tool_schemas(
+                include_web_search,
+                include_skills,
+                False,
+                only_tools=spec.tool_names,
+                exclude_tools=excluded,
+            )
+        return glm_tool_schemas(
+            include_web_search,
+            include_skills,
+            False,
+            only_tools=spec.tool_names,
+            exclude_tools=excluded,
         )
 
     def _normal_web_search_tool_schemas(self):

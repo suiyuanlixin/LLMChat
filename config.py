@@ -35,6 +35,7 @@ DEFAULT_MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_AGENT_APPROVAL_MODE = "confirm"
 DEFAULT_AGENT_SUMMARY_MODEL = ""
 DEFAULT_AGENT_PLAN_ENABLE = True
+DEFAULT_AGENT_TEAM_ENABLE = False
 DEFAULT_SKILLS_ENABLE = True
 DEFAULT_SKILLS_SOURCE_APP = True
 DEFAULT_SKILLS_SOURCE_WORKSPACE = False
@@ -82,6 +83,7 @@ class AppConfig:
     agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
     agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
     agent_plan_enable: bool = DEFAULT_AGENT_PLAN_ENABLE
+    agent_team_enable: bool = DEFAULT_AGENT_TEAM_ENABLE
     skills_enable: bool = DEFAULT_SKILLS_ENABLE
     skills_source_app: bool = DEFAULT_SKILLS_SOURCE_APP
     skills_source_workspace: bool = DEFAULT_SKILLS_SOURCE_WORKSPACE
@@ -119,6 +121,7 @@ class AppConfig:
             "agent_show_thinking": self.agent_show_thinking,
             "agent_summary_model": self.agent_summary_model,
             "agent_plan_enable": self.agent_plan_enable,
+            "agent_team_enable": self.agent_team_enable,
             "skills_enable": self.skills_enable,
             "skills_source_app": self.skills_source_app,
             "skills_source_workspace": self.skills_source_workspace,
@@ -159,6 +162,9 @@ class AppConfig:
                 "show_thinking": self.agent_show_thinking,
                 "summary_model": self.agent_summary_model,
                 "plan_mode": self.agent_plan_enable,
+                "agent_team": {
+                    "enable": self.agent_team_enable,
+                },
             },
             "skills": {
                 "enable": self.skills_enable,
@@ -449,6 +455,13 @@ def _sanitize_config(config):
     config["agent_summary_model"] = str(
         agent_config.get("summary_model", DEFAULT_AGENT_SUMMARY_MODEL) or ""
     ).strip()
+
+    agent_team_config = agent_config.get("agent_team", {})
+    if not isinstance(agent_team_config, dict):
+        agent_team_config = {}
+    config["agent_team_enable"] = _parse_bool(
+        agent_team_config.get("enable"), DEFAULT_AGENT_TEAM_ENABLE
+    )
 
     skills_sources_config = skills_config.get("sources", {})
     if not isinstance(skills_sources_config, dict):

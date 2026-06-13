@@ -38,6 +38,16 @@ from subagents import (
     DISPATCH_SUBAGENT_TOOL_NAME,
     SubagentRegistry,
 )
+from team import (
+    SPAWN_TEAMMATE_TOOL_NAME,
+    LIST_TEAMMATES_TOOL_NAME,
+    SEND_MESSAGE_TOOL_NAME,
+    READ_INBOX_TOOL_NAME,
+    BROADCAST_TOOL_NAME,
+    SHUTDOWN_TEAMMATE_TOOL_NAME,
+    TEAM_TOOL_NAMES,
+    TeamStore,
+)
 
 
 MAX_READ_CHARS = 60000
@@ -822,6 +832,9 @@ class AgentTools:
             skills_summary_provider=self.skills_catalog_prompt
         )
         self.subagent_executor = None
+        self.team_executor = None
+        self.team_store = None
+        self.team_enabled = False
         self.set_approval_mode(approval_mode)
         self.set_web_search_config(
             web_search_enabled,
@@ -908,6 +921,9 @@ class AgentTools:
     def set_subagent_executor(self, executor):
         self.subagent_executor = executor
 
+    def set_team_executor(self, executor):
+        self.team_executor = executor
+
     @property
     def subagents_available(self):
         return self.enabled and self.subagent_executor is not None
@@ -916,6 +932,26 @@ class AgentTools:
         if not self.subagents_available:
             return []
         return [self._dispatch_subagent_tool_definition()]
+
+    def set_team_config(self, team_store=None, team_enabled=False):
+        self.team_store = team_store
+        self.team_enabled = bool(team_enabled) and self.enabled and team_store is not None
+
+    @property
+    def team_available(self):
+        return getattr(self, "team_enabled", False)
+
+    def team_tool_definitions(self):
+        if not self.team_available:
+            return []
+        return [
+            self._spawn_teammate_tool_definition(),
+            self._list_teammates_tool_definition(),
+            self._send_message_tool_definition(),
+            self._read_inbox_tool_definition(),
+            self._broadcast_tool_definition(),
+            self._shutdown_teammate_tool_definition(),
+        ]
 
     def _dispatch_subagent_tool_definition(self):
         return {
@@ -968,6 +1004,149 @@ class AgentTools:
                     },
                 },
                 "required": ["agent_type", "task"],
+            },
+        }
+
+    def _spawn_teammate_tool_definition(self):
+        store = self.team_store if self.team_available else None
+        return {
+            "name": SPAWN_TEAMMATE_TOOL_NAME,
+            "description": (
+                "Spawn a persistent teammate into the agent team and optionally assign an "
+                "immediate task. Teammates have independent contexts and tool whitelists. "
+                "The teammate runs immediately and returns a result. Use this to parallelize "
+                "work across different roles.\n\n"
+                "Available teammate types:\n"
+                f"{store.describe() if store else ''}"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "teammate_type": {
+                        "type": "string",
+                        "enum": store.names(include_aliases=True) if store else [],
+                        "description": "The teammate role to spawn.",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The task to assign immediately after spawning.",
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "Optional short label for terminal output.",
+                    },
+                    "expected_output": {
+                        "type": "string",
+                        "description": "Optional specific deliverable or format.",
+                    },
+                    "evidence_required": {
+                        "type": "string",
+                        "description": "Optional evidence requirement.",
+                    },
+                    "scope_limit": {
+                        "type": "string",
+                        "description": "Optional hard boundary for the task.",
+                    },
+                },
+                "required": ["teammate_type", "task"],
+            },
+        }
+
+    def _list_teammates_tool_definition(self):
+        return {
+            "name": LIST_TEAMMATES_TOOL_NAME,
+            "description": "List all active teammates in the agent team with their status and task count.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+            },
+        }
+
+    def _send_message_tool_definition(self):
+        return {
+            "name": SEND_MESSAGE_TOOL_NAME,
+            "description": (
+                "Send a message to a teammate's inbox. The teammate will process the "
+                "message on next wake. Use this for follow-up communication with teammates."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "teammate_name": {
+                        "type": "string",
+                        "description": "The name of the teammate to message.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The message content to send.",
+                    },
+                },
+                "required": ["teammate_name", "message"],
+            },
+        }
+
+    def _read_inbox_tool_definition(self):
+        return {
+            "name": READ_INBOX_TOOL_NAME,
+            "description": (
+                "Read pending messages from the lead's inbox (replies from teammates). "
+                "Optionally read from a specific teammate's inbox."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "teammate_name": {
+                        "type": "string",
+                        "description": "Optional teammate name. If omitted, reads the lead inbox.",
+                    },
+                    "clear": {
+                        "type": "boolean",
+                        "description": "Whether to clear messages after reading. Default false.",
+                    },
+                },
+            },
+        }
+
+    def _broadcast_tool_definition(self):
+        return {
+            "name": BROADCAST_TOOL_NAME,
+            "description": (
+                "Broadcast a message to multiple teammates at once. "
+                "Optionally specify which teammates to include."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message to broadcast.",
+                    },
+                    "teammate_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of teammate names. Broadcasts to all if omitted.",
+                    },
+                },
+                "required": ["message"],
+            },
+        }
+
+    def _shutdown_teammate_tool_definition(self):
+        return {
+            "name": SHUTDOWN_TEAMMATE_TOOL_NAME,
+            "description": (
+                "Shutdown and remove a teammate from the active team. "
+                "The teammate's thread history is preserved for future reference."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "teammate_name": {
+                        "type": "string",
+                        "description": "The name of the teammate to shutdown.",
+                    },
+                },
+                "required": ["teammate_name"],
             },
         }
 
@@ -1224,6 +1403,12 @@ class AgentTools:
                 "list_skills": self._list_skills,
                 "read_skill": self._read_skill,
                 DISPATCH_SUBAGENT_TOOL_NAME: self._dispatch_subagent,
+                SPAWN_TEAMMATE_TOOL_NAME: self._spawn_teammate,
+                LIST_TEAMMATES_TOOL_NAME: self._list_teammates,
+                SEND_MESSAGE_TOOL_NAME: self._send_message,
+                READ_INBOX_TOOL_NAME: self._read_inbox,
+                BROADCAST_TOOL_NAME: self._broadcast,
+                SHUTDOWN_TEAMMATE_TOOL_NAME: self._shutdown_teammate,
             }
             handler = handlers.get(name)
             if handler is None:
@@ -1789,6 +1974,89 @@ class AgentTools:
             evidence_required=str(tool_input.get("evidence_required") or "").strip(),
             scope_limit=str(tool_input.get("scope_limit") or "").strip(),
         )
+
+    def _spawn_teammate(self, tool_input):
+        if not self.team_available:
+            raise AgentToolError("Agent team is disabled. Enable it with /team on.")
+        teammate_type = _required_string(tool_input, "teammate_type")
+        task = _required_string(tool_input, "task")
+        spec = self.team_store.get_spec(teammate_type)
+        if spec is None:
+            raise AgentToolError(
+                f"Unknown teammate type {teammate_type!r}. Available: "
+                + ", ".join(self.team_store.names(include_aliases=True))
+            )
+        purpose = str(tool_input.get("purpose") or "").strip()
+        expected_output = str(tool_input.get("expected_output") or "").strip()
+        evidence_required = str(tool_input.get("evidence_required") or "").strip()
+        scope_limit = str(tool_input.get("scope_limit") or "").strip()
+        self.team_store.add_teammate(spec.name)
+        if self.team_executor is None:
+            raise AgentToolError("Team executor is not configured.")
+        return self.team_executor(
+            spec=spec,
+            task=task,
+            purpose=purpose,
+            expected_output=expected_output,
+            evidence_required=evidence_required,
+            scope_limit=scope_limit,
+        )
+
+    def _list_teammates(self, tool_input):
+        if not self.team_available:
+            raise AgentToolError("Agent team is disabled.")
+        roster = self.team_store.get_roster()
+        if not roster:
+            return "No active teammates."
+        lines = []
+        for t in roster:
+            lines.append(
+                f"- {t['name']} ({t.get('role', '?')}) "
+                f"[{t.get('status', 'unknown')}] "
+                f"tasks: {t.get('task_count', 0)}"
+            )
+        return "Active teammates:\n" + "\n".join(lines)
+
+    def _send_message(self, tool_input):
+        if not self.team_available:
+            raise AgentToolError("Agent team is disabled.")
+        teammate_name = _required_string(tool_input, "teammate_name")
+        message = _required_string(tool_input, "message")
+        return self.team_store.send_message("lead", teammate_name, message)
+
+    def _read_inbox(self, tool_input):
+        if not self.team_available:
+            raise AgentToolError("Agent team is disabled.")
+        teammate_name = str(tool_input.get("teammate_name") or "").strip()
+        clear = bool(tool_input.get("clear", False))
+        messages = self.team_store.read_inbox(teammate_name, clear=clear)
+        if not messages:
+            return "Inbox is empty."
+        lines = []
+        for msg in messages:
+            sender = msg.get("from", "?")
+            content = str(msg.get("content", ""))
+            ts = msg.get("timestamp", "?")
+            lines.append(f"[{ts}] {sender}: {content}")
+        return "Inbox messages:\n" + "\n".join(lines)
+
+    def _broadcast(self, tool_input):
+        if not self.team_available:
+            raise AgentToolError("Agent team is disabled.")
+        message = _required_string(tool_input, "message")
+        teammate_names = tool_input.get("teammate_names")
+        if teammate_names is not None and not isinstance(teammate_names, list):
+            teammate_names = None
+        return self.team_store.broadcast("lead", message, teammate_names)
+
+    def _shutdown_teammate(self, tool_input):
+        if not self.team_available:
+            raise AgentToolError("Agent team is disabled.")
+        teammate_name = _required_string(tool_input, "teammate_name")
+        removed = self.team_store.remove_teammate(teammate_name)
+        if removed:
+            return f"Teammate '{teammate_name}' shutdown and removed from team."
+        return f"No active teammate found with name '{teammate_name}'."
 
     def _web_search(self, tool_input):
         if not self.web_search_enabled:

@@ -51,6 +51,7 @@ COMMANDS = {
     "/search": "Toggle, inspect or configure web search (Example: /search on).",
     "/skills": "Toggle, inspect or configure agent skills (Example: /skills workspace on).",
     "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
+    "/team": "Toggle, inspect or configure agent team mode (Example: /team on, /team list, /team shutdown <name>).",
 }
 
 
@@ -1287,7 +1288,77 @@ def handle_agent(chat, args):
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
             f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto, "
-            f"/agent show-thinking summary|full|off, /agent plan on|off, or /skills."
+            f"/agent show-thinking summary|full|off, /agent plan on|off, or /agent skills ..."
+        )
+        return True
+
+
+def handle_team(chat, args):
+    status = chat.get_team_status()
+
+    if args is None:
+        available = ", ".join(status.get("available_types", []))
+        current = "on" if status["enabled"] else "off"
+        teammates = status.get("teammates", [])
+        lines = [
+            f"Agent team: {current}.",
+            f"Active teammates: {status['active_count']}."
+        ]
+        if teammates:
+            lines.append("Teammates:")
+            for t in teammates:
+                lines.append(
+                    f"  - {t['name']} ({t.get('role', '?')}) "
+                    f"[{t.get('status', '?')}] tasks: {t.get('task_count', 0)}"
+                )
+        else:
+            lines.append("No active teammates.")
+        lines.append(f"Available types: {available}")
+        lines.append("Usage: /team on | /team off | /team list | /team shutdown <name>")
+        print_info("\n".join(lines))
+        return True
+
+    parts = args.split()
+    mode = parts[0].lower().strip() if parts else ""
+
+    if mode == "on" and len(parts) == 1:
+        chat.set_team_mode(True)
+        save_config_field("agent_team_enable", True)
+        print_success("Agent team turned on.")
+    elif mode == "off" and len(parts) == 1:
+        chat.set_team_mode(False)
+        save_config_field("agent_team_enable", False)
+        print_success("Agent team turned off.")
+    elif mode == "list" and len(parts) == 1:
+        teammates = status.get("teammates", [])
+        available = ", ".join(status.get("available_types", []))
+        if not teammates:
+            print_info(
+                f"No active teammates.\n"
+                f"Available types: {available}\n"
+                f"Use spawn_teammate tool within agent mode to spawn one."
+            )
+        else:
+            lines = ["Active teammates:"]
+            for t in teammates:
+                lines.append(
+                    f"  - {t['name']} ({t.get('role', '?')}) "
+                    f"[{t.get('status', '?')}] tasks: {t.get('task_count', 0)}"
+                )
+            print_info("\n".join(lines))
+    elif mode == "shutdown" and len(parts) == 2:
+        name = parts[1]
+        try:
+            removed = chat.team_store.remove_teammate(name)
+        except Exception as e:
+            removed = False
+        if removed:
+            print_success(f"Teammate '{name}' shutdown.")
+        else:
+            print_warn(f"No active teammate found with name '{name}'.")
+    else:
+        print_error(
+            "Usage: /team on | /team off | /team list | /team shutdown <name>"
         )
     return True
 
@@ -1307,6 +1378,7 @@ COMMAND_HANDLERS = {
     "/search": handle_search,
     "/skills": handle_skills,
     "/agent": handle_agent,
+    "/team": handle_team,
     "/token": handle_token,
     "/temp": handle_temp,
 }
